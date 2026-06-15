@@ -1,6 +1,6 @@
 {
   "name": "paopao-codex-plugin",
-  "version": "0.1.0+codex.20260615123617",
+  "version": "0.1.0+codex.20260615125250",
   "description": "paopao: turn source documents into editable consulting-style PPTX decks.",
   "author": {
     "name": "Paopao"

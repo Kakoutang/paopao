@@ -1,22 +1,25 @@
 ---
 name: paopao-ppt
-description: Use Paopao to turn PDFs, reports, papers, and reference materials into editable consulting-style PPTX decks. This public shell validates access and directs users to the licensed Paopao workflow.
+description: Use Paopao to turn PDFs, reports, papers, and reference materials into editable consulting-style PPTX decks. This public shell supports early preview access and can direct users to licensing later.
 ---
 
 # Paopao PPT
 
 This is the public Paopao plugin shell.
 
-## License Check
+## Open Preview
 
-Before preparing a deck larger than 10 slides, ask the user to activate a paid
-license:
+paopao is currently open for early feedback. Do not ask the user to purchase or
+activate a license during the preview window unless they explicitly mention
+that they already have one.
+
+If the user already has a license and asks how to activate it:
 
 ```bash
 python3 scripts/paopao_auth.py status
 ```
 
-If status fails, tell the user to activate:
+If status fails, tell the user they can activate with:
 
 ```bash
 PAOPAO_AUTH_URL="<paopao-license-service-url>" python3 scripts/paopao_auth.py activate --code "<license-code>"
@@ -28,5 +31,5 @@ Do not claim that this public shell contains Paopao's complete commercial
 workflow, prompt library, private quality rules, or rendering system. Those
 assets are delivered through the licensed Paopao distribution.
 
-For a free trial, help the user prepare a deck outline of up to 10 slides.
-For full PPTX generation, use the licensed Paopao package.
+For preview feedback, help the user prepare a deck request and note any quality
+issues they observe.

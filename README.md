@@ -11,18 +11,21 @@ This public repository contains the installable plugin shell:
 - lightweight workflow entrypoint
 
 The full commercial workflow, template library, private rules, and update logic
-are delivered through Paopao's license service after activation.
+are delivered through Paopao's managed distribution.
 
-## Free Trial
+## Open Preview
 
-You can try Paopao with decks up to 10 slides. Larger decks require a paid
-license.
+paopao is currently open for early feedback. During this preview window, you do
+not need a license to try it.
+
+After the preview period, paid licensing may be enabled for larger decks or
+commercial use.
 
 ## Activate A License
 
-After purchase, you will receive a license key from Paopao.
+If you already received a license key from Paopao, activate it from this plugin
+folder:
 
-From this plugin folder:
 
 ```bash
 PAOPAO_AUTH_URL="https://your-paopao-license-service.example.com" \
@@ -49,4 +52,4 @@ does not need your source PDFs to validate your license.
 
 ## Support
 
-For license help, billing questions, or commercial access, contact Paopao.
+For preview feedback, license help, or commercial access, contact Paopao.
