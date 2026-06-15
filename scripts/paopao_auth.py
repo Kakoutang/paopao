@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -30,6 +31,15 @@ DEFAULT_TIMEOUT = 20
 
 class AuthError(RuntimeError):
     pass
+
+
+def ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def device_id() -> str:
@@ -74,7 +84,7 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=ssl_context()) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
