@@ -1,11 +1,11 @@
-# Paopao for Codex
+# paopao
 
-Paopao for Codex helps turn PDFs, reports, papers, and reference materials into
+paopao helps turn PDFs, reports, papers, and reference materials into
 editable consulting-style PowerPoint decks.
 
 This public repository contains the installable plugin shell:
 
-- Codex plugin metadata
+- plugin metadata
 - public usage instructions
 - license activation client
 - lightweight workflow entrypoint

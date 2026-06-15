@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""License client for Paopao for Codex.
+"""License client for paopao.
 
 The plugin stores only a signed token and public license summary locally.
 Source documents remain on the user's machine; the license server receives

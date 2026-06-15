@@ -1,15 +1,15 @@
 {
   "name": "paopao-codex-plugin",
-  "version": "0.1.0",
-  "description": "Paopao for Codex: turn source documents into editable consulting-style PPTX decks.",
+  "version": "0.1.0+codex.20260615123617",
+  "description": "paopao: turn source documents into editable consulting-style PPTX decks.",
   "author": {
     "name": "Paopao"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Paopao for Codex",
+    "displayName": "paopao",
     "shortDescription": "Create editable consulting-style PPTX decks from source documents.",
-    "longDescription": "Paopao for Codex is a licensed workflow shell for creating polished, editable PowerPoint decks from PDFs, reports, papers, and reference materials. Core templates and workflow updates are delivered through Paopao's license service.",
+    "longDescription": "paopao is a licensed workflow shell for creating polished, editable PowerPoint decks from PDFs, reports, papers, and reference materials. Core templates and workflow updates are delivered through Paopao's license service.",
     "developerName": "Paopao",
     "category": "Productivity",
     "capabilities": [
