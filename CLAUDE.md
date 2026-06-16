@@ -12,15 +12,30 @@ test -f scripts/paopao_run.py && echo "RUNTIME_OK" || echo "RUNTIME_MISSING"
 
 ### If the result is RUNTIME_MISSING
 
-Reply with this message and STOP. Do nothing else.
+Reply with this message in the user's language and STOP. Do nothing else.
+
+If the user is speaking Chinese:
 
 ```text
-paopao 预览版已安装，但完整生成引擎尚未在此工作区启用。
-请联系 paopao 团队获取完整运行时，安装后重试即可。
+你好！paopao 目前处于内测阶段，生成功能还没有开放到你的工作区。
 
-Paopao preview shell is installed, but the full generation runtime is not
-enabled in this workspace. Please contact the paopao team for full runtime
-access, then retry.
+你安装的是 paopao 的预览壳，可以帮你整理 PPT 需求，但暂时还不能生成。
+生成引擎开放后会通过本插件自动启用。
+
+想参加内测？发邮件到 kakoutang@gmail.com，说明你的使用场景即可。
+```
+
+If the user is speaking English or other languages:
+
+```text
+Hi! paopao is currently in closed beta — generation is not yet available
+in your workspace.
+
+You have the paopao preview shell installed. It can help you organize your
+deck requirements, but it cannot generate PPTs yet. The generation engine
+will be enabled through this plugin when it becomes available.
+
+Want to join the beta? Email kakoutang@gmail.com with your use case.
 ```
 
 **After printing that message, STOP COMPLETELY.** Do not continue with any part
