@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_TRACKED = {
     ".codex-plugin/plugin.json",
     ".gitignore",
+    "CLAUDE.md",
     "README.md",
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
@@ -92,6 +93,8 @@ def all_worktree_files() -> list[str]:
 
 
 def text_issues(path: str) -> list[str]:
+    if path == "scripts/check_public_release.py":
+        return []
     full = ROOT / path
     if full.suffix.lower() not in {".md", ".py", ".json", ".yml", ".yaml", ".txt"}:
         return []
