@@ -8,17 +8,20 @@ into editable consulting-style PowerPoint decks.
 ## Free Edition
 
 - 7 public layout templates
-- Image-first workflow: generate visual references before PPTX reconstruction
-- Public HTML-to-editable-PPTX renderer
+- Same Image2-first production workflow as local Paopao
+- Prompt-backed visual reference generation before PPTX reconstruction
+- HTML-to-editable-PPTX renderer and renderer guide
+- Full pipeline gates: analysis, prompt selection, image references, user
+  approval, image-only reconstruction, PowerPoint QA, final delivery cleanup
 - Up to 15 slides per deck
-- Editable PPTX-oriented workflow
+- Editable PPTX output; no whole-slide screenshot backgrounds
 - Local files stay in the user's workspace
 
-The full Paopao system has a larger private prompt library, advanced layout
-coverage, and stronger commercial QA workflow. It is not included in this
-public repo.
+The full Paopao system has a larger private prompt library and broader advanced
+layout coverage. The public edition keeps the production workflow but limits
+template count and deck length.
 
-完整版包含更大的私有模板库和商用质检流程，不包含在这个公开仓库里。
+完整版包含更大的私有模板库和更多高级版式。公开版保留生产流程，但限制模板数量和页数。
 
 ## Setup
 

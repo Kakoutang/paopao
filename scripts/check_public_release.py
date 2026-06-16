@@ -23,6 +23,7 @@ ALLOWED_TRACKED = {
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
     "prompts/PUBLIC_STYLE.md",
+    "prompts/SYSTEM_PROMPT.md",
     "prompts/01C_diagram_with_commentary.md",
     "prompts/02B_dual_chart_with_interpretation_cards.md",
     "prompts/04C_comparison_table_with_summary.md",
@@ -55,7 +56,6 @@ FORBIDDEN_PATTERNS = [
     "**/*.ppt",
     "**/*.pdf",
     "**/pptx_qa.py",
-    "**/SYSTEM_PROMPT.md",
     "**/final_prompt_*.md",
     "**/image2_prompt_*.md",
     "**/generation_request_*.json",
@@ -63,8 +63,6 @@ FORBIDDEN_PATTERNS = [
 
 FORBIDDEN_TEXT = [
     "paopao-internal",
-    "generation_request",
-    "SYSTEM_PROMPT",
     "Jenny",
     "/Users/jennytang",
     "SparkDeck",
@@ -104,10 +102,16 @@ def all_worktree_files() -> list[str]:
 def text_issues(path: str) -> list[str]:
     if path == "scripts/check_public_release.py":
         return []
-    if path in {"scripts/renderer.py", "reference/renderer_guide.md"}:
+    if path in {
+        "scripts/renderer.py",
+        "scripts/paopao_run.py",
+        "reference/renderer_guide.md",
+        "prompts/SYSTEM_PROMPT.md",
+        "skills/paopao-ppt/SKILL.md",
+        "CLAUDE.md",
+    }:
         text_forbidden = [
             "paopao-internal",
-            "SYSTEM_PROMPT.md",
             "/Users/jennytang",
             "SparkDeck",
             "SPARK_DATA_DIR",
