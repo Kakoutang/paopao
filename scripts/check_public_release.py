@@ -86,7 +86,7 @@ def all_worktree_files() -> list[str]:
     for path in ROOT.rglob("*"):
         if not path.is_file():
             continue
-        if ".git" in path.parts:
+        if ".git" in path.parts or "__pycache__" in path.parts:
             continue
         files.append(rel(path))
     return sorted(files)
