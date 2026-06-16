@@ -19,10 +19,10 @@ ALLOWED_TRACKED = {
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
+    "scripts/pptx_qa.py",
     "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
-    "prompts/PUBLIC_STYLE.md",
     "prompts/SYSTEM_PROMPT.md",
     "prompts/01C_diagram_with_commentary.md",
     "prompts/02B_dual_chart_with_interpretation_cards.md",
@@ -55,7 +55,6 @@ FORBIDDEN_PATTERNS = [
     "**/*.pptx",
     "**/*.ppt",
     "**/*.pdf",
-    "**/pptx_qa.py",
     "**/final_prompt_*.md",
     "**/image2_prompt_*.md",
     "**/generation_request_*.json",
@@ -102,9 +101,14 @@ def all_worktree_files() -> list[str]:
 def text_issues(path: str) -> list[str]:
     if path == "scripts/check_public_release.py":
         return []
-    if path in {
-        "scripts/renderer.py",
+    if path == "scripts/renderer.py":
+        text_forbidden = [
+            "paopao-internal",
+            "/Users/jennytang",
+        ]
+    elif path in {
         "scripts/paopao_run.py",
+        "scripts/pptx_qa.py",
         "reference/renderer_guide.md",
         "prompts/SYSTEM_PROMPT.md",
         "skills/paopao-ppt/SKILL.md",

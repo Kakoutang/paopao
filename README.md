@@ -1,56 +1,108 @@
 # paopao
 
-paopao public edition turns source documents, notes, and reference materials
-into editable consulting-style PowerPoint decks.
+paopao is a local plugin for creating editable consulting-style
+PPTX decks from PDFs, papers, reports, and reference images.
 
-泡泡公开版可以把文档、笔记和参考资料整理成可编辑的咨询风格 PPT。
+This MVP does not run a web app and does not call Paopao-owned model APIs. The
+user's local AI workspace performs the reasoning workflow.
 
-## Free Edition
+## What Is Included
 
-- 7 public layout templates
-- Same Image2-first production workflow as local Paopao
-- Prompt-backed visual reference generation before PPTX reconstruction
-- HTML-to-editable-PPTX renderer and renderer guide
-- Full pipeline gates: analysis, prompt selection, image references, user
-  approval, image-only reconstruction, PowerPoint QA, final delivery cleanup
-- Up to 15 slides per deck
-- Editable PPTX output; no whole-slide screenshot backgrounds
-- Local files stay in the user's workspace
+- `skills/paopao-ppt/SKILL.md`: the local deck workflow.
+- `scripts/renderer.py`: HTML to editable PPTX renderer for the HTML commercial path.
+- `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
+- `scripts/paopao_run.py`: task initialization, commercial path validation, rendering, and packaging helper.
+- `prompts/`: layout annotation library.
+- `reference/renderer_guide.md`: HTML/PPTX stability rules for the HTML path.
 
-The full Paopao system has a larger private prompt library and broader advanced
-layout coverage. The public edition keeps the production workflow but limits
-template count and deck length.
+## Public Edition Limits
 
-完整版包含更大的私有模板库和更多高级版式。公开版保留生产流程，但限制模板数量和页数。
+This public GitHub edition uses the same production workflow as local Paopao.
+The public limits are:
 
-## Setup
+- 7 included prompt templates instead of the full private prompt library.
+- Up to 15 slides per deck.
 
-Install the plugin in Codex, then ask paopao to create a deck.
+Paopao is updating quickly right now. If an output looks like an older workflow
+or skips visual references, pull/reinstall the latest GitHub version and try
+again; quality may improve as updates land.
 
-Optional local helper check:
+## Quality Gates
+
+The plugin enforces the commercial delivery path with local checks:
+
+- A commercial render contract must declare either `html` or `direct_pptx` as the editable reconstruction path, with Image2 as the source of truth.
+- Direct PPTX output is allowed only when it is built from image-derived measurement/visual contracts and passes the real PowerPoint preview gate.
+- HTML cannot use short text placeholders as icons inside icon containers when HTML is the declared path.
+- Screenshot-cropped icon PNGs are checked for opaque corner backgrounds. Use `python3 scripts/paopao_run.py clean-icon-crop --image <reference> --box x,y,w,h --output <asset.png>` to expand the crop, remove the detected background, trim to the real icon, and export a transparent PNG.
+- Final QA must explicitly compare title, module geometry, icons, takeaway, and color hierarchy against the generated visual reference, using real PPTX previews rather than HTML/browser previews.
+- PowerPoint QA must confirm actual PPTX opening, visible text/numbers/icons, layout match, and no overlap.
+- Delivery cleanup rejects exposed prompt Markdown files.
+- Delivery cleanup rejects multiple top-level PPTX drafts; only the final PPTX should remain visible.
+
+## Quick Test
 
 ```bash
 python3 scripts/paopao_run.py doctor
+python3 scripts/paopao_run.py init --name demo --pages 3 --language English
+python3 scripts/paopao_run.py check --task-dir output/demo
 ```
 
-## Usage
+If Codex declares the HTML commercial path and creates `output/demo/html/slide01.html` and other slide HTML files:
 
-Examples:
+```bash
+python3 scripts/paopao_run.py render \
+  --task-dir output/demo \
+  --pptx output/demo/pptx/demo.pptx
+```
 
-- `用这个 PDF 帮我做 5 页中文 PPT，重点是管理层汇报`
-- `Make a 4-page English deck from this report for an investor briefing`
+## Open Preview And Licensing
 
-If slide count, language, or focus is missing, paopao will ask before starting.
+The commercial plugin supports activation-code licensing through the companion
+license API in `auth_server/`.
 
-Note: Paopao is updating quickly right now. If output looks like an older
-workflow or skips visual references, pull/reinstall the latest GitHub version
-and try again.
+Open preview mode:
 
-## Full Version
+- Early users can render without activation while `PAOPAO_OPEN_PREVIEW=1`.
+- This is the default during the initial feedback window.
+- Set `PAOPAO_OPEN_PREVIEW=0` when you are ready to turn paid licensing back on.
 
-For the full version, contact WeChat: `sugarong_`.
+Paid mode:
 
-## Privacy
+- Set `PAOPAO_FREE_MAX_SLIDES=10` to allow 10 slides without activation.
+- Larger decks require a paid license and page quota.
 
-Source documents stay in your local workspace. This public plugin does not send
-files to a Paopao server.
+Activate a paid installation:
+
+```bash
+PAOPAO_AUTH_URL=https://your-render-service.onrender.com \
+python3 scripts/paopao_auth.py activate --code PAOPAO-PRO-XXXX
+```
+
+Check status:
+
+```bash
+python3 scripts/paopao_auth.py status
+```
+
+When `PAOPAO_AUTH_REQUIRED=1` is set in a commercial package, rendering reserves
+page quota before generation. Successful jobs commit the quota; failed jobs
+cancel the reservation so users are not charged for failed output.
+
+Manual license fulfillment:
+
+```bash
+python3 ../../scripts/issue_paopao_license.py \
+  --server-url "$PAOPAO_AUTH_URL" \
+  --admin-key-id "$PAOPAO_ADMIN_KEY_ID" \
+  --admin-private-key "$PAOPAO_ADMIN_PRIVATE_KEY" \
+  --email user@example.com \
+  --plan pro_monthly \
+  --price-code early_bird_19_usd_monthly
+```
+
+For local development only, set:
+
+```bash
+PAOPAO_LOCAL_DEV=1
+```
