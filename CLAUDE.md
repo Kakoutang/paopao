@@ -22,6 +22,7 @@ than 10 slides, stop and ask them to reduce the page count or contact WeChat
 
 ## Hard Rules
 
+- Use the public runtime controller first. At the start of a task, run `python3 <plugin-root>/scripts/paopao_run.py make-deck --name <task-name> --source <file> --pages <n> --language <language> --focus <focus>`. After each required agent/image/user step, continue with `make-deck --task-dir output/<task-name>`. Do not bypass the runtime by going directly from source files to HTML or PPTX.
 - Do not freehand the workflow from memory. At the start of every Paopao task and after each major artifact is created, run `paopao_run.py run-task --task-dir output/<task-name>` and follow the blocked `next_action`. If `run-task` is blocked, do not skip ahead to later stages.
 - Final output must be `.pptx`.
 - Final PPTX must be editable. Never use a whole-slide screenshot, Image2, PNG, JPG, or PDF as the slide background.
@@ -97,6 +98,20 @@ source report/PDF
 The image is the visual contract for the reconstruction stage. The source report and prompts determine what the image should contain, but once Image2 is selected, the declared HTML or direct-PPTX source must be based on the actual observed image through the per-slide observation record, not on memory, the prompt text, or a guessed layout.
 
 The controller command is the source of truth for the next allowed action:
+
+```bash
+python3 <plugin-root>/scripts/paopao_run.py make-deck --task-dir output/<task-name>
+```
+
+`make-deck` is the public runtime entrypoint. It creates/continues the task,
+copies sources into `source/`, auto-runs deterministic steps when safe, writes
+`qa/public_runtime_state.json`, and returns a machine-readable `next_action`.
+If it returns `image_generation_required`, generate exactly the requested
+references from the locked generation requests, register them, then rerun
+`make-deck`. If it returns `agent_required`, complete only that stage and rerun
+`make-deck`.
+
+The lower-level controller remains available for inspection:
 
 ```bash
 python3 <plugin-root>/scripts/paopao_run.py run-task --task-dir output/<task-name>

@@ -10,7 +10,9 @@ commercial path uses the HTML renderer.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -452,17 +454,29 @@ def write_task_local_gitignore(task_dir: Path) -> None:
     path.write_text(TASK_LOCAL_GITIGNORE, encoding="utf-8")
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    if args.pages and free_max_slides() and args.pages > free_max_slides():
+def enforce_public_page_limit(pages: int | None) -> None:
+    if pages and free_max_slides() and pages > free_max_slides():
         raise SystemExit(
             f"paopao 免费版最多支持 {free_max_slides()} 页。"
             "如需更多页数或完整模板库，请联系微信 sugarong_ 获取。\n"
             f"paopao free tier supports up to {free_max_slides()} slides. "
             "For more pages or the full template library, contact WeChat: sugarong_"
         )
-    task_name = slugify(args.name)
-    root = Path(args.output_root).resolve() / task_name
+
+
+def create_task_dir(
+    *,
+    name: str,
+    output_root: str | Path,
+    pages: int | None,
+    language: str,
+    focus: str,
+) -> Path:
+    enforce_public_page_limit(pages)
+    task_name = slugify(name)
+    root = Path(output_root).resolve() / task_name
     for child in [
+        "source",
         "analysis",
         "image2",
         "spec",
@@ -474,9 +488,9 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     manifest = {
         "task_name": task_name,
-        "page_count": args.pages,
-        "language": args.language,
-        "focus": args.focus,
+        "page_count": pages,
+        "language": language,
+        "focus": focus,
         "status": "initialized",
     }
     (root / "paopao_task.json").write_text(
@@ -484,6 +498,17 @@ def cmd_init(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     write_task_local_gitignore(root)
+    return root
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    root = create_task_dir(
+        name=args.name,
+        output_root=args.output_root,
+        pages=args.pages,
+        language=args.language,
+        focus=args.focus,
+    )
     print(root)
     return 0
 
@@ -1031,11 +1056,16 @@ def load_slide_story(task_dir: Path) -> dict[int, dict[str, str]]:
         return {}
     out: dict[int, dict[str, str]] = {}
     for item in slides:
-        if not isinstance(item, dict) or not isinstance(item.get("slide"), int):
+        if not isinstance(item, dict):
             continue
-        out[int(item["slide"])] = {
+        slide_value = item.get("slide")
+        if not isinstance(slide_value, int):
+            slide_value = item.get("slide_number")
+        if not isinstance(slide_value, int):
+            continue
+        out[int(slide_value)] = {
             "brief": str(item.get("brief", "") or item.get("claim", "") or item.get("title", "")),
-            "role": str(item.get("role", "")),
+            "role": str(item.get("role", "") or item.get("slide_role", "")),
             "section_name": str(item.get("section_name", "")),
         }
     return out
@@ -1060,6 +1090,8 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
                 "missing_tier1_data": missing,
             })
     if not compatible:
+        compatible = list(catalog)
+    elif len(compatible) < min(3, len(catalog)):
         compatible = list(catalog)
 
     selected: list[dict[str, object]] = []
@@ -1090,7 +1122,13 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
         candidate_pool = [entry for _, _, entry, _ in scored[:3]]
         if len(candidate_pool) < 3:
             candidate_pool.extend(entry for entry in compatible if entry not in candidate_pool)
+        if len(candidate_pool) < 3:
+            candidate_pool.extend(entry for entry in catalog if entry not in candidate_pool)
         candidate_pool = candidate_pool[:3]
+        score_by_template = {
+            str(scored_entry.get("template", "")): score
+            for score, _, scored_entry, _ in scored
+        }
         candidates = [
             {
                 "rank": rank + 1,
@@ -1099,10 +1137,7 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
                 "family": candidate["family"],
                 "visual_grammar": prompt_visual_grammar(str(candidate["family"])),
                 "selection_method": "role_fit_with_visual_diversity",
-                "score": next(
-                    score for score, _, scored_entry, _ in scored
-                    if scored_entry.get("template") == candidate.get("template")
-                ),
+                "score": score_by_template.get(str(candidate.get("template", "")), 0),
                 "when_to_use": candidate.get("when_to_use", ""),
             }
             for rank, candidate in enumerate(candidate_pool)
@@ -4832,6 +4867,293 @@ def task_controller_status(
     }
 
 
+def copy_runtime_sources(task_dir: Path, sources: list[str]) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    source_dir = task_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    for raw in sources:
+        src = Path(raw).expanduser().resolve()
+        if not src.exists():
+            copied.append({"source": str(src), "ok": False, "error": "missing"})
+            continue
+        if src.is_dir():
+            target = source_dir / src.name
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(src, target)
+            copied.append({"source": str(src), "target": str(target), "ok": True, "type": "directory"})
+        else:
+            target = source_dir / src.name
+            shutil.copy2(src, target)
+            copied.append(
+                {
+                    "source": str(src),
+                    "target": str(target),
+                    "ok": True,
+                    "type": "file",
+                    "sha256": sha256_file(target),
+                }
+            )
+    return copied
+
+
+def write_public_runtime_state(task_dir: Path, state: dict[str, object]) -> None:
+    runtime_dir = task_dir / "qa"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "public_runtime_state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def slide_story_exists(task_dir: Path) -> bool:
+    path = task_dir / "analysis" / "slide_story.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    slides = data.get("slides") if isinstance(data, dict) else data
+    return isinstance(slides, list) and bool(slides)
+
+
+def maybe_run_prompt_plan(task_dir: Path, expected: int, topic: str) -> dict[str, object] | None:
+    plan_path = prompt_selection_plan_path(task_dir)
+    if plan_path.exists() or not slide_story_exists(task_dir):
+        return None
+    args = argparse.Namespace(task_dir=str(task_dir), pages=expected, topic=topic)
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        rc = cmd_plan_prompts(args)
+    return {
+        "action": "plan-prompts",
+        "return_code": rc,
+        "path": str(plan_path),
+        "stdout_captured": bool(stdout.getvalue().strip()),
+    }
+
+
+def maybe_prepare_image2_requests(task_dir: Path) -> dict[str, object] | None:
+    manifest = task_dir / "image2" / "image2_generation_manifest.json"
+    if manifest.exists():
+        return None
+    expected = expected_pages_from_task(task_dir)
+    if not expected:
+        return None
+    issues: list[str] = []
+    check_analysis_files(task_dir, expected, issues)
+    if issues:
+        return None
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        rc = cmd_prepare_image2_prompts(argparse.Namespace(task_dir=str(task_dir)))
+    return {
+        "action": "prepare-image2-prompts",
+        "return_code": rc,
+        "path": str(manifest),
+        "stdout_captured": bool(stdout.getvalue().strip()),
+    }
+
+
+def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dict[str, object]:
+    blocked = status.get("blocked") if isinstance(status.get("blocked"), dict) else None
+    if not blocked:
+        return {
+            "type": "deliverable",
+            "message": "Final delivery gate is complete. Reply only with files under delivery/.",
+        }
+    stage = str(blocked.get("stage", ""))
+    expected = int(status.get("expected_pages", 0) or 0)
+    if stage == "analysis":
+        return {
+            "type": "agent_required",
+            "stage": "analysis",
+            "message": (
+                "Read source files, write analysis_report.md and slide_story.json, rerun make-deck "
+                "so the runtime can select templates, then write final_prompt_XX.md from the selected plan."
+            ),
+            "must_create": [
+                "analysis/analysis_report.md",
+                "analysis/slide_story.json",
+                "analysis/prompt_selection_audit.md",
+                *[f"analysis/final_prompt_{idx:02d}.md" for idx in range(1, expected + 1)],
+            ],
+            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+            "forbidden": [
+                "Do not write HTML or PPTX before analysis check passes.",
+                "Do not show prompt Markdown files to the user.",
+            ],
+        }
+    if stage == "image2":
+        requests = [f"image2/generation_request_{idx:02d}.json" for idx in range(1, expected + 1)]
+        register_commands = [
+            (
+                "python3 scripts/paopao_run.py register-image2-reference "
+                f"--task-dir {task_dir} --slide {idx} "
+                f"--image <generated_image_{idx:02d}_path_outside_task_dir> "
+                f"--generation-request {task_dir / 'image2' / f'generation_request_{idx:02d}.json'} "
+                f"--generated-prompt-sha256 <sha256_of_image2_prompt_{idx:02d}.md> "
+                "--source image_gen_builtin --tool-call-id <image_generation_artifact_id>"
+            )
+            for idx in range(1, expected + 1)
+        ]
+        return {
+            "type": "image_generation_required",
+            "stage": "image2",
+            "message": (
+                "Generate exactly one reference image per slide from generation_request_XX.json "
+                "prompt_text, register each image, then record style review and ask the user to approve previews."
+            ),
+            "generation_requests": requests,
+            "register_commands": register_commands,
+            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+            "forbidden": [
+                "Do not summarize or rewrite prompt_text for image generation.",
+                "Do not use HTML/PPTX/browser previews as Image2 references.",
+                "Do not continue to reconstruction before user approval is recorded.",
+            ],
+        }
+    if stage == "memory_boundary":
+        return {
+            "type": "agent_required",
+            "stage": "memory_boundary",
+            "message": (
+                "Run forget-after-image2 after user approval, then reopen each selected image and "
+                "record fresh observations from the image only."
+            ),
+            "commands": [
+                f"python3 scripts/paopao_run.py forget-after-image2 --task-dir {task_dir}",
+                *[
+                    (
+                        "python3 scripts/paopao_run.py record-image2-observation "
+                        f"--task-dir {task_dir} --slide {idx} --evidence <fresh visual observation>"
+                    )
+                    for idx in range(1, expected + 1)
+                ],
+            ],
+            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+        }
+    if stage == "html":
+        return {
+            "type": "agent_required",
+            "stage": "reconstruction",
+            "message": (
+                "Extract image-derived contracts, write measurement/spec files, declare html or direct_pptx, "
+                "then build the declared editable source from the selected images only."
+            ),
+            "commands": [
+                *[
+                    f"python3 scripts/paopao_run.py extract-image2-contract --task-dir {task_dir} --slide {idx}"
+                    for idx in range(1, expected + 1)
+                ],
+                (
+                    "python3 scripts/paopao_run.py record-commercial-render "
+                    f"--task-dir {task_dir} --render-path <html|direct_pptx> --pptx <final_pptx_path>"
+                ),
+            ],
+            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+            "forbidden": [
+                "Do not use final_prompt, image2_prompt, analysis_report, or remembered intent as visual inputs.",
+                "Do not render whole-slide images as PPT backgrounds.",
+            ],
+        }
+    if stage == "pptx":
+        return {
+            "type": "agent_required",
+            "stage": "pptx_qa",
+            "message": (
+                "Render the declared editable PPTX, open the real PPTX in PowerPoint, record PowerPoint "
+                "and fidelity reviews, then rerun make-deck."
+            ),
+            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+        }
+    if stage == "delivery":
+        return {
+            "type": "finalize_required",
+            "stage": "delivery",
+            "message": "Run finalize-delivery; only files under delivery/ are user-facing.",
+            "command": f"python3 scripts/paopao_run.py finalize-delivery --task-dir {task_dir} --pptx <final_pptx_path>",
+        }
+    return {
+        "type": "blocked",
+        "stage": stage,
+        "message": str(blocked.get("next_action", "")),
+        "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
+    }
+
+
+def cmd_make_deck(args: argparse.Namespace) -> int:
+    if args.task_dir:
+        task_dir = Path(args.task_dir).expanduser().resolve()
+        if not task_dir.exists():
+            raise SystemExit(f"Task directory does not exist: {task_dir}")
+    else:
+        if not args.name:
+            raise SystemExit("make-deck requires --name when --task-dir is not supplied.")
+        if not args.pages:
+            raise SystemExit("make-deck requires --pages when creating a new task.")
+        task_dir = create_task_dir(
+            name=args.name,
+            output_root=args.output_root,
+            pages=args.pages,
+            language=args.language,
+            focus=args.focus,
+        )
+
+    copied_sources = copy_runtime_sources(task_dir, args.source or [])
+    if any(not item.get("ok") for item in copied_sources):
+        state = {
+            "schema": "paopao.public_runtime_state.v1",
+            "task_dir": str(task_dir),
+            "ok": False,
+            "blocked": {
+                "stage": "source",
+                "issues": copied_sources,
+            },
+        }
+        write_public_runtime_state(task_dir, state)
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 1
+
+    expected = args.pages or expected_pages_from_task(task_dir)
+    if not expected:
+        raise SystemExit("Missing expected page count. Pass --pages or initialize the task with --pages.")
+    enforce_public_page_limit(expected)
+
+    automatic_actions: list[dict[str, object]] = []
+    planned = maybe_run_prompt_plan(task_dir, expected, args.topic or args.focus or task_dir.name)
+    if planned:
+        automatic_actions.append(planned)
+    prepared = maybe_prepare_image2_requests(task_dir)
+    if prepared:
+        automatic_actions.append(prepared)
+
+    pptx = Path(args.pptx).expanduser().resolve() if args.pptx else None
+    status = task_controller_status(task_dir, expected, pptx)
+    next_action = public_runtime_next_action(task_dir, status)
+    state = {
+        "schema": "paopao.public_runtime_state.v1",
+        "runtime": "public_make_deck",
+        "task_dir": str(task_dir),
+        "expected_pages": expected,
+        "public_limits": {
+            "max_slides": free_max_slides(),
+            "prompt_templates": len(load_prompt_catalog()),
+        },
+        "copied_sources": copied_sources,
+        "automatic_actions": automatic_actions,
+        "status": status,
+        "next_action": next_action,
+        "user_visible_output_policy": (
+            "Only delivery/ is user-facing. Prompt, analysis, spec, image2 request, and QA files are internal."
+        ),
+    }
+    write_public_runtime_state(task_dir, state)
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+    return 0 if status.get("deliverable") else 2
+
+
 def cmd_run_task(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir).resolve()
     expected = args.pages or expected_pages_from_task(task_dir)
@@ -5228,6 +5550,21 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--language", default="")
     init.add_argument("--focus", default="")
     init.set_defaults(func=cmd_init)
+
+    make_deck = sub.add_parser(
+        "make-deck",
+        help="Public runtime controller: create or continue a deck task without skipping required gates",
+    )
+    make_deck.add_argument("--task-dir", default="", help="Existing task directory to continue")
+    make_deck.add_argument("--name", default="", help="Task name when creating a new task")
+    make_deck.add_argument("--output-root", default="output")
+    make_deck.add_argument("--source", action="append", default=[], help="Source file or folder to copy into task/source")
+    make_deck.add_argument("--pages", type=int, default=None)
+    make_deck.add_argument("--language", default="")
+    make_deck.add_argument("--focus", default="")
+    make_deck.add_argument("--topic", default="", help="Deck topic for deterministic prompt-template planning")
+    make_deck.add_argument("--pptx", default="", help="Final PPTX path when continuing late-stage QA/finalization")
+    make_deck.set_defaults(func=cmd_make_deck)
 
     plan_prompts = sub.add_parser(
         "plan-prompts",

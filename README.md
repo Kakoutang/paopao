@@ -11,7 +11,7 @@ user's local AI workspace performs the reasoning workflow.
 - `skills/paopao-ppt/SKILL.md`: the local deck workflow.
 - `scripts/renderer.py`: HTML to editable PPTX renderer for the HTML commercial path.
 - `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
-- `scripts/paopao_run.py`: task initialization, commercial path validation, rendering, and packaging helper.
+- `scripts/paopao_run.py`: public runtime controller, task initialization, commercial path validation, rendering, and packaging helper.
 - `prompts/`: layout annotation library.
 - `reference/renderer_guide.md`: HTML/PPTX stability rules for the HTML path.
 
@@ -31,6 +31,11 @@ again; quality may improve as updates land.
 
 The plugin enforces the commercial delivery path with local checks:
 
+- `make-deck` is the public runtime entrypoint. It creates or continues a task,
+  copies source files into `source/`, auto-runs deterministic steps such as
+  prompt-template planning and locked image-request preparation, and stops with
+  a machine-readable `next_action` whenever model reasoning, image generation,
+  user approval, or visual reconstruction is required.
 - A commercial render contract must declare either `html` or `direct_pptx` as the editable reconstruction path, with Image2 as the source of truth.
 - Direct PPTX output is allowed only when it is built from image-derived measurement/visual contracts and passes the real PowerPoint preview gate.
 - HTML cannot use short text placeholders as icons inside icon containers when HTML is the declared path.
@@ -44,17 +49,23 @@ The plugin enforces the commercial delivery path with local checks:
 
 ```bash
 python3 scripts/paopao_run.py doctor
-python3 scripts/paopao_run.py init --name demo --pages 3 --language English
-python3 scripts/paopao_run.py check --task-dir output/demo
+python3 scripts/paopao_run.py make-deck \
+  --name demo \
+  --source /path/to/source.pdf \
+  --pages 3 \
+  --language English \
+  --focus "management briefing"
 ```
 
-If Codex declares the HTML commercial path and creates `output/demo/html/slide01.html` and other slide HTML files:
+Continue from the same runtime after each required agent or image step:
 
 ```bash
-python3 scripts/paopao_run.py render \
-  --task-dir output/demo \
-  --pptx output/demo/pptx/demo.pptx
+python3 scripts/paopao_run.py make-deck --task-dir output/demo
 ```
+
+The command writes `qa/public_runtime_state.json`. Only `delivery/` is
+user-facing after finalization; prompt, analysis, spec, image request, and QA
+files are internal build artifacts.
 
 ## Open Preview And Licensing
 
