@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if private Paopao assets are present in the public plugin shell."""
+"""Fail if private Paopao assets are present in the public plugin."""
 
 from __future__ import annotations
 
@@ -18,12 +18,21 @@ ALLOWED_TRACKED = {
     "README.md",
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
+    "scripts/paopao_run.py",
     "skills/paopao-ppt/SKILL.md",
+    "prompts/INDEX.md",
+    "prompts/PUBLIC_STYLE.md",
+    "prompts/01C_diagram_with_commentary.md",
+    "prompts/02B_dual_chart_with_interpretation_cards.md",
+    "prompts/04C_comparison_table_with_summary.md",
+    "prompts/07A_executive_summary_scr.md",
+    "prompts/08B_initiative_rollout_matrix.md",
+    "prompts/09A_chevron_with_detail_rows.md",
+    "prompts/14D_headline_metrics_with_charts.md",
     ".github/workflows/public-release-guard.yml",
 }
 
 FORBIDDEN_PATTERNS = [
-    "prompts/**",
     "reference/**",
     "docs/**",
     "memory/**",
@@ -44,7 +53,6 @@ FORBIDDEN_PATTERNS = [
     "**/*.pptx",
     "**/*.ppt",
     "**/*.pdf",
-    "**/paopao_run.py",
     "**/renderer.py",
     "**/pptx_qa.py",
     "**/SYSTEM_PROMPT.md",
@@ -60,8 +68,17 @@ FORBIDDEN_TEXT = [
     "generation_request",
     "SYSTEM_PROMPT",
     "Image2 reference",
+    "commercial_render_contract",
+    "visual contract",
+    "locked image",
+    "prepare-image2-prompts",
+    "register-image2-reference",
     "Jenny",
     "/Users/jennytang",
+    "SparkDeck",
+    "SPARK_DATA_DIR",
+    "SPARK_PRESERVED_ASSET",
+    "SPARK_CHROMIUM_EXECUTABLE",
 ]
 
 

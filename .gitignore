@@ -6,9 +6,7 @@ __pycache__/
 output/
 dist/
 
-# Commercial/private Paopao assets must never be committed to the public shell.
-prompts/
-reference/
+# Private assets that must never be committed
 docs/
 memory/
 qa/

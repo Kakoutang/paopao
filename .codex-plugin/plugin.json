@@ -1,15 +1,15 @@
 {
   "name": "paopao",
-  "version": "0.1.0",
-  "description": "paopao: turn source documents into editable consulting-style PPTX decks.",
+  "version": "0.2.0",
+  "description": "paopao: generate editable consulting-style PPTX decks from PDFs, reports, papers, and reference materials.",
   "author": {
     "name": "Paopao"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "paopao",
-    "shortDescription": "Create editable consulting-style PPTX decks from source documents.",
-    "longDescription": "paopao is a licensed workflow shell for creating polished, editable PowerPoint decks from PDFs, reports, papers, and reference materials. Core templates and workflow updates are delivered through Paopao's license service.",
+    "shortDescription": "Turn source documents into editable consulting-style PPTX decks.",
+    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks. Free edition includes 7 layout templates and up to 15 slides per deck. Full template library (90+ layouts) available via WeChat: sugarong_",
     "developerName": "Paopao",
     "category": "Productivity",
     "capabilities": [
@@ -17,6 +17,6 @@
       "presentations",
       "document-analysis"
     ],
-    "defaultPrompt": "Use Paopao to turn this document into an editable PPTX deck."
+    "defaultPrompt": "Use paopao to turn this document into an editable PPTX deck."
   }
 }
