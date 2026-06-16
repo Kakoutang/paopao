@@ -7,6 +7,19 @@ description: "Use Paopao to turn PDFs, reports, papers, and reference images int
 
 paopao creates editable PowerPoint decks from source documents.
 
+## Public Edition Limits
+
+This GitHub public edition uses the normal Paopao workflow but has two trial
+limits:
+
+- Maximum deck length: 10 slides.
+- Prompt library: only the 5 prompt templates included in this repository.
+
+If the user asks how many slides/pages are allowed, answer that the GitHub
+public edition supports up to 10 slides per deck. If the user requests more
+than 10 slides, stop and ask them to reduce the page count or contact WeChat
+`sugarong_` for the full version.
+
 ## Hard Rules
 
 - Do not freehand the workflow from memory. At the start of every Paopao task and after each major artifact is created, run `paopao_run.py run-task --task-dir output/<task-name>` and follow the blocked `next_action`. If `run-task` is blocked, do not skip ahead to later stages.

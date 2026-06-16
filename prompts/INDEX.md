@@ -1,18 +1,16 @@
-# paopao Prompt Library — Free Edition
+# paopao Prompt Library - Public Edition
 
-本目录包含 7 个免费 layout 模板，覆盖最常用的 PPT 页面类型。
+本目录包含 5 个公开版 layout 模板，覆盖最常用的 PPT 页面类型。
 
-This directory contains 7 free layout templates covering the most common slide types.
+This directory contains 5 public layout templates covering the most common slide types.
 
 ## Available Layouts
 
 | File | Layout Name | Type |
 |------|------------|------|
 | 01C_diagram_with_commentary.md | diagram_with_commentary | 概念图解 / Conceptual Diagram |
-| 02B_dual_chart_with_interpretation_cards.md | dual_chart_with_interpretation_cards | 图表分析 / Chart Analysis |
 | 04C_comparison_table_with_summary.md | comparison_table_with_summary | 对比表格 / Comparison Table |
 | 07A_executive_summary_scr.md | executive_summary_scr | 执行摘要 / Executive Summary |
-| 08B_initiative_rollout_matrix.md | initiative_rollout_matrix | 矩阵规划 / Matrix Planning |
 | 09A_chevron_with_detail_rows.md | chevron_with_detail_rows | 流程步骤 / Process Flow |
 | 14D_headline_metrics_with_charts.md | headline_metrics_with_charts | 数据仪表盘 / Data Dashboard |
 

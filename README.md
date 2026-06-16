@@ -20,8 +20,8 @@ user's local AI workspace performs the reasoning workflow.
 This public GitHub edition uses the same production workflow as local Paopao.
 The public limits are:
 
-- 7 included prompt templates instead of the full private prompt library.
-- Up to 15 slides per deck.
+- 5 included prompt templates instead of the full private prompt library.
+- Up to 10 slides per deck.
 
 Paopao is updating quickly right now. If an output looks like an older workflow
 or skips visual references, pull/reinstall the latest GitHub version and try

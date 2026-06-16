@@ -382,11 +382,11 @@ def open_preview_enabled() -> bool:
 
 
 def free_max_slides() -> int:
-    raw = os.getenv("PAOPAO_FREE_MAX_SLIDES", "15").strip()
+    raw = os.getenv("PAOPAO_FREE_MAX_SLIDES", "10").strip()
     try:
-        return 15 if int(raw) <= 0 else min(15, int(raw))
+        return 10 if int(raw) <= 0 else min(10, int(raw))
     except ValueError:
-        return 15
+        return 10
 
 
 def has_local_license() -> bool:
