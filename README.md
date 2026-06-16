@@ -42,6 +42,10 @@ Examples:
 
 If slide count, language, or focus is missing, paopao will ask before starting.
 
+Note: Paopao is updating quickly right now. If output looks like an older
+workflow or skips visual references, pull/reinstall the latest GitHub version
+and try again.
+
 ## Full Version
 
 For the full version, contact WeChat: `sugarong_`.
