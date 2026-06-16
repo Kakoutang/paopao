@@ -8,6 +8,8 @@ layout library than the full Paopao system.
 
 ## Output Contract
 
+- First create one visual reference image per slide. The reference images are
+  the design target for the editable PPTX reconstruction.
 - Create a real editable PPTX deck, not a deck made of full-slide screenshots.
 - Keep the deck to 15 slides or fewer.
 - Use the user's requested language consistently.
@@ -125,6 +127,8 @@ PowerPoint materials, sparse functional icons, no decorative backgrounds.
 
 When building editable PPTX from HTML:
 
+- Start from the approved visual reference images, not from memory or from the
+  topic alone.
 - Write HTML as a clean slide surface, not a webpage.
 - Use fixed 16:9 slide dimensions.
 - Prefer simple boxes, tables, text, arrows, and chart containers.

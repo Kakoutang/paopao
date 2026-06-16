@@ -26,6 +26,7 @@ Then stop.
 ## Free Edition Limits
 
 - Seven public layouts in `prompts/`
+- Mandatory visual reference image generation before PPTX reconstruction
 - Public renderer and renderer reference guide
 - Up to 15 slides per deck
 - Public style prompt only
@@ -49,6 +50,10 @@ otherwise.
 
 - Follow `CLAUDE.md`.
 - Use `prompts/PUBLIC_STYLE.md` and the seven public layout templates.
+- Generate exactly one visual reference image per requested slide before
+  creating the final PPTX.
+- Show the reference images and wait for user confirmation or requested changes
+  before reconstructing the editable PPTX.
 - Use `reference/renderer_guide.md` and `scripts/renderer.py` when converting
   HTML into editable PPTX.
 - Produce editable PPTX output where possible.

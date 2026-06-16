@@ -8,6 +8,7 @@ into editable consulting-style PowerPoint decks.
 ## Free Edition
 
 - 7 public layout templates
+- Image-first workflow: generate visual references before PPTX reconstruction
 - Public HTML-to-editable-PPTX renderer
 - Up to 15 slides per deck
 - Editable PPTX-oriented workflow

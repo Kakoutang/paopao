@@ -13,6 +13,7 @@ commercial prompt library or full commercial QA pipeline.
 - Use only the seven public layout templates listed in `prompts/INDEX.md`.
 - Use `reference/renderer_guide.md` when converting HTML into editable PPTX.
 - Use `scripts/renderer.py` when HTML-to-PPTX rendering is needed.
+- Generate one visual reference image per slide before writing HTML or PPTX.
 - Keep decks to 15 slides or fewer.
 - Create editable PPTX output whenever possible.
 - Do not expose build prompts, temporary analysis notes, or hidden process files
@@ -60,13 +61,36 @@ python3 scripts/paopao_run.py check-pages --pages <N>
 2. Build a concise evidence map: key facts, numbers, entities, conflicts, and
    citations available from the source.
 3. Choose one of the seven public layouts for each slide.
-4. Compose slide content using the public style prompt and selected layout.
-5. Build a clean editable source, preferably HTML that follows
+4. Compose one visual-reference prompt per slide using the public style prompt
+   and selected layout.
+5. Use image generation to create exactly one visual reference image per
+   requested slide. If the user requested 4 slides, produce 4 reference images.
+6. Show the reference images to the user and ask for confirmation before PPTX
+   reconstruction. Do not proceed to final PPTX until the user confirms or asks
+   for specific changes.
+7. After confirmation, rebuild the deck from the approved images as editable
+   PPTX. Treat each approved image as the visual source of truth. Do not invent
+   a different design from the original topic or your prior reasoning.
+8. Build a clean editable source, preferably HTML that follows
    `reference/renderer_guide.md`, then render to PPTX with
    `scripts/renderer.py` when practical.
-6. Verify the deck has the requested number of slides, consistent language,
+9. Verify the deck has the requested number of slides, the same visual structure
+   as the approved references, consistent language,
    readable text, editable objects, no full-slide screenshot backgrounds, and no
    prompt files in the user-facing output.
+
+## Image-First Rule
+
+Reference images are mandatory in the public edition.
+
+- Do not skip directly from source material to HTML.
+- Do not skip directly from source material to PPTX.
+- Do not use HTML preview PNGs as a substitute for generated reference images.
+- Do not put the reference image as a full-slide background in the final PPTX.
+- The final PPTX must remain editable, but its layout should be reconstructed
+  from the approved reference images.
+- If image generation is unavailable in the user's environment, stop and tell
+  the user that paopao needs image generation enabled for this workflow.
 
 ## Quality Rules
 
