@@ -8,12 +8,14 @@ into editable consulting-style PowerPoint decks.
 ## Free Edition
 
 - 7 public layout templates
+- Public HTML-to-editable-PPTX renderer
 - Up to 15 slides per deck
 - Editable PPTX-oriented workflow
 - Local files stay in the user's workspace
 
 The full Paopao system has a larger private prompt library, advanced layout
-coverage, and commercial QA workflow. It is not included in this public repo.
+coverage, and stronger commercial QA workflow. It is not included in this
+public repo.
 
 完整版包含更大的私有模板库和商用质检流程，不包含在这个公开仓库里。
 

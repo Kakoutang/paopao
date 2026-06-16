@@ -26,6 +26,7 @@ Then stop.
 ## Free Edition Limits
 
 - Seven public layouts in `prompts/`
+- Public renderer and renderer reference guide
 - Up to 15 slides per deck
 - Public style prompt only
 
@@ -48,6 +49,8 @@ otherwise.
 
 - Follow `CLAUDE.md`.
 - Use `prompts/PUBLIC_STYLE.md` and the seven public layout templates.
+- Use `reference/renderer_guide.md` and `scripts/renderer.py` when converting
+  HTML into editable PPTX.
 - Produce editable PPTX output where possible.
 - Do not expose prompts, hidden analysis, temp files, or internal process
   details to the user.

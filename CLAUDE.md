@@ -5,12 +5,14 @@ consulting-style PowerPoint decks from user-provided documents, notes, and
 reference images.
 
 This repository is the public edition. It does not contain Paopao's private
-commercial prompt library, private rendering system, or commercial QA pipeline.
+commercial prompt library or full commercial QA pipeline.
 
 ## Public Boundary
 
 - Use only the public style guide in `prompts/PUBLIC_STYLE.md`.
 - Use only the seven public layout templates listed in `prompts/INDEX.md`.
+- Use `reference/renderer_guide.md` when converting HTML into editable PPTX.
+- Use `scripts/renderer.py` when HTML-to-PPTX rendering is needed.
 - Keep decks to 15 slides or fewer.
 - Create editable PPTX output whenever possible.
 - Do not expose build prompts, temporary analysis notes, or hidden process files
@@ -59,7 +61,9 @@ python3 scripts/paopao_run.py check-pages --pages <N>
    citations available from the source.
 3. Choose one of the seven public layouts for each slide.
 4. Compose slide content using the public style prompt and selected layout.
-5. Build an editable PPTX using the available presentation tools.
+5. Build a clean editable source, preferably HTML that follows
+   `reference/renderer_guide.md`, then render to PPTX with
+   `scripts/renderer.py` when practical.
 6. Verify the deck has the requested number of slides, consistent language,
    readable text, editable objects, no full-slide screenshot backgrounds, and no
    prompt files in the user-facing output.
@@ -77,5 +81,5 @@ python3 scripts/paopao_run.py check-pages --pages <N>
 ## Full Version
 
 The full Paopao system contains a larger layout library, private prompt system,
-private rendering workflow, and commercial QA controls. It is not included in
-this public repository.
+and stronger commercial QA controls. It is not included in this public
+repository.

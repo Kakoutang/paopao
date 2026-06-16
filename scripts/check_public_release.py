@@ -19,6 +19,7 @@ ALLOWED_TRACKED = {
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
+    "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
     "prompts/PUBLIC_STYLE.md",
@@ -29,11 +30,11 @@ ALLOWED_TRACKED = {
     "prompts/08B_initiative_rollout_matrix.md",
     "prompts/09A_chevron_with_detail_rows.md",
     "prompts/14D_headline_metrics_with_charts.md",
+    "reference/renderer_guide.md",
     ".github/workflows/public-release-guard.yml",
 }
 
 FORBIDDEN_PATTERNS = [
-    "reference/**",
     "docs/**",
     "memory/**",
     "output/**",
@@ -53,7 +54,6 @@ FORBIDDEN_PATTERNS = [
     "**/*.pptx",
     "**/*.ppt",
     "**/*.pdf",
-    "**/renderer.py",
     "**/pptx_qa.py",
     "**/SYSTEM_PROMPT.md",
     "**/final_prompt_*.md",
@@ -63,16 +63,8 @@ FORBIDDEN_PATTERNS = [
 
 FORBIDDEN_TEXT = [
     "paopao-internal",
-    "final_prompt",
-    "image2_prompt",
     "generation_request",
     "SYSTEM_PROMPT",
-    "Image2 reference",
-    "commercial_render_contract",
-    "visual contract",
-    "locked image",
-    "prepare-image2-prompts",
-    "register-image2-reference",
     "Jenny",
     "/Users/jennytang",
     "SparkDeck",
@@ -112,6 +104,18 @@ def all_worktree_files() -> list[str]:
 def text_issues(path: str) -> list[str]:
     if path == "scripts/check_public_release.py":
         return []
+    if path in {"scripts/renderer.py", "reference/renderer_guide.md"}:
+        text_forbidden = [
+            "paopao-internal",
+            "SYSTEM_PROMPT.md",
+            "/Users/jennytang",
+            "SparkDeck",
+            "SPARK_DATA_DIR",
+            "SPARK_PRESERVED_ASSET",
+            "SPARK_CHROMIUM_EXECUTABLE",
+        ]
+    else:
+        text_forbidden = FORBIDDEN_TEXT
     full = ROOT / path
     if full.suffix.lower() not in {".md", ".py", ".json", ".yml", ".yaml", ".txt"}:
         return []
@@ -120,7 +124,7 @@ def text_issues(path: str) -> list[str]:
     except UnicodeDecodeError:
         return [f"{path}: non-text bytes in a text-like file"]
     issues = []
-    for needle in FORBIDDEN_TEXT:
+    for needle in text_forbidden:
         if needle in text:
             issues.append(f"{path}: contains forbidden internal marker {needle!r}")
     return issues

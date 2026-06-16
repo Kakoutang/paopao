@@ -20,6 +20,8 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_PROMPT = PLUGIN_ROOT / "prompts" / "PUBLIC_STYLE.md"
 PROMPT_INDEX = PLUGIN_ROOT / "prompts" / "INDEX.md"
+RENDERER = PLUGIN_ROOT / "scripts" / "renderer.py"
+RENDERER_GUIDE = PLUGIN_ROOT / "reference" / "renderer_guide.md"
 FREE_MAX_SLIDES = int(os.getenv("PAOPAO_FREE_MAX_SLIDES", "15"))
 
 
@@ -49,11 +51,19 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "plugin_root": str(PLUGIN_ROOT),
         "public_prompt_exists": PUBLIC_PROMPT.exists(),
         "prompt_index_exists": PROMPT_INDEX.exists(),
+        "renderer_exists": RENDERER.exists(),
+        "renderer_guide_exists": RENDERER_GUIDE.exists(),
         "free_max_slides": FREE_MAX_SLIDES,
         "private_runtime_included": False,
     }
     print(json.dumps(checks, ensure_ascii=False, indent=2))
-    return 0 if checks["public_prompt_exists"] and checks["prompt_index_exists"] else 1
+    required = [
+        checks["public_prompt_exists"],
+        checks["prompt_index_exists"],
+        checks["renderer_exists"],
+        checks["renderer_guide_exists"],
+    ]
+    return 0 if all(required) else 1
 
 
 def cmd_init(args: argparse.Namespace) -> int:
