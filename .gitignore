@@ -5,3 +5,21 @@ __pycache__/
 .paopao/
 output/
 dist/
+
+# Commercial/private Paopao assets must never be committed to the public shell.
+prompts/
+reference/
+docs/
+memory/
+qa/
+pptx/
+image2/
+html/
+spec/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.pptx
+*.ppt
+*.pdf

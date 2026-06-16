@@ -1,6 +1,6 @@
 {
   "name": "paopao",
-  "version": "0.1.0+codex.20260615130318",
+  "version": "0.1.0",
   "description": "paopao: turn source documents into editable consulting-style PPTX decks.",
   "author": {
     "name": "Paopao"

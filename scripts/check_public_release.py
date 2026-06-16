@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Fail if private Paopao assets are present in the public plugin shell."""
+
+from __future__ import annotations
+
+import fnmatch
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+ALLOWED_TRACKED = {
+    ".codex-plugin/plugin.json",
+    ".gitignore",
+    "README.md",
+    "scripts/check_public_release.py",
+    "scripts/paopao_auth.py",
+    "skills/paopao-ppt/SKILL.md",
+    ".github/workflows/public-release-guard.yml",
+}
+
+FORBIDDEN_PATTERNS = [
+    "prompts/**",
+    "reference/**",
+    "docs/**",
+    "memory/**",
+    "output/**",
+    "dist/**",
+    "qa/**",
+    "pptx/**",
+    "image2/**",
+    "html/**",
+    "spec/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.zip",
+    "**/*.tar",
+    "**/*.tar.gz",
+    "**/*.tgz",
+    "**/*.pptx",
+    "**/*.ppt",
+    "**/*.pdf",
+    "**/paopao_run.py",
+    "**/renderer.py",
+    "**/pptx_qa.py",
+    "**/SYSTEM_PROMPT.md",
+    "**/final_prompt_*.md",
+    "**/image2_prompt_*.md",
+    "**/generation_request_*.json",
+]
+
+FORBIDDEN_TEXT = [
+    "paopao-internal",
+    "final_prompt",
+    "image2_prompt",
+    "generation_request",
+    "SYSTEM_PROMPT",
+    "Image2 reference",
+    "Jenny",
+    "/Users/jennytang",
+]
+
+
+def rel(path: Path) -> str:
+    return path.relative_to(ROOT).as_posix()
+
+
+def matches_forbidden(path: str) -> str | None:
+    for pattern in FORBIDDEN_PATTERNS:
+        if fnmatch.fnmatch(path, pattern):
+            return pattern
+    return None
+
+
+def tracked_files() -> list[str]:
+    out = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def all_worktree_files() -> list[str]:
+    files: list[str] = []
+    for path in ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        if ".git" in path.parts:
+            continue
+        files.append(rel(path))
+    return sorted(files)
+
+
+def text_issues(path: str) -> list[str]:
+    full = ROOT / path
+    if full.suffix.lower() not in {".md", ".py", ".json", ".yml", ".yaml", ".txt"}:
+        return []
+    try:
+        text = full.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return [f"{path}: non-text bytes in a text-like file"]
+    issues = []
+    for needle in FORBIDDEN_TEXT:
+        if needle in text:
+            issues.append(f"{path}: contains forbidden internal marker {needle!r}")
+    return issues
+
+
+def main() -> int:
+    issues: list[str] = []
+    for path in tracked_files():
+        if path not in ALLOWED_TRACKED:
+            issues.append(f"tracked file is not allowed in public shell: {path}")
+        pattern = matches_forbidden(path)
+        if pattern:
+            issues.append(f"tracked forbidden file {path} matched {pattern}")
+        issues.extend(text_issues(path))
+
+    for path in all_worktree_files():
+        pattern = matches_forbidden(path)
+        if pattern:
+            issues.append(f"worktree forbidden file {path} matched {pattern}")
+
+    if issues:
+        print("Public Paopao release guard failed:", file=sys.stderr)
+        for issue in issues:
+            print(f"- {issue}", file=sys.stderr)
+        return 1
+    print("Public Paopao release guard passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

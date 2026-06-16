@@ -46,7 +46,7 @@ python3 scripts/paopao_auth.py logout
 
 ## Privacy
 
-Your source documents stay in your local Codex environment. The license service
+Your source documents stay in your local AI workspace. The license service
 tracks license status, device activation, plan, and page quota metadata. It
 does not need your source PDFs to validate your license.
 
