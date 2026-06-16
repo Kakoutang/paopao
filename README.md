@@ -3,12 +3,22 @@
 paopao helps turn PDFs, reports, papers, and reference materials into
 editable consulting-style PowerPoint decks.
 
+## Current Preview Status
+
+This public repository is the Paopao access shell. It does not contain the full
+generation runtime by itself. If the runtime is not enabled in your workspace,
+Paopao should not generate a substitute deck with generic tools.
+
+We are using this public shell for installation, request intake, privacy notes,
+and license activation. Full generation is available only when the Paopao
+runtime package is enabled.
+
 This public repository contains the installable plugin shell:
 
 - plugin metadata
 - public usage instructions
 - license activation client
-- lightweight workflow entrypoint
+- lightweight runtime gate and request-intake entrypoint
 
 The full commercial workflow, template library, private rules, and update logic
 are delivered through Paopao's managed distribution.
@@ -16,7 +26,7 @@ are delivered through Paopao's managed distribution.
 ## Open Preview
 
 paopao is currently open for early feedback. During this preview window, you do
-not need a license to try it.
+not need a license to try it after the full runtime has been enabled.
 
 After the preview period, paid licensing may be enabled for larger decks or
 commercial use.
