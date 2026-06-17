@@ -6,6 +6,10 @@ __pycache__/
 output/
 dist/
 
+# Workflow files fetched from server at runtime
+prompts/SYSTEM_PROMPT.md
+reference/renderer_guide.md
+
 # Private assets that must never be committed
 docs/
 memory/

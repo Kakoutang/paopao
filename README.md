@@ -8,12 +8,12 @@ user's local AI workspace performs the reasoning workflow.
 
 ## What Is Included
 
-- `skills/paopao-ppt/SKILL.md`: the local deck workflow.
+- `skills/paopao-ppt/SKILL.md`: deck workflow entry point.
 - `scripts/renderer.py`: HTML to editable PPTX renderer for the HTML commercial path.
 - `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
 - `scripts/paopao_run.py`: public runtime controller, task initialization, commercial path validation, rendering, and packaging helper.
-- `prompts/`: layout annotation library.
-- `reference/renderer_guide.md`: HTML/PPTX stability rules for the HTML path.
+- `prompts/`: layout annotation index (templates served from production server).
+- `reference/`: renderer guide (fetched from production server at runtime).
 
 ## Public Edition Limits
 

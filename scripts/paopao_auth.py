@@ -200,6 +200,14 @@ def fetch_prompt_content(name: str) -> str:
     return result.get("content", "")
 
 
+def fetch_workflow_content(name: str) -> str:
+    base = server_url()
+    if not base:
+        return ""
+    result = request_json("GET", f"{base}/workflow/{name}")
+    return result.get("content", "")
+
+
 def logout() -> None:
     if LICENSE_PATH.exists():
         LICENSE_PATH.unlink()

@@ -32,6 +32,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 RENDERER = PLUGIN_ROOT / "scripts" / "renderer.py"
 SYSTEM_PROMPT = PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md"
 PROMPT_LIBRARY_DIR = PLUGIN_ROOT / "prompts"
+WORKFLOW_CACHE_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao")) / "workflow"
 
 
 PROMPT_REQUIRED_MARKERS = ["TITLE", "BOTTOM", "Source", "DESIGN"]
@@ -904,6 +905,67 @@ def has_placeholder(text: str) -> bool:
 
 
 _remote_prompt_cache: dict[str, str] = {}
+_workflow_cache: dict[str, str] = {}
+
+WORKFLOW_LOCAL_PATHS: dict[str, Path] = {
+    "SYSTEM_PROMPT.md": SYSTEM_PROMPT,
+    "renderer_guide.md": PLUGIN_ROOT / "reference" / "renderer_guide.md",
+}
+
+
+def fetch_and_cache_workflow(name: str) -> str:
+    content = ""
+    for attempt in range(3):
+        try:
+            content = paopao_auth.fetch_workflow_content(name)
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    if not content:
+        return ""
+    if not content.strip():
+        return ""
+    _workflow_cache[name] = content
+    local = WORKFLOW_LOCAL_PATHS.get(name)
+    if local:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(content, encoding="utf-8")
+    else:
+        WORKFLOW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (WORKFLOW_CACHE_DIR / name).write_text(content, encoding="utf-8")
+    return content
+
+
+def get_workflow_content(name: str) -> str:
+    if name in _workflow_cache:
+        return _workflow_cache[name]
+    local = WORKFLOW_LOCAL_PATHS.get(name)
+    if local and local.exists():
+        text = read_text(local)
+        if text.strip():
+            _workflow_cache[name] = text
+            return text
+    cached = WORKFLOW_CACHE_DIR / name
+    if cached.exists():
+        text = read_text(cached)
+        if text.strip():
+            _workflow_cache[name] = text
+            return text
+    return fetch_and_cache_workflow(name)
+
+
+def get_system_prompt_text() -> str:
+    return get_workflow_content("SYSTEM_PROMPT.md")
+
+
+def get_system_prompt_sha() -> str:
+    text = get_system_prompt_text()
+    if text:
+        return sha256_text(text)
+    if SYSTEM_PROMPT.exists():
+        return sha256_file(SYSTEM_PROMPT)
+    return ""
 
 
 def prompt_template_path(name: str) -> Path:
@@ -1046,16 +1108,23 @@ def prompt_role_base_score(entry: dict[str, object], story_text: str, slide_idx:
     return score
 
 
+def max_template_uses(pages: int, available: int) -> int:
+    if available <= 0:
+        return pages
+    return (pages + available - 1) // available
+
+
 def prompt_candidate_score(
     entry: dict[str, object],
     story_text: str,
     slide_idx: int,
     expected: int,
-    used_templates: set[str],
+    used_templates: dict[str, int],
     used_families: set[str],
     used_grammars: set[str],
     previous_family: str,
     previous_grammar: str,
+    max_uses: int = 1,
 ) -> tuple[int, list[str]]:
     template = str(entry.get("template", ""))
     family = str(entry.get("family", ""))
@@ -1064,9 +1133,13 @@ def prompt_candidate_score(
     reasons: list[str] = []
     if score:
         reasons.append(f"role_fit={score}")
-    if template in used_templates:
+    current_count = used_templates.get(template, 0)
+    if current_count >= max_uses:
         score -= 1000
-        reasons.append("repeat_template=-1000")
+        reasons.append(f"repeat_template_over_limit=-1000 (used={current_count}, max={max_uses})")
+    elif current_count > 0:
+        score -= 300
+        reasons.append(f"repeat_template=-300 (used={current_count}, max={max_uses})")
     if family in used_families:
         score -= 180
         reasons.append("repeat_family=-180")
@@ -1134,11 +1207,12 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
         compatible = list(catalog)
 
     selected: list[dict[str, object]] = []
-    used_templates: set[str] = set()
+    used_templates: dict[str, int] = {}
     used_families: set[str] = set()
     used_grammars: set[str] = set()
     previous_family = ""
     previous_grammar = ""
+    max_uses = max_template_uses(expected, len(compatible))
     for idx in range(1, expected + 1):
         story = slide_story.get(idx, {})
         story_text = prompt_story_text(story, topic)
@@ -1154,6 +1228,7 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
                 used_grammars,
                 previous_family,
                 previous_grammar,
+                max_uses,
             )
             scored.append((score, str(entry.get("template", "")), entry, reasons))
         scored.sort(key=lambda item: (-item[0], item[1]))
@@ -1197,7 +1272,8 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
             "score_reasons": chosen_reasons,
             "candidates": candidates,
         })
-        used_templates.add(str(chosen["template"]))
+        t_name = str(chosen["template"])
+        used_templates[t_name] = used_templates.get(t_name, 0) + 1
         used_families.add(family)
         used_grammars.add(grammar)
         previous_family = family
@@ -1213,9 +1289,11 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
         "compatible_catalog_size": len(compatible),
         "rejected_for_missing_tier1_data": rejected[:40],
         "report_signals": report_signals,
+        "max_template_uses": max_uses,
         "selection_rule": (
-            "deterministic role-fit scoring with tier-1 data compatibility, template uniqueness, "
-            "scaffold-family diversity, and adjacent visual-grammar collision penalties"
+            f"deterministic role-fit scoring with tier-1 data compatibility, "
+            f"max {max_uses} use(s) per template (ceil({expected}/{len(compatible)})), "
+            f"scaffold-family diversity, and adjacent visual-grammar collision penalties"
         ),
         "slide_story_path": "analysis/slide_story.json" if slide_story else None,
         "slides": selected,
@@ -1261,24 +1339,26 @@ def prompt_template_issue(text: str, prompt_name: str) -> list[str]:
     return issues
 
 
-def prompt_selection_diversity_issues(selections: list[tuple[int, str, str]]) -> list[str]:
+def prompt_selection_diversity_issues(selections: list[tuple[int, str, str]], available_templates: int = 0) -> list[str]:
     issues: list[str] = []
     if len(selections) < 2:
         return issues
-    template_seen: dict[str, int] = {}
+    max_uses = max_template_uses(len(selections), available_templates) if available_templates > 0 else 1
+    template_counts: dict[str, list[int]] = {}
     family_seen: dict[str, int] = {}
     previous_idx = 0
     previous_family = ""
     previous_grammar = ""
     for idx, template_name, family in selections:
         grammar = prompt_visual_grammar(family)
-        if template_name in template_seen:
+        template_counts.setdefault(template_name, []).append(idx)
+        if len(template_counts[template_name]) > max_uses:
             issues.append(
-                f"final_prompt_{idx:02d}.md repeats PROMPT_TEMPLATE {template_name}; "
-                f"already used on slide {template_seen[template_name]:02d}. Select a different prompt-library template unless the audit gives a content-specific exception."
+                f"final_prompt_{idx:02d}.md uses PROMPT_TEMPLATE {template_name} "
+                f"{len(template_counts[template_name])} times (max allowed: {max_uses} for "
+                f"{len(selections)} pages / {available_templates} templates). "
+                f"Select a different prompt-library template."
             )
-        else:
-            template_seen[template_name] = idx
         if family in family_seen:
             issues.append(
                 f"prompt selection plan slide {idx} repeats scaffold family {family}; "
@@ -1354,10 +1434,11 @@ def prompt_selection_plan_issues(task_dir: Path, expected: int, selections: list
                 f"final_prompt_{idx:02d}.md uses {actual}, but prompt_selection_plan.json selected {planned}; "
                 "rerun plan-prompts or revise the final prompt to match the selected template"
             )
+    avail = int(plan.get("compatible_catalog_size") or plan.get("catalog_size") or 0)
     issues.extend(prompt_selection_diversity_issues([
         (idx, selected_by_slide[idx], prompt_scaffold_family(selected_by_slide[idx]))
         for idx in sorted(selected_by_slide)
-    ]))
+    ], available_templates=avail))
     return issues
 
 
@@ -1547,11 +1628,11 @@ def prompt_private_path(task_dir: Path, path: Path) -> Path:
 
 
 def build_image2_prompt_text(task_dir: Path, idx: int) -> str:
-    system_text = read_text(SYSTEM_PROMPT)
+    system_text = get_system_prompt_text()
     slide_prompt = read_text(task_dir / "analysis" / f"final_prompt_{idx:02d}.md")
     navigation_contract = build_deck_navigation_contract(task_dir, idx)
     if not system_text.strip():
-        raise SystemExit(f"System prompt missing or empty: {SYSTEM_PROMPT}")
+        raise SystemExit("System prompt missing or empty — check server connection")
     if not slide_prompt.strip():
         raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
     return (
@@ -1628,7 +1709,7 @@ def cmd_prepare_image2_prompts(args: argparse.Namespace) -> int:
         image_path = image2_reference_path(task_dir, idx)
         prompt_sha = sha256_text(prompt_text)
         final_prompt_sha = sha256_file(final_prompt) if final_prompt.exists() else None
-        system_prompt_sha = sha256_file(SYSTEM_PROMPT)
+        system_prompt_sha = get_system_prompt_sha()
         request_sha = sha256_file(request_path)
         image_sha = sha256_file(image_path) if image_path.exists() else None
         base_entry: dict[str, object] = {
@@ -2591,7 +2672,7 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
         "generation_request_sha256": sha256_file(request_path),
         "generation_request_id": str(generation_request.get("request_id", "")),
         "final_prompt_sha256": sha256_file(final_prompt) if final_prompt.exists() else None,
-        "system_prompt_sha256": sha256_file(SYSTEM_PROMPT),
+        "system_prompt_sha256": get_system_prompt_sha(),
         "image_sha256": sha256_file(target),
         "image_path": str(target.relative_to(task_dir)),
         "image_status": "registered_verified",
@@ -2670,7 +2751,8 @@ def check_analysis_files(task_dir: Path, expected: int, issues: list[str]) -> No
                 issues.append(f"final_prompt_{idx:02d}.md missing {marker}")
         if "VISUAL STYLE" not in text and "compact consulting" not in text.lower():
             issues.append(f"final_prompt_{idx:02d}.md missing compact consulting visual-style instruction")
-    issues.extend(prompt_selection_diversity_issues(prompt_selections))
+    avail_count = len(load_prompt_catalog())
+    issues.extend(prompt_selection_diversity_issues(prompt_selections, available_templates=avail_count))
     issues.extend(prompt_selection_plan_issues(task_dir, expected, prompt_selections))
 
 
@@ -2924,7 +3006,8 @@ def check_image2_files(
             final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
             if require_prompt_files and final_prompt.exists() and entry.get("final_prompt_sha256") != sha256_file(final_prompt):
                 issues.append(f"image2_generation_manifest slide {idx}: final_prompt_sha256 mismatch")
-            if require_prompt_files and SYSTEM_PROMPT.exists() and entry.get("system_prompt_sha256") != sha256_file(SYSTEM_PROMPT):
+            sp_sha = get_system_prompt_sha()
+            if require_prompt_files and sp_sha and entry.get("system_prompt_sha256") != sp_sha:
                 issues.append(f"image2_generation_manifest slide {idx}: system_prompt_sha256 mismatch")
     if image_refs:
         check_image2_style_review(task_dir, expected, issues)
@@ -5554,6 +5637,22 @@ def cmd_package(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch_workflow(args: argparse.Namespace) -> int:
+    ALL_WORKFLOW = ["SKILL.md", "SYSTEM_PROMPT.md", "renderer_guide.md"]
+    names = ALL_WORKFLOW if args.fetch_all else ([args.name] if args.name else ALL_WORKFLOW)
+    results: dict[str, str] = {}
+    for name in names:
+        content = fetch_and_cache_workflow(name)
+        if content:
+            local = WORKFLOW_LOCAL_PATHS.get(name)
+            path = str(local) if local else str(WORKFLOW_CACHE_DIR / name)
+            results[name] = path
+        else:
+            results[name] = "FAILED"
+    print(json.dumps(results, indent=2, ensure_ascii=False))
+    return 0 if all(v != "FAILED" for v in results.values()) else 1
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     modules = ["playwright", "pptx", "lxml"]
     module_checks = {
@@ -5567,7 +5666,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "plugin_root": str(PLUGIN_ROOT),
         "renderer_exists": RENDERER.exists(),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
-        "renderer_guide_exists": (PLUGIN_ROOT / "reference" / "renderer_guide.md").exists(),
+        "renderer_guide_exists": bool(get_workflow_content("renderer_guide.md")),
         "python_modules": module_checks,
         "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
         "chromium_hint": chromium_hint,
@@ -5785,6 +5884,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Check local plugin files")
     doctor.set_defaults(func=cmd_doctor)
+
+    fw = sub.add_parser("fetch-workflow", help="Fetch workflow files from server")
+    fw.add_argument("--name", default="", help="Single file name (SKILL.md, SYSTEM_PROMPT.md, renderer_guide.md)")
+    fw.add_argument("--all", action="store_true", dest="fetch_all", help="Fetch all workflow files")
+    fw.set_defaults(func=cmd_fetch_workflow)
     return parser
 
 
