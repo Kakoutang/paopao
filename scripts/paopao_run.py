@@ -903,8 +903,27 @@ def has_placeholder(text: str) -> bool:
     return any(pattern in lower for pattern in PLACEHOLDER_PATTERNS)
 
 
+_remote_prompt_cache: dict[str, str] = {}
+
+
 def prompt_template_path(name: str) -> Path:
     return PROMPT_LIBRARY_DIR / name
+
+
+def read_prompt_template(name: str) -> str:
+    local = PROMPT_LIBRARY_DIR / name
+    if local.exists():
+        return read_text(local)
+    if name in _remote_prompt_cache:
+        return _remote_prompt_cache[name]
+    if has_local_license():
+        try:
+            content = paopao_auth.fetch_prompt_content(name)
+            _remote_prompt_cache[name] = content
+            return content
+        except Exception:
+            pass
+    return ""
 
 
 def prompt_selection_plan_path(task_dir: Path) -> Path:
@@ -945,7 +964,7 @@ def parse_data_requires(text: str) -> list[str]:
     return values
 
 
-def load_prompt_catalog() -> list[dict[str, object]]:
+def _load_local_prompt_catalog() -> list[dict[str, object]]:
     catalog: list[dict[str, object]] = []
     for path in sorted(PROMPT_LIBRARY_DIR.glob("*.md")):
         if path.name in {"SYSTEM_PROMPT.md", "INDEX.md"}:
@@ -962,6 +981,28 @@ def load_prompt_catalog() -> list[dict[str, object]]:
             "data_requires": parse_data_requires(text),
         })
     return catalog
+
+
+def load_prompt_catalog() -> list[dict[str, object]]:
+    local = _load_local_prompt_catalog()
+    local_names = {str(e["template"]) for e in local}
+    if has_local_license():
+        try:
+            remote = paopao_auth.fetch_prompt_catalog()
+            for entry in remote:
+                name = entry.get("template", "")
+                if name and name not in local_names:
+                    dr = entry.get("data_requires", "")
+                    local.append({
+                        "template": name,
+                        "layout_name": entry.get("layout_name", ""),
+                        "family": prompt_scaffold_family(name),
+                        "when_to_use": str(entry.get("when_to_use", ""))[:320],
+                        "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
+                    })
+        except Exception:
+            pass
+    return local
 
 
 def extract_report_signals(analysis_report: str) -> dict[str, int]:
@@ -1205,9 +1246,9 @@ def prompt_template_issue(text: str, prompt_name: str) -> list[str]:
         ]
     template_name = match.group("name")
     template = prompt_template_path(template_name)
-    if not template.exists() or template.name == SYSTEM_PROMPT.name:
+    template_text = read_prompt_template(template_name)
+    if (not template_text) or template.name == SYSTEM_PROMPT.name:
         return [f"{prompt_name} PROMPT_TEMPLATE does not exist in prompt library: {template_name}"]
-    template_text = read_text(template)
     layout_match = LAYOUT_NAME_RE.search(template_text)
     if not layout_match:
         issues.append(f"{prompt_name} PROMPT_TEMPLATE {template_name} missing LAYOUT_NAME in library")

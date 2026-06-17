@@ -179,6 +179,26 @@ def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     return result
 
 
+def fetch_prompt_catalog() -> list[dict[str, Any]]:
+    data = read_license()
+    token = data.get("token", "")
+    base = server_url()
+    if not base:
+        return []
+    result = request_json("GET", f"{base}/prompts/catalog", token=token)
+    return result.get("prompts", [])
+
+
+def fetch_prompt_content(name: str) -> str:
+    data = read_license()
+    token = data.get("token", "")
+    base = server_url()
+    if not base:
+        raise AuthError("no server URL configured")
+    result = request_json("GET", f"{base}/prompts/{name}", token=token)
+    return result.get("content", "")
+
+
 def logout() -> None:
     if LICENSE_PATH.exists():
         LICENSE_PATH.unlink()
