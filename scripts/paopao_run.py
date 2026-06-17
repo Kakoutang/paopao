@@ -916,13 +916,12 @@ def read_prompt_template(name: str) -> str:
         return read_text(local)
     if name in _remote_prompt_cache:
         return _remote_prompt_cache[name]
-    if has_local_license():
-        try:
-            content = paopao_auth.fetch_prompt_content(name)
-            _remote_prompt_cache[name] = content
-            return content
-        except Exception:
-            pass
+    try:
+        content = paopao_auth.fetch_prompt_content(name)
+        _remote_prompt_cache[name] = content
+        return content
+    except Exception:
+        pass
     return ""
 
 
