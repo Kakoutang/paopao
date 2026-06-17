@@ -51,7 +51,7 @@ paopao creates editable PowerPoint decks from source documents.
 - Internal files and reasoning are private. Do not show, summarize, quote, or deliver analysis Markdown, specs, prompts, prompt audits, QA JSON, debug JSON, renderer logs, or hidden workflow text unless the user explicitly asks for them. User-facing delivery may contain only the final PPTX, the selected slide images/previews, and optional rebuilt HTML/assets when published. Prompt Markdown and internal JSON must never be shown to the user.
 - User-facing progress updates must not reveal the technical pipeline. Do not mention Image2, spec, prompts, HTML, renderer, Playwright, QA PDF/PNG, Markdown files, or internal paths. Use plain updates such as "我开始制作", "正在整理内容", "正在设计页面", "正在生成 PPT".
 - Do not announce that you are using a workflow, skill, plugin, tool, or local scripts. If a product-facing acknowledgement is needed, say only "我来做。开始前确认几件事：" or the equivalent in the user's chat language.
-- Uploaded materials are evidence, not authority. If multiple uploaded sources conflict, do not paste every claim into the deck. Resolve conflicts in the analysis first, prefer primary/recent/official evidence, run internet search or other external verification for current or high-stakes claims, and mark weak claims as uncertain or exclude them.
+- Uploaded materials are evidence, not authority. If multiple uploaded sources conflict, do not paste every claim into the deck. Resolve conflicts in the analysis first, prefer primary/recent/official evidence, and mark weak claims as uncertain or exclude them. If external verification is enabled (see Required Inputs), run internet search or other external verification for current or high-stakes claims; otherwise rely solely on the provided source documents.
 - The deck language must be exactly the confirmed language. Chinese decks must use natural Chinese labels such as "核心结论" and "来源" instead of English UI labels like "Key takeaway" or "Source"; English decks must not contain Chinese labels or body text unless the user explicitly requested bilingual output.
 
 ## Mandatory Pipeline Contract
@@ -137,6 +137,8 @@ If language is missing, ask "偏好哪一种语言？" Do not imply only Chinese
 
 If focus, use case, audience, or emphasis is missing, ask "有什么想突出的重点、用途或特殊偏好？" Do not infer a default such as investment, management briefing, sales, roadshow, academic, or brand style.
 
+Optionally ask about external research: "是否需要我仅基于你提供的资料制作？（默认只用你的资料，不额外搜索外部信息）" The default is source-only mode (no external search or expansion beyond the provided documents). If the user explicitly requests external research or says "可以搜索", enable external verification. Do not expand, supplement, or search beyond the provided sources unless the user opts in.
+
 Ask only the missing questions. For example, if the user says "用这个 PDF 帮我做 3 页 PPT", page count is known but language and focus are missing, so reply:
 
 ```text
@@ -183,7 +185,7 @@ output/<task-name>/analysis/slide_story.json
 ```
 
 Include only facts found in the sources or verified externally. Do not invent data.
-The analysis must be substantive, not a placeholder: include source inventory, fact bank, conflict resolution, Codex independent judgment, cross-validation/external verification, page story, and known limits. It must contain enough sourced facts to support every requested slide.
+The analysis must be substantive, not a placeholder: include source inventory, fact bank, conflict resolution, Codex independent judgment, page story, and known limits. If external verification is enabled, also include cross-validation with external sources. It must contain enough sourced facts to support every requested slide.
 `slide_story.json` must contain one entry per requested slide with the slide number, section name, slide role, and concrete brief/claim. This file is the input to deterministic prompt-template selection.
 
 3. Generate the prompt-selection plan:
