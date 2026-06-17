@@ -26,6 +26,7 @@ from typing import Any
 PLUGIN_VERSION = "0.1.0"
 CONFIG_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao"))
 LICENSE_PATH = CONFIG_DIR / "license.json"
+DEFAULT_SERVER_URL = "https://paopao-license-api.onrender.com"
 DEFAULT_TIMEOUT = 20
 
 
@@ -71,7 +72,7 @@ def write_license(data: dict[str, Any]) -> None:
 
 
 def server_url(value: str = "") -> str:
-    url = value or os.getenv("PAOPAO_AUTH_URL") or read_license().get("server_url", "")
+    url = value or os.getenv("PAOPAO_AUTH_URL") or read_license().get("server_url", "") or DEFAULT_SERVER_URL
     return str(url).rstrip("/")
 
 

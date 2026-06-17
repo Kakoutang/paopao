@@ -986,22 +986,21 @@ def _load_local_prompt_catalog() -> list[dict[str, object]]:
 def load_prompt_catalog() -> list[dict[str, object]]:
     local = _load_local_prompt_catalog()
     local_names = {str(e["template"]) for e in local}
-    if has_local_license():
-        try:
-            remote = paopao_auth.fetch_prompt_catalog()
-            for entry in remote:
-                name = entry.get("template", "")
-                if name and name not in local_names:
-                    dr = entry.get("data_requires", "")
-                    local.append({
-                        "template": name,
-                        "layout_name": entry.get("layout_name", ""),
-                        "family": prompt_scaffold_family(name),
-                        "when_to_use": str(entry.get("when_to_use", ""))[:320],
-                        "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
-                    })
-        except Exception:
-            pass
+    try:
+        remote = paopao_auth.fetch_prompt_catalog()
+        for entry in remote:
+            name = entry.get("template", "")
+            if name and name not in local_names:
+                dr = entry.get("data_requires", "")
+                local.append({
+                    "template": name,
+                    "layout_name": entry.get("layout_name", ""),
+                    "family": prompt_scaffold_family(name),
+                    "when_to_use": str(entry.get("when_to_use", ""))[:320],
+                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
+                })
+    except Exception:
+        pass
     return local
 
 
