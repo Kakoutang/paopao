@@ -136,6 +136,7 @@ PIPELINE_PASS_SCHEMA = "paopao.pipeline_pass.v1"
 FINAL_DELIVERY_PASS_SCHEMA = "paopao.final_delivery_pass.v1"
 COMMERCIAL_RENDER_CONTRACT_SCHEMA = "paopao.commercial_render_contract.v1"
 COMMERCIAL_RENDER_PATHS = {"html", "direct_pptx"}
+DIRECT_PPTX_OBJECT_MAP_SCHEMA = "paopao.direct_pptx_object_map.v1"
 
 VISUAL_CONTRACT_REQUIRED_REGIONS = [
     "nav",
@@ -153,6 +154,42 @@ VISUAL_CONTRACT_BORDER_STYLES = {
     "dashed",
     "dotted",
     "mixed",
+}
+VISUAL_CHART_KEYWORDS = {
+    "chart",
+    "graph",
+    "plot",
+    "bar_chart",
+    "line_chart",
+    "pie_chart",
+    "scatter",
+    "histogram",
+    "waterfall",
+    "柱状图",
+    "柱形图",
+    "条形图",
+    "折线图",
+    "曲线图",
+    "饼图",
+    "散点图",
+    "面积图",
+    "瀑布图",
+    "坐标轴",
+    "轴线",
+    "数据图",
+}
+VISUAL_TABLE_KEYWORDS = {
+    "table",
+    "matrix",
+    "grid",
+    "data_table",
+    "comparison_table",
+    "表格",
+    "矩阵",
+    "网格",
+    "行列",
+    "数据表",
+    "对比表",
 }
 IMAGE_ONLY_RECONSTRUCTION_SOURCE = "image2_reference_only"
 POST_IMAGE_FORBIDDEN_MEMORY_MARKERS = [
@@ -4222,6 +4259,208 @@ def check_pptx_file(pptx: Path, expected: int, issues: list[str]) -> dict[str, i
     }
 
 
+def direct_pptx_object_map_path(task_dir: Path) -> Path:
+    return task_dir / "qa" / "direct_pptx_object_map.json"
+
+
+def _contract_semantic_region_ids(task_dir: Path, expected: int) -> dict[str, dict[int, set[str]]]:
+    result: dict[str, dict[int, set[str]]] = {"chart": {}, "table": {}}
+    for idx in range(1, expected + 1):
+        contract = visual_contract_path(task_dir, idx)
+        if not contract.exists():
+            continue
+        data = _read_json_file(contract)
+        if not isinstance(data, dict):
+            continue
+        regions = data.get("regions")
+        if not isinstance(regions, list):
+            continue
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            rid = str(region.get("id", "")).strip()
+            if not rid or _is_visual_contract_root_region(region):
+                continue
+            text_items = region.get("text", [])
+            icon_items = region.get("icon_semantics", [])
+            haystack = " ".join(
+                [
+                    rid,
+                    str(region.get("role", "")),
+                    str(region.get("type", "")),
+                    " ".join(str(v) for v in text_items if isinstance(text_items, list)),
+                    " ".join(str(v) for v in icon_items if isinstance(icon_items, list)),
+                ]
+            ).lower()
+            if any(keyword.lower() in haystack for keyword in VISUAL_CHART_KEYWORDS):
+                result["chart"].setdefault(idx, set()).add(rid)
+            if any(keyword.lower() in haystack for keyword in VISUAL_TABLE_KEYWORDS):
+                result["table"].setdefault(idx, set()).add(rid)
+    return result
+
+
+def _pptx_package_object_counts(pptx: Path) -> dict[str, int]:
+    counts = {"charts": 0, "tables": 0, "embedded_workbooks": 0}
+    if not pptx.exists():
+        return counts
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(pptx) as zf:
+            names = zf.namelist()
+            counts["charts"] = len([
+                name for name in names
+                if name.startswith("ppt/charts/chart") and name.endswith(".xml")
+            ])
+            counts["embedded_workbooks"] = len([
+                name for name in names
+                if name.startswith("ppt/embeddings/")
+            ])
+            counts["tables"] = sum(
+                zf.read(name).count(b"<a:tbl")
+                for name in names
+                if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            )
+    except Exception:
+        return counts
+    return counts
+
+
+def check_direct_pptx_semantics(
+    task_dir: Path,
+    expected: int,
+    pptx: Path,
+    pptx_summary: dict[str, int] | None,
+    issues: list[str],
+) -> dict[str, object]:
+    semantic_regions = _contract_semantic_region_ids(task_dir, expected)
+    chart_regions = {idx: sorted(ids) for idx, ids in semantic_regions["chart"].items() if ids}
+    table_regions = {idx: sorted(ids) for idx, ids in semantic_regions["table"].items() if ids}
+    required_region_ids_by_slide: dict[int, set[str]] = {}
+    for idx in range(1, expected + 1):
+        data = _read_json_file(visual_contract_path(task_dir, idx))
+        if not isinstance(data, dict):
+            continue
+        regions = data.get("regions")
+        if not isinstance(regions, list):
+            continue
+        for region in regions:
+            if not isinstance(region, dict) or _is_visual_contract_root_region(region):
+                continue
+            rid = str(region.get("id", "")).strip()
+            if rid:
+                required_region_ids_by_slide.setdefault(idx, set()).add(rid)
+
+    package_counts = _pptx_package_object_counts(pptx)
+    chart_count = int(package_counts.get("charts") or (pptx_summary or {}).get("charts") or 0)
+    table_count = int(package_counts.get("tables") or (pptx_summary or {}).get("tables") or 0)
+    workbook_count = int(package_counts.get("embedded_workbooks") or 0)
+
+    if chart_regions and chart_count < sum(len(ids) for ids in chart_regions.values()):
+        issues.append(
+            "direct_pptx semantic gate: visual contract declares chart regions "
+            f"{chart_regions}, but the PPTX contains only {chart_count} native chart object(s). "
+            "Use PowerPoint chart objects with ChartData instead of drawing charts from lines/shapes."
+        )
+    if chart_regions and workbook_count < chart_count:
+        issues.append(
+            "direct_pptx semantic gate: native charts must include embedded workbook data so users can edit data via Excel."
+        )
+    if table_regions and table_count < sum(len(ids) for ids in table_regions.values()):
+        issues.append(
+            "direct_pptx semantic gate: visual contract declares table/matrix regions "
+            f"{table_regions}, but the PPTX contains only {table_count} native table object(s). "
+            "Use PowerPoint table objects instead of drawing tables from rectangles/text boxes."
+        )
+
+    map_path = direct_pptx_object_map_path(task_dir)
+    mapped_region_ids: set[str] = set()
+    mapped_region_ids_by_slide: dict[int, set[str]] = {}
+    mapped_chart_ids: set[str] = set()
+    mapped_table_ids: set[str] = set()
+    if not map_path.exists():
+        issues.append(
+            "qa/direct_pptx_object_map.json missing; direct_pptx must record the observed region-to-PPTX-object mapping "
+            "before pipeline/delivery can pass"
+        )
+    else:
+        data = _read_json_file(map_path)
+        if not isinstance(data, dict):
+            issues.append("qa/direct_pptx_object_map.json cannot be parsed")
+        else:
+            if data.get("schema") != DIRECT_PPTX_OBJECT_MAP_SCHEMA:
+                issues.append(f"qa/direct_pptx_object_map.json schema must be {DIRECT_PPTX_OBJECT_MAP_SCHEMA}")
+            if data.get("expected_pages") != expected:
+                issues.append("qa/direct_pptx_object_map.json expected_pages does not match task page count")
+            recorded_pptx = _resolve_task_path(task_dir, data.get("pptx_path"))
+            if recorded_pptx is None or recorded_pptx.resolve() != pptx.resolve():
+                issues.append("qa/direct_pptx_object_map.json pptx_path must match the checked PPTX")
+            if pptx.exists() and data.get("pptx_sha256") != sha256_file(pptx):
+                issues.append("qa/direct_pptx_object_map.json pptx_sha256 does not match the checked PPTX")
+            slides = data.get("slides")
+            if not isinstance(slides, list) or len(slides) != expected:
+                found = len(slides) if isinstance(slides, list) else 0
+                issues.append(f"qa/direct_pptx_object_map.json slides: expected {expected}, found {found}")
+            else:
+                for idx in range(1, expected + 1):
+                    entry = slides[idx - 1] if idx - 1 < len(slides) else {}
+                    if not isinstance(entry, dict):
+                        issues.append(f"qa/direct_pptx_object_map.json slide {idx}: entry must be an object")
+                        continue
+                    observation, _observation_issues = image_observation_record_issues(task_dir, idx)
+                    if observation is not None and entry.get("observation_id") != observation.get("observation_id"):
+                        issues.append(f"qa/direct_pptx_object_map.json slide {idx}: observation_id must match fresh observation")
+                    mappings = entry.get("regions")
+                    if not isinstance(mappings, list) or not mappings:
+                        issues.append(f"qa/direct_pptx_object_map.json slide {idx}: regions mapping list is required")
+                        continue
+                    for mapping in mappings:
+                        if not isinstance(mapping, dict):
+                            continue
+                        rid = str(mapping.get("region_id", "")).strip()
+                        kind = str(mapping.get("object_kind", "")).strip().lower()
+                        if not rid:
+                            issues.append(f"qa/direct_pptx_object_map.json slide {idx}: mapping missing region_id")
+                            continue
+                        mapped_region_ids.add(rid)
+                        mapped_region_ids_by_slide.setdefault(idx, set()).add(rid)
+                        if kind in {"chart", "native_chart"}:
+                            mapped_chart_ids.add(rid)
+                        if kind in {"table", "native_table"}:
+                            mapped_table_ids.add(rid)
+                        if not kind:
+                            issues.append(f"qa/direct_pptx_object_map.json slide {idx} region {rid}: object_kind is required")
+
+    for ids in chart_regions.values():
+        for rid in ids:
+            if rid not in mapped_chart_ids:
+                issues.append(f"direct_pptx semantic gate: chart region {rid} must map to object_kind native_chart")
+    for ids in table_regions.values():
+        for rid in ids:
+            if rid not in mapped_table_ids:
+                issues.append(f"direct_pptx semantic gate: table/matrix region {rid} must map to object_kind native_table")
+    for idx, required_ids in sorted(required_region_ids_by_slide.items()):
+        missing = sorted(required_ids - mapped_region_ids_by_slide.get(idx, set()))
+        if missing:
+            issues.append(
+                f"direct_pptx semantic gate: slide {idx} object map missing observed visual regions: "
+                + ", ".join(missing)
+            )
+
+    return {
+        "object_map": str(map_path.resolve()),
+        "chart_region_count": sum(len(ids) for ids in chart_regions.values()),
+        "table_region_count": sum(len(ids) for ids in table_regions.values()),
+        "required_region_count": sum(len(ids) for ids in required_region_ids_by_slide.values()),
+        "chart_regions": chart_regions,
+        "table_regions": table_regions,
+        "mapped_region_count": len(mapped_region_ids),
+        "native_charts": chart_count,
+        "native_tables": table_count,
+        "embedded_workbooks": workbook_count,
+    }
+
+
 def render_manifest_path(task_dir: Path) -> Path:
     return task_dir / "qa" / "render_manifest.json"
 
@@ -4632,15 +4871,19 @@ def check_delivery_files(
     check_image2_files(task_dir, expected, issues, require_prompt_files=False)
     spec_count = check_spec_files(task_dir, expected, issues)
     visual_contract_count = check_visual_contract_files(task_dir, expected, issues)
-    html_count = check_html_files(task_dir, expected, issues)
     final_pptx = exposed_pptx[0].resolve() if len(exposed_pptx) == 1 else None
     pptx_summary = check_pptx_file(final_pptx, expected, issues) if final_pptx else None
     commercial = check_commercial_render_contract(task_dir, expected, final_pptx, issues) if final_pptx else None
     render_path = commercial.get("render_path") if isinstance(commercial, dict) else commercial_render_path(task_dir)
+    direct_semantics: object = "not_required_for_html"
     if render_path == "html":
+        html_count: object = check_html_files(task_dir, expected, issues)
         render_manifest: object = check_render_manifest(task_dir, final_pptx, issues)
     else:
+        html_count = "debug_optional"
         render_manifest = "not_required_for_direct_pptx"
+        if final_pptx is not None:
+            direct_semantics = check_direct_pptx_semantics(task_dir, expected, final_pptx, pptx_summary, issues)
     fidelity = check_fidelity_review(task_dir, expected, issues)
     commercial_similarity = check_commercial_similarity(task_dir, expected, issues)
     powerpoint = check_powerpoint_review(task_dir, expected, issues)
@@ -4697,6 +4940,7 @@ def check_delivery_files(
         "pptx_summary": pptx_summary,
         "commercial_render_contract": commercial,
         "render_manifest": render_manifest,
+        "direct_pptx_semantics": direct_semantics,
         "fidelity_review": fidelity,
         "commercial_similarity": commercial_similarity,
         "powerpoint_review": powerpoint,
@@ -4742,6 +4986,8 @@ def check_pipeline_contract(
     if pptx_summary is not None:
         counts["pptx"] = str(pptx)
         counts["pptx_summary"] = pptx_summary
+    if render_path == "direct_pptx":
+        counts["direct_pptx_semantics"] = check_direct_pptx_semantics(task_dir, expected, pptx, pptx_summary, issues)
     counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues)
     counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues)
     counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
@@ -4765,7 +5011,7 @@ def write_pipeline_pass(
         "pipeline_counts": pipeline_counts,
         "policy": (
             "Delivery publishing is allowed only after analysis, Image2 references, fresh "
-            "visual contracts, HTML, render manifest, PowerPoint review, and fidelity review pass."
+            "visual contracts, the declared editable reconstruction path, PowerPoint review, and fidelity review pass."
         ),
     }
     path = pipeline_pass_path(task_dir)
@@ -4905,15 +5151,23 @@ def cmd_audit_task(args: argparse.Namespace) -> int:
             counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
             counts["spec_count"] = check_spec_files(task_dir, expected, issues)
             counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-            counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-            counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
+            if commercial_render_path(task_dir) == "html":
+                counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
+                counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
+            else:
+                counts["html_slide_count"] = "debug_optional"
+                counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
         elif stage == "pptx":
             check_analysis_files(task_dir, expected, issues)
             counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
             counts["spec_count"] = check_spec_files(task_dir, expected, issues)
             counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-            counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-            counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
+            if commercial_render_path(task_dir) == "html":
+                counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
+                counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
+            else:
+                counts["html_slide_count"] = "debug_optional"
+                counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
             check_pptx = pptx
             if check_pptx is None:
                 pptx_files = sorted((task_dir / "pptx").glob("*.pptx"))
@@ -4922,7 +5176,13 @@ def cmd_audit_task(args: argparse.Namespace) -> int:
             if pptx_summary is not None:
                 counts["pptx"] = str(check_pptx)
                 counts["pptx_summary"] = pptx_summary
-            counts["render_manifest"] = check_render_manifest(task_dir, check_pptx, issues)
+            if commercial_render_path(task_dir) == "direct_pptx":
+                counts["direct_pptx_semantics"] = check_direct_pptx_semantics(
+                    task_dir, expected, check_pptx, pptx_summary, issues
+                )
+                counts["render_manifest"] = "not_required_for_direct_pptx"
+            else:
+                counts["render_manifest"] = check_render_manifest(task_dir, check_pptx, issues)
         elif stage == "pipeline":
             counts.update(check_pipeline_contract(task_dir, expected, pptx, issues))
         elif stage == "delivery":
@@ -4990,6 +5250,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         if pptx_summary is not None:
             counts["pptx"] = str(pptx)
             counts["pptx_summary"] = pptx_summary
+        if commercial_render_path(task_dir) == "direct_pptx":
+            counts["direct_pptx_semantics"] = check_direct_pptx_semantics(task_dir, expected, pptx, pptx_summary, issues)
         if commercial_render_path(task_dir) == "html":
             counts["render_manifest"] = check_render_manifest(task_dir, pptx, issues)
         else:
@@ -5310,8 +5572,8 @@ def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dic
             "type": "agent_required",
             "stage": "reconstruction",
             "message": (
-                "Extract image-derived contracts, write measurement/spec files, declare html or direct_pptx, "
-                "then build the declared editable source from the selected images only."
+                "Extract image-derived contracts, write measurement/spec files, declare direct_pptx unless "
+                "explicitly debugging the legacy HTML path, then build the editable PPTX from the selected images only."
             ),
             "commands": [
                 *[
@@ -5320,13 +5582,14 @@ def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dic
                 ],
                 (
                     "python3 scripts/paopao_run.py record-commercial-render "
-                    f"--task-dir {task_dir} --render-path <html|direct_pptx> --pptx <final_pptx_path>"
+                    f"--task-dir {task_dir} --render-path direct_pptx --pptx <final_pptx_path>"
                 ),
             ],
             "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
             "forbidden": [
                 "Do not use final_prompt, image2_prompt, analysis_report, or remembered intent as visual inputs.",
                 "Do not render whole-slide images as PPT backgrounds.",
+                "Do not choose the legacy HTML path unless the task explicitly asks for an HTML-path A/B run.",
             ],
         }
     if stage == "pptx":
