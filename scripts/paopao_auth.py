@@ -200,6 +200,21 @@ def fetch_prompt_content(name: str) -> str:
     return result.get("content", "")
 
 
+def fill_prompt_template(name: str, fills: dict[str, str]) -> str:
+    data = read_license()
+    token = data.get("token", "")
+    base = server_url()
+    if not base:
+        raise AuthError("no server URL configured")
+    result = request_json(
+        "POST",
+        f"{base}/prompts/fill",
+        payload={"template": name, "fills": fills},
+        token=token,
+    )
+    return result.get("filled_content", "")
+
+
 def fetch_workflow_content(name: str) -> str:
     base = server_url()
     if not base:

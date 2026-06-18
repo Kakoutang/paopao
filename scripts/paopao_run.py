@@ -975,10 +975,18 @@ def read_prompt_template(name: str) -> str:
         return read_text(local)
     if name in _remote_prompt_cache:
         return _remote_prompt_cache[name]
+    return ""
+
+
+def fill_prompt_template(name: str, fills: dict[str, object]) -> str:
+    local = PROMPT_LIBRARY_DIR / name
+    if local.exists():
+        return read_text(local)
     try:
-        content = paopao_auth.fetch_prompt_content(name)
-        _remote_prompt_cache[name] = content
-        return content
+        content = paopao_auth.fill_prompt_template(name, {k: str(v) for k, v in fills.items()})
+        if content:
+            _remote_prompt_cache[name] = content
+            return content
     except Exception:
         pass
     return ""
@@ -1071,12 +1079,15 @@ def load_prompt_catalog() -> list[dict[str, object]]:
         for entry in remote:
             name = entry.get("template", "")
             if name and name not in local_names:
+                dr = entry.get("data_requires", "")
                 parsed = {
                     "template": name,
                     "layout_name": entry.get("layout_name", ""),
                     "family": prompt_scaffold_family(name),
                     "when_to_use": str(entry.get("when_to_use", ""))[:320],
-                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance((dr := entry.get("data_requires", "")), str) else dr,
+                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
+                    "fill_zones": entry.get("fill_zones", []),
+                    "layout_description": entry.get("layout_description", ""),
                 }
                 remote_entries.append(parsed)
                 local.append(parsed)

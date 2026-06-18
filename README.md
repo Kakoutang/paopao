@@ -36,13 +36,41 @@ Before generation, paopao may ask you to confirm:
 - Local runtime scripts
 - Public preview template index
 
-## Privacy
+## Privacy & Data Security / 隐私与数据安全
 
-- **您的原始文件（PDF、文档等）和生成的 PPT 始终保留在您的本地环境中，不会上传到任何服务器。**
-- 在生成过程中，paopao 会将每页幻灯片的摘要信息（标题、关键数据点、结论等即将出现在 PPT 上的内容）发送至 paopao 设计服务器，用于版式匹配和页面设计。这些信息不会被存储或用于其他用途。
-- paopao 还会联系许可证服务器进行激活验证和运行时更新，但不会传输您的文档或生成的 PPT 文件。
+paopao 的数据处理方式与您日常使用的 AI 工具（如 ChatGPT、Claude、Gemini）类似：生成过程中，部分信息需要经过云端服务处理。
 
-Your source files (PDFs, documents) and generated decks stay in your local workspace and are never uploaded. During generation, paopao sends per-slide summary data (titles, key figures, conclusions — content that will appear on the slides) to the paopao design server for layout matching and page design. This data is not stored or used for other purposes. paopao also contacts the license server for activation and runtime updates, but never transmits your documents or generated PPTX files.
+**什么会离开您的电脑：**
+- 每页幻灯片的摘要信息（标题、关键数据点、结论等即将出现在 PPT 上的内容）会发送至 paopao 设计服务器，用于版式匹配和页面设计。
+- 许可证验证信息（激活码）会发送至许可证服务器。
+
+**什么不会离开您的电脑：**
+- 您的原始文件（PDF、文档、Excel 等）始终保留在本地。
+- 生成的 PPT 文件始终保留在本地。
+
+**我们不会：**
+- 存储您发送的摘要数据。
+- 将您的数据用于模型训练或其他用途。
+
+**安全建议：** 与使用任何 AI 工具一样，如果您的资料包含高度机密信息（如未公开财务数据、商业秘密、受保密协议约束的内容），请在使用前评估相关风险，或咨询您所在机构的信息安全部门。
+
+---
+
+paopao handles data similarly to AI tools you already use (ChatGPT, Claude, Gemini): some information is processed through a cloud service during generation.
+
+**What leaves your computer:**
+- Per-slide summary data (titles, key figures, conclusions - content that will appear on the slides) is sent to the paopao design server for layout matching.
+- License activation data is sent to the license server.
+
+**What stays on your computer:**
+- Your source files (PDFs, documents, spreadsheets) never leave your machine.
+- Your generated PPTX files never leave your machine.
+
+**We do not:**
+- Store your summary data after processing.
+- Use your data for model training or any other purpose.
+
+**Security advice:** As with any AI-powered tool, if your materials contain highly confidential information (e.g., unpublished financials, trade secrets, or NDA-protected content), please assess the risks before use, or consult your organization's information security team.
 
 ## Limits
 
