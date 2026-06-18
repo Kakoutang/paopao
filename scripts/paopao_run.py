@@ -5751,11 +5751,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     )
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
-        "renderer_exists": RENDERER.exists(),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
         "python_modules": module_checks,
         "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
-        "chromium_hint": chromium_hint,
     }
     print(json.dumps(checks, indent=2, ensure_ascii=False))
     required_files_ok = all(v for k, v in checks.items() if k.endswith("_exists"))
