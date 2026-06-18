@@ -14,7 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_TRACKED = {
     ".codex-plugin/plugin.json",
     ".gitignore",
-    "CLAUDE.md",
     "README.md",
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
@@ -22,12 +21,6 @@ ALLOWED_TRACKED = {
     "scripts/pptx_qa.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
-    "prompts/SYSTEM_PROMPT.md",
-    "prompts/01C_diagram_with_commentary.md",
-    "prompts/04C_comparison_table_with_summary.md",
-    "prompts/07A_executive_summary_scr.md",
-    "prompts/09A_chevron_with_detail_rows.md",
-    "prompts/14D_headline_metrics_with_charts.md",
     ".github/workflows/public-release-guard.yml",
 }
 

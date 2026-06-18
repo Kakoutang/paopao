@@ -5741,23 +5741,26 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
-    modules = ["playwright", "pptx", "lxml"]
-    module_checks = {
+    required_modules = ["pptx", "lxml"]
+    optional_modules = ["playwright"]
+    required_checks = {
         name: importlib.util.find_spec(name) is not None
-        for name in modules
+        for name in required_modules
     }
-    chromium_hint = (
-        "If Playwright browsers are missing, run: python3 -m playwright install chromium"
-    )
+    optional_checks = {
+        name: importlib.util.find_spec(name) is not None
+        for name in optional_modules
+    }
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
-        "python_modules": module_checks,
+        "required_modules": required_checks,
+        "optional_modules": optional_checks,
         "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
     }
     print(json.dumps(checks, indent=2, ensure_ascii=False))
     required_files_ok = all(v for k, v in checks.items() if k.endswith("_exists"))
-    modules_ok = all(module_checks.values())
+    modules_ok = all(required_checks.values())
     return 0 if required_files_ok and modules_ok else 1
 
 
