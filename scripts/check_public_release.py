@@ -20,7 +20,6 @@ ALLOWED_TRACKED = {
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
     "scripts/pptx_qa.py",
-    "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
     "prompts/SYSTEM_PROMPT.md",
@@ -29,7 +28,6 @@ ALLOWED_TRACKED = {
     "prompts/07A_executive_summary_scr.md",
     "prompts/09A_chevron_with_detail_rows.md",
     "prompts/14D_headline_metrics_with_charts.md",
-    "reference/renderer_guide.md",
     ".github/workflows/public-release-guard.yml",
 }
 
@@ -99,15 +97,9 @@ def all_worktree_files() -> list[str]:
 def text_issues(path: str) -> list[str]:
     if path == "scripts/check_public_release.py":
         return []
-    if path == "scripts/renderer.py":
-        text_forbidden = [
-            "paopao-internal",
-            "/Users/jennytang",
-        ]
-    elif path in {
+    if path in {
         "scripts/paopao_run.py",
         "scripts/pptx_qa.py",
-        "reference/renderer_guide.md",
         "prompts/SYSTEM_PROMPT.md",
         "skills/paopao-ppt/SKILL.md",
         "CLAUDE.md",
@@ -139,6 +131,8 @@ def text_issues(path: str) -> list[str]:
 def main() -> int:
     issues: list[str] = []
     for path in tracked_files():
+        if not (ROOT / path).exists():
+            continue
         if path not in ALLOWED_TRACKED:
             issues.append(f"tracked file is not allowed in public shell: {path}")
         pattern = matches_forbidden(path)

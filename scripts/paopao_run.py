@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Local helpers for paopao tasks.
 
-This script does not call an LLM. Codex performs the reasoning workflow from
-the skill instructions; this helper creates stable task folders, validates the
-Image2-to-editable-PPTX commercial contract, and renders HTML when the declared
-commercial path uses the HTML renderer.
+This script creates stable local task folders, validates delivery artifacts,
+and packages editable PPTX output for paopao.
 """
 
 from __future__ import annotations
@@ -909,7 +907,6 @@ _workflow_cache: dict[str, str] = {}
 
 WORKFLOW_LOCAL_PATHS: dict[str, Path] = {
     "SYSTEM_PROMPT.md": SYSTEM_PROMPT,
-    "renderer_guide.md": PLUGIN_ROOT / "reference" / "renderer_guide.md",
 }
 
 
@@ -3863,6 +3860,58 @@ def _detect_bg_color(im) -> tuple[int, int, int]:
     return _median_color(samples)
 
 
+def _prune_icon_components(im, *, min_area: int = 14):
+    """Remove tiny or edge-connected leftovers after background removal."""
+    im = im.convert("RGBA")
+    alpha = im.getchannel("A")
+    data = alpha.load()
+    width, height = im.size
+    seen: set[tuple[int, int]] = set()
+    keep: set[tuple[int, int]] = set()
+    components: list[tuple[int, tuple[int, int, int, int], bool, list[tuple[int, int]]]] = []
+
+    for y in range(height):
+        for x in range(width):
+            if (x, y) in seen or data[x, y] <= 20:
+                continue
+            stack = [(x, y)]
+            comp: list[tuple[int, int]] = []
+            seen.add((x, y))
+            while stack:
+                cx, cy = stack.pop()
+                comp.append((cx, cy))
+                for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height or (nx, ny) in seen:
+                        continue
+                    if data[nx, ny] > 20:
+                        seen.add((nx, ny))
+                        stack.append((nx, ny))
+            xs = [p[0] for p in comp]
+            ys = [p[1] for p in comp]
+            bbox = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
+            area = len(comp)
+            touches_edge = bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= width - 1 or bbox[3] >= height - 1
+            thin_edge = touches_edge and (bbox[2] - bbox[0] <= 4 or bbox[3] - bbox[1] <= 4)
+            components.append((area, bbox, thin_edge, comp))
+
+    total_area = sum(area for area, _, _, _ in components)
+    for area, bbox, thin_edge, comp in components:
+        if area < min_area or thin_edge:
+            continue
+        touches_edge = bbox[0] <= 2 or bbox[1] <= 2 or bbox[2] >= width - 2 or bbox[3] >= height - 2
+        if touches_edge and area < max(20, total_area * 0.015):
+            continue
+        keep.update(comp)
+
+    px = im.load()
+    for y in range(height):
+        for x in range(width):
+            if (x, y) not in keep:
+                r, g, b, a = px[x, y]
+                px[x, y] = (r, g, b, 0)
+    return im
+
+
 def clean_icon_crop_image(source: Path, box: tuple[int, int, int, int], output: Path, *, expand: int = 14, padding: int = 10, threshold: int = 34, min_canvas: int = 96) -> dict[str, object]:
     Image = _load_pil()
     src = Image.open(source).convert("RGBA")
@@ -3882,6 +3931,7 @@ def clean_icon_crop_image(source: Path, box: tuple[int, int, int, int], output: 
             elif dist <= threshold * 1.8:
                 alpha = int(a * min(1.0, (dist - threshold) / max(1, threshold * 0.8)))
                 pixels[px, py] = (r, g, b, alpha)
+    crop = _prune_icon_components(crop)
     bbox = crop.getchannel("A").getbbox()
     if bbox:
         crop = crop.crop(bbox)
@@ -5205,6 +5255,25 @@ def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dic
     }
 
 
+def public_runtime_stdout_summary(state: dict[str, object]) -> dict[str, object]:
+    status = state.get("status") if isinstance(state.get("status"), dict) else {}
+    deliverable = bool(status.get("deliverable")) if isinstance(status, dict) else False
+    summary = {
+        "schema": "paopao.public_runtime_summary.v1",
+        "ok": deliverable,
+        "task_dir": state.get("task_dir"),
+        "expected_pages": state.get("expected_pages"),
+        "message": (
+            "Deck is ready in the delivery folder."
+            if deliverable
+            else "Paopao prepared the next private production step. Continue with the local runtime."
+        ),
+    }
+    if deliverable and state.get("task_dir"):
+        summary["delivery_dir"] = str((Path(str(state["task_dir"])) / "delivery").resolve())
+    return summary
+
+
 def cmd_make_deck(args: argparse.Namespace) -> int:
     if args.task_dir:
         task_dir = Path(args.task_dir).expanduser().resolve()
@@ -5235,7 +5304,12 @@ def cmd_make_deck(args: argparse.Namespace) -> int:
             },
         }
         write_public_runtime_state(task_dir, state)
-        print(json.dumps(state, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "schema": "paopao.public_runtime_summary.v1",
+            "ok": False,
+            "task_dir": str(task_dir),
+            "message": "Source file check failed. Please confirm the file path is accessible.",
+        }, ensure_ascii=False, indent=2))
         return 1
 
     expected = args.pages or expected_pages_from_task(task_dir)
@@ -5272,7 +5346,7 @@ def cmd_make_deck(args: argparse.Namespace) -> int:
         ),
     }
     write_public_runtime_state(task_dir, state)
-    print(json.dumps(state, ensure_ascii=False, indent=2))
+    print(json.dumps(public_runtime_stdout_summary(state), ensure_ascii=False, indent=2))
     return 0 if status.get("deliverable") else 2
 
 
@@ -5516,6 +5590,19 @@ def cmd_finalize_delivery(args: argparse.Namespace) -> int:
 def cmd_clean_icon_crop(args: argparse.Namespace) -> int:
     try:
         box = _parse_box(args.box)
+        if args.box_space == "1920x1080":
+            Image = _load_pil()
+            with Image.open(Path(args.image).resolve()) as im:
+                src_w, src_h = im.size
+            sx = src_w / 1920
+            sy = src_h / 1080
+            x, y, w, h = box
+            box = (
+                int(round(x * sx)),
+                int(round(y * sy)),
+                int(round(w * sx)),
+                int(round(h * sy)),
+            )
         result = clean_icon_crop_image(
             Path(args.image).resolve(),
             box,
@@ -5638,7 +5725,7 @@ def cmd_package(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch_workflow(args: argparse.Namespace) -> int:
-    ALL_WORKFLOW = ["SKILL.md", "SYSTEM_PROMPT.md", "renderer_guide.md"]
+    ALL_WORKFLOW = ["SKILL.md", "SYSTEM_PROMPT.md"]
     names = ALL_WORKFLOW if args.fetch_all else ([args.name] if args.name else ALL_WORKFLOW)
     results: dict[str, str] = {}
     for name in names:
@@ -5666,7 +5753,6 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "plugin_root": str(PLUGIN_ROOT),
         "renderer_exists": RENDERER.exists(),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
-        "renderer_guide_exists": bool(get_workflow_content("renderer_guide.md")),
         "python_modules": module_checks,
         "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
         "chromium_hint": chromium_hint,
@@ -5861,7 +5947,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Crop an icon from a reference image, remove detected corner background, and export a transparent PNG.",
     )
     clean_icon.add_argument("--image", required=True, help="Source reference image path")
-    clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h in source image pixels")
+    clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h")
+    clean_icon.add_argument(
+        "--box-space",
+        choices=["source", "1920x1080"],
+        default="source",
+        help="Coordinate space for --box. Use 1920x1080 for visual-reference coordinates.",
+    )
     clean_icon.add_argument("--output", required=True, help="Output PNG path, usually output/<task>/html/assets/<name>.png")
     clean_icon.add_argument("--expand", type=int, default=14, help="Pixels to expand around the supplied box before cleanup")
     clean_icon.add_argument("--padding", type=int, default=10, help="Transparent padding around the cleaned icon")
@@ -5886,7 +5978,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     fw = sub.add_parser("fetch-workflow", help="Fetch workflow files from server")
-    fw.add_argument("--name", default="", help="Single file name (SKILL.md, SYSTEM_PROMPT.md, renderer_guide.md)")
+    fw.add_argument("--name", default="", help="Single file name (SKILL.md or SYSTEM_PROMPT.md)")
     fw.add_argument("--all", action="store_true", dest="fetch_all", help="Fetch all workflow files")
     fw.set_defaults(func=cmd_fetch_workflow)
     return parser
