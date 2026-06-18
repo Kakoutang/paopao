@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""License client for paopao.
+"""License and design-service client for paopao.
 
 The plugin stores only a signed token and public license summary locally.
-Source documents remain on the user's machine; the license server receives
-only device, plan, quota, and job-page metadata.
+Source files remain on the user's machine. During prompt filling, the design
+server receives only the per-slide content the agent submits for the selected
+template zones; raw template downloads are not supported.
 """
 
 from __future__ import annotations
@@ -188,16 +189,6 @@ def fetch_prompt_catalog() -> list[dict[str, Any]]:
         return []
     result = request_json("GET", f"{base}/prompts/catalog", token=token)
     return result.get("prompts", [])
-
-
-def fetch_prompt_content(name: str) -> str:
-    data = read_license()
-    token = data.get("token", "")
-    base = server_url()
-    if not base:
-        raise AuthError("no server URL configured")
-    result = request_json("GET", f"{base}/prompts/{name}", token=token)
-    return result.get("content", "")
 
 
 def fill_prompt_template(name: str, fills: dict[str, str]) -> str:

@@ -973,15 +973,10 @@ def read_prompt_template(name: str) -> str:
     local = PROMPT_LIBRARY_DIR / name
     if local.exists():
         return read_text(local)
-    if name in _remote_prompt_cache:
-        return _remote_prompt_cache[name]
     return ""
 
 
 def fill_prompt_template(name: str, fills: dict[str, object]) -> str:
-    local = PROMPT_LIBRARY_DIR / name
-    if local.exists():
-        return read_text(local)
     try:
         content = paopao_auth.fill_prompt_template(name, {k: str(v) for k, v in fills.items()})
         if content:
@@ -999,6 +994,13 @@ def prompt_selection_plan_path(task_dir: Path) -> Path:
 def selected_prompt_template(text: str) -> str | None:
     match = PROMPT_TEMPLATE_RE.search(text)
     return match.group("name") if match else None
+
+
+def prompt_catalog_entry(template_name: str) -> dict[str, object] | None:
+    for entry in load_prompt_catalog():
+        if str(entry.get("template", "")) == template_name:
+            return entry
+    return None
 
 
 def prompt_scaffold_family(template_name: str) -> str:
@@ -1308,6 +1310,8 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
             "brief": story.get("brief", ""),
             "selected_template": chosen["template"],
             "layout_name": chosen["layout_name"],
+            "layout_description": chosen.get("layout_description", ""),
+            "fill_zones": chosen.get("fill_zones", []),
             "family": family,
             "visual_grammar": grammar,
             "selection_method": "role_fit_with_visual_diversity",
@@ -1356,23 +1360,65 @@ def cmd_plan_prompts(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_fills_arg(raw: str) -> dict[str, object]:
+    value = str(raw or "").strip()
+    if not value:
+        raise SystemExit("--fills-json is required")
+    path = Path(value).expanduser()
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        data = json.loads(value)
+    if not isinstance(data, dict):
+        raise SystemExit("--fills-json must be a JSON object or a path to a JSON object")
+    return data
+
+
+def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
+    template_name = str(args.template or "").strip()
+    if not template_name.endswith(".md"):
+        raise SystemExit("--template must be a prompt template filename ending in .md")
+    fills = _load_fills_arg(args.fills_json)
+    filled = fill_prompt_template(template_name, fills)
+    if not filled.strip():
+        raise SystemExit(
+            "Could not fill prompt template. Check license/template access and the paopao design server."
+        )
+    if not PROMPT_TEMPLATE_RE.search(filled):
+        filled = f"PROMPT_TEMPLATE: {template_name}\n{filled.lstrip()}"
+    out = Path(args.output).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(filled.rstrip() + "\n", encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "template": template_name,
+        "output": str(out.resolve()),
+        "sha256": sha256_file(out),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def prompt_template_issue(text: str, prompt_name: str) -> list[str]:
     issues: list[str] = []
     match = PROMPT_TEMPLATE_RE.search(text)
     if not match:
         return [
-            f"{prompt_name} missing PROMPT_TEMPLATE: <prompt-library-file>.md; final prompts must be filled from plugins/paopao-codex-plugin/prompts"
+            f"{prompt_name} missing PROMPT_TEMPLATE: <template-file>.md; final prompts must be generated via fill-prompt-template"
         ]
     template_name = match.group("name")
-    template = prompt_template_path(template_name)
+    if template_name in {"SYSTEM_PROMPT.md", "INDEX.md"}:
+        return [f"{prompt_name} PROMPT_TEMPLATE cannot be {template_name}"]
+    catalog_entry = prompt_catalog_entry(template_name)
     template_text = read_prompt_template(template_name)
-    if (not template_text) or template.name == SYSTEM_PROMPT.name:
-        return [f"{prompt_name} PROMPT_TEMPLATE does not exist in prompt library: {template_name}"]
-    layout_match = LAYOUT_NAME_RE.search(template_text)
-    if not layout_match:
-        issues.append(f"{prompt_name} PROMPT_TEMPLATE {template_name} missing LAYOUT_NAME in library")
-        return issues
-    layout_name = layout_match.group("name")
+    layout_name = ""
+    if catalog_entry:
+        layout_name = str(catalog_entry.get("layout_name", "")).strip()
+    if not layout_name and template_text:
+        layout_match = LAYOUT_NAME_RE.search(template_text)
+        if layout_match:
+            layout_name = layout_match.group("name")
+    if not layout_name:
+        return [f"{prompt_name} PROMPT_TEMPLATE is not available for the current plan: {template_name}"]
     if f"LAYOUT_NAME: {layout_name}" not in text:
         issues.append(
             f"{prompt_name} must include LAYOUT_NAME: {layout_name} from PROMPT_TEMPLATE {template_name}"
@@ -5189,7 +5235,8 @@ def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dic
             "stage": "analysis",
             "message": (
                 "Read source files, write analysis_report.md and slide_story.json, rerun make-deck "
-                "so the runtime can select templates, then write final_prompt_XX.md from the selected plan."
+                "so the runtime can select templates, then create per-slide zone-fill JSON and run "
+                "fill-prompt-template for each selected template."
             ),
             "must_create": [
                 "analysis/analysis_report.md",
@@ -5197,8 +5244,14 @@ def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dic
                 "analysis/prompt_selection_audit.md",
                 *[f"analysis/final_prompt_{idx:02d}.md" for idx in range(1, expected + 1)],
             ],
+            "fill_command_example": (
+                "python3 scripts/paopao_run.py fill-prompt-template "
+                "--template <selected_template.md> --fills-json <zone_fills.json> "
+                f"--output {task_dir}/analysis/final_prompt_XX.md"
+            ),
             "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
             "forbidden": [
+                "Do not fetch or request raw prompt template content.",
                 "Do not write HTML or PPTX before analysis check passes.",
                 "Do not show prompt Markdown files to the user.",
             ],
@@ -5845,6 +5898,19 @@ def build_parser() -> argparse.ArgumentParser:
     plan_prompts.add_argument("--pages", type=int, default=None)
     plan_prompts.add_argument("--topic", default="")
     plan_prompts.set_defaults(func=cmd_plan_prompts)
+
+    fill_prompt = sub.add_parser(
+        "fill-prompt-template",
+        help="Fill a selected template through the paopao design server without downloading raw template text",
+    )
+    fill_prompt.add_argument("--template", required=True)
+    fill_prompt.add_argument(
+        "--fills-json",
+        required=True,
+        help="JSON object or path to a JSON object mapping fill zone names to slide content.",
+    )
+    fill_prompt.add_argument("--output", required=True)
+    fill_prompt.set_defaults(func=cmd_fill_prompt_template)
 
     render = sub.add_parser("render", help="Render task HTML slides to PPTX")
     render.add_argument("--task-dir", required=True)

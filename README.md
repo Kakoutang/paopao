@@ -36,6 +36,10 @@ Before generation, paopao may ask you to confirm:
 - Local runtime scripts
 - Public preview template index
 
+## Prompt Template Protection
+
+Raw paopao prompt templates are not downloaded to your computer. The local runtime receives a template catalog with allowed layout IDs and fill zones, then calls the paopao design server to assemble a filled prompt for the selected slide. The server returns only the filled result for that slide, not the reusable source template.
+
 ## Privacy & Data Security / 隐私与数据安全
 
 paopao 的数据处理方式与您日常使用的 AI 工具（如 ChatGPT、Claude、Gemini）类似：生成过程中，部分信息需要经过云端服务处理。
