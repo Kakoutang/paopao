@@ -6,6 +6,18 @@ PPTX decks from PDFs, papers, reports, and reference images.
 This MVP does not run a web app and does not call Paopao-owned model APIs. The
 user's local AI workspace performs the reasoning workflow.
 
+## Current Version: v1.0 (Early Access)
+
+paopao is in active development. Known limitations in this version:
+
+- **Fidelity**: Visual reference to editable PPTX conversion may have layout
+  gaps on complex pages. We are iterating rapidly on conversion accuracy.
+- **Token usage**: Generation can be token-intensive, especially for pages with
+  many elements. Optimization is in progress.
+
+We are shipping updates frequently. Pull the latest version before starting a
+new project for the best results.
+
 ## What Is Included
 
 - `skills/paopao-ppt/SKILL.md`: deck workflow entry point.
