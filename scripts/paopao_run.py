@@ -1041,24 +1041,59 @@ def _load_local_prompt_catalog() -> list[dict[str, object]]:
     return catalog
 
 
+_CATALOG_CACHE_PATH = PLUGIN_ROOT / "prompts" / ".catalog_cache.json"
+
+
+def _save_catalog_cache(entries: list[dict[str, object]]) -> None:
+    try:
+        _CATALOG_CACHE_PATH.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _load_catalog_cache() -> list[dict[str, object]]:
+    try:
+        if _CATALOG_CACHE_PATH.exists():
+            return json.loads(_CATALOG_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
 def load_prompt_catalog() -> list[dict[str, object]]:
     local = _load_local_prompt_catalog()
     local_names = {str(e["template"]) for e in local}
+    remote_entries: list[dict[str, object]] = []
     try:
         remote = paopao_auth.fetch_prompt_catalog()
         for entry in remote:
             name = entry.get("template", "")
             if name and name not in local_names:
-                dr = entry.get("data_requires", "")
-                local.append({
+                parsed = {
                     "template": name,
                     "layout_name": entry.get("layout_name", ""),
                     "family": prompt_scaffold_family(name),
                     "when_to_use": str(entry.get("when_to_use", ""))[:320],
-                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
-                })
+                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance((dr := entry.get("data_requires", "")), str) else dr,
+                }
+                remote_entries.append(parsed)
+                local.append(parsed)
+        if remote_entries:
+            _save_catalog_cache(remote_entries)
     except Exception:
-        pass
+        cached = _load_catalog_cache()
+        for entry in cached:
+            name = str(entry.get("template", ""))
+            if name and name not in local_names:
+                local.append(entry)
+                local_names.add(name)
+    if not local:
+        raise SystemExit(
+            "No prompt templates available. Check your network connection to "
+            "paopao-license-api.onrender.com and retry, or contact WeChat: sugarong_"
+        )
     return local
 
 
