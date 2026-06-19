@@ -2711,6 +2711,28 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
         )
         return 1
 
+    pptx_before_image2: list[str] = []
+    for d in ["delivery", "pptx", "qa/pptx_actual"]:
+        check_dir = task_dir / d
+        if check_dir.is_dir():
+            for f in check_dir.rglob("*"):
+                if f.is_file() and f.suffix.lower() in {".pptx", ".png", ".pdf"}:
+                    pptx_before_image2.append(str(f.relative_to(task_dir)))
+    if pptx_before_image2:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": (
+                    "PPTX/delivery files already exist in the task directory. "
+                    "Image2 references must be registered BEFORE any PPTX is generated. "
+                    "This prevents self-comparison (registering PPTX screenshots as reference images)."
+                ),
+                "existing_pptx_files": pptx_before_image2[:10],
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
+
     source_image = Path(args.image).resolve()
     target = image2_reference_path(task_dir, idx)
     if source_image == target.resolve():
@@ -3136,6 +3158,18 @@ def check_image2_files(
             if require_prompt_files and sp_sha and entry.get("system_prompt_sha256") != sp_sha:
                 issues.append(f"image2_generation_manifest slide {idx}: system_prompt_sha256 mismatch")
     if image_refs:
+        earliest_ref_mtime = min(r.stat().st_mtime for r in image_refs)
+        for d in ["delivery", "pptx", "qa/pptx_actual"]:
+            check_dir = task_dir / d
+            if check_dir.is_dir():
+                for f in check_dir.rglob("*"):
+                    if f.is_file() and f.suffix.lower() in {".pptx", ".png", ".pdf"}:
+                        if f.stat().st_mtime <= earliest_ref_mtime:
+                            issues.append(
+                                f"PPTX/delivery file {f.relative_to(task_dir)} was created before or at the same time as Image2 references. "
+                                "This indicates Image2 may have been derived from the PPTX (self-comparison). "
+                                "Image2 must be generated independently before any PPTX is built."
+                            )
         check_image2_style_review(task_dir, expected, issues)
         check_image2_user_review(task_dir, expected, issues)
     return len(image_refs)
