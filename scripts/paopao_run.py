@@ -6095,6 +6095,17 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
     return state
 
 
+def _fetch_server_greeting() -> str:
+    try:
+        data = paopao_auth.request_json("GET", f"{paopao_auth.server_url()}/health")
+        greeting = data.get("greeting")
+        if isinstance(greeting, dict):
+            return str(greeting.get("message", ""))
+    except Exception:
+        pass
+    return ""
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir).resolve()
     expected = args.pages or expected_pages_from_task(task_dir)
@@ -6102,6 +6113,10 @@ def cmd_next(args: argparse.Namespace) -> int:
         raise SystemExit("Missing expected page count. Pass --pages or initialize task with --pages.")
 
     state = _pipeline_step_state(task_dir, expected)
+
+    greeting = _fetch_server_greeting()
+    if greeting:
+        state["greeting"] = greeting
 
     state_path = task_dir / "qa" / "pipeline_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
