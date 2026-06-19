@@ -24,11 +24,13 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.3.0"
 CONFIG_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao"))
 LICENSE_PATH = CONFIG_DIR / "license.json"
 DEFAULT_SERVER_URL = "https://paopao-license-api.onrender.com"
 DEFAULT_TIMEOUT = 20
+UPDATE_INSTRUCTION_ZH = "请帮我更新 paopao 插件到最新版，然后重新开始生成 PPT。"
+UPDATE_INSTRUCTION_EN = "Please update my paopao plugin to the latest version, then restart the PPT generation."
 
 
 class AuthError(RuntimeError):
@@ -91,9 +93,39 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise AuthError(f"license server rejected request: HTTP {exc.code} {detail}") from exc
+        if exc.code == 426:
+            message = ""
+            try:
+                parsed = json.loads(detail)
+                message = str(parsed.get("detail", "")).strip()
+            except Exception:
+                message = detail.strip()
+            raise AuthError(
+                "paopao 插件需要更新后才能继续生成。\n"
+                f"{message}\n"
+                "如果你不熟悉操作，请直接把这句话发给 Codex：\n"
+                f"{UPDATE_INSTRUCTION_ZH}\n"
+                f"English: {UPDATE_INSTRUCTION_EN}"
+            ) from exc
+        message = ""
+        try:
+            parsed = json.loads(detail)
+            message = str(parsed.get("detail", "")).strip()
+        except Exception:
+            message = ""
+        if not message:
+            if "<html" in detail.lower() or "<!doctype html" in detail.lower():
+                message = "paopao 服务暂时不可用，请稍后重试。"
+            else:
+                message = detail.strip()
+        if len(message) > 500:
+            message = message[:500].rstrip() + "..."
+        raise AuthError(f"paopao service rejected request: HTTP {exc.code} {message}") from exc
     except urllib.error.URLError as exc:
-        raise AuthError(f"cannot reach license server: {exc}") from exc
+        raise AuthError(
+            "无法连接 paopao 服务，请检查网络后重试。"
+            f"English: cannot reach paopao service: {exc}"
+        ) from exc
 
 
 def activate(code: str, url: str) -> dict[str, Any]:
@@ -154,7 +186,7 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
     result = request_json(
         "POST",
         f"{base}/usage/reserve",
-        {"job_id": job_id, "pages": pages},
+        {"job_id": job_id, "pages": pages, "plugin_version": PLUGIN_VERSION},
         token=token,
     )
     data["license"] = result.get("license", data.get("license", {}))

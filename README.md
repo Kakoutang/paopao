@@ -29,6 +29,16 @@ Before generation, paopao may ask you to confirm:
 - Language
 - Focus, use case, or audience
 
+## Update
+
+paopao is updated frequently during the public preview. If Codex says paopao needs an update, or if free generation unexpectedly asks for a license, ask Codex:
+
+```text
+请帮我更新 paopao 插件到最新版，然后重新开始生成 PPT。
+```
+
+After updating, start the deck request again. The free preview should allow up to 10 slides and access the free layout catalog without a license.
+
 ## Included
 
 - Codex plugin manifest
