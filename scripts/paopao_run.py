@@ -6095,15 +6095,23 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
     return state
 
 
-def _fetch_server_greeting() -> str:
+def _fetch_server_notices() -> dict[str, str]:
+    result: dict[str, str] = {}
     try:
         data = paopao_auth.request_json("GET", f"{paopao_auth.server_url()}/health")
         greeting = data.get("greeting")
         if isinstance(greeting, dict):
-            return str(greeting.get("message", ""))
+            msg = str(greeting.get("message", "")).strip()
+            if msg:
+                result["greeting"] = msg
+        notice = data.get("update_notice")
+        if isinstance(notice, dict):
+            msg = str(notice.get("message", "")).strip()
+            if msg:
+                result["update_notice"] = msg
     except Exception:
         pass
-    return ""
+    return result
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -6114,9 +6122,11 @@ def cmd_next(args: argparse.Namespace) -> int:
 
     state = _pipeline_step_state(task_dir, expected)
 
-    greeting = _fetch_server_greeting()
-    if greeting:
-        state["greeting"] = greeting
+    notices = _fetch_server_notices()
+    if notices.get("greeting"):
+        state["greeting"] = notices["greeting"]
+    if notices.get("update_notice"):
+        state["update_notice"] = notices["update_notice"]
 
     state_path = task_dir / "qa" / "pipeline_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
