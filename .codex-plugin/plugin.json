@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "paopao",
     "shortDescription": "Turn source documents into editable consulting-style PPTX decks.",
-    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks through a guided public preview runtime. Free preview includes selected layout templates and up to 10 slides per deck.",
+    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks through a guided local workspace experience.",
     "developerName": "Paopao",
     "category": "Productivity",
     "capabilities": [

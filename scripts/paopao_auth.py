@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""License and design-service client for paopao.
+"""Access and design-service client for paopao.
 
-The plugin stores only a signed token and public license summary locally.
+The plugin stores only a signed token and public access summary locally.
 Source files remain on the user's machine. During prompt filling, the design
 server receives only the per-slide content the agent submits for the selected
 template zones; raw template downloads are not supported.
@@ -131,7 +131,7 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
 def activate(code: str, url: str) -> dict[str, Any]:
     base = server_url(url)
     if not base:
-        raise AuthError("missing license server URL. Set PAOPAO_AUTH_URL or pass --server-url.")
+        raise AuthError("missing paopao service URL. Set PAOPAO_AUTH_URL or pass --server-url.")
     result = request_json(
         "POST",
         f"{base}/activate",
@@ -163,7 +163,7 @@ def status(allow_dev: bool = True) -> dict[str, Any]:
                 "mode": "local-dev",
                 "message": "PAOPAO_LOCAL_DEV=1 bypass is enabled.",
             }
-        raise AuthError("not activated. Run paopao_auth.py activate first.")
+        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
     result = request_json("GET", f"{base}/license/status", token=token)
     data["license"] = result.get("license", data.get("license", {}))
     data["last_status_at"] = int(time.time())
@@ -182,7 +182,7 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
     if os.getenv("PAOPAO_LOCAL_DEV") == "1" and (not token or not base):
         return {"reservation_id": "local-dev", "license": {"remaining_pages": 999999}}
     if not token or not base:
-        raise AuthError("not activated. Run paopao_auth.py activate first.")
+        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
     result = request_json(
         "POST",
         f"{base}/usage/reserve",
@@ -201,7 +201,7 @@ def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     token = data.get("token", "")
     base = server_url()
     if not token or not base:
-        raise AuthError("not activated. Run paopao_auth.py activate first.")
+        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
     result = request_json(
         "POST",
         f"{base}/usage/{command}",
@@ -256,22 +256,22 @@ def print_json(data: dict[str, Any]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Paopao license client")
+    parser = argparse.ArgumentParser(description="Paopao access client")
     sub = parser.add_subparsers(dest="command", required=True)
 
     activate_cmd = sub.add_parser("activate", help="Activate this plugin installation")
     activate_cmd.add_argument("--code", required=True)
     activate_cmd.add_argument("--server-url", default="")
 
-    sub.add_parser("status", help="Check license status")
-    sub.add_parser("require", help="Fail if the plugin is not licensed")
+    sub.add_parser("status", help="Check paopao access status")
+    sub.add_parser("require", help="Fail if paopao access is unavailable")
 
-    reserve_cmd = sub.add_parser("reserve", help="Reserve page quota before a job")
+    reserve_cmd = sub.add_parser("reserve", help="Reserve page access before a job")
     reserve_cmd.add_argument("--job-id", required=True)
     reserve_cmd.add_argument("--pages", required=True, type=int)
 
     for name in ["commit", "cancel"]:
-        cmd = sub.add_parser(name, help=f"{name.title()} a reserved job quota")
+        cmd = sub.add_parser(name, help=f"{name.title()} a reserved job")
         cmd.add_argument("--reservation-id", required=True)
 
     sub.add_parser("logout", help="Remove local activation token")
@@ -297,7 +297,7 @@ def main() -> int:
             print_json({"ok": True})
         return 0
     except AuthError as exc:
-        print(f"Paopao license error: {exc}", file=sys.stderr)
+        print(f"Paopao access error: {exc}", file=sys.stderr)
         return 2
 
 

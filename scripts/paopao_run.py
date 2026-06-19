@@ -442,10 +442,10 @@ def reserve_quota(task_dir: Path, pages: int) -> str:
     free_limit = free_max_slides()
     if free_limit and pages > free_limit:
         raise SystemExit(
-            f"paopao 免费版最多支持 {free_limit} 页。"
-            "如需更多页数或完整模板库，请联系微信 sugarong_ 获取。\n"
-            f"paopao public edition supports up to {free_limit} slides. "
-            "For more pages or the full template library, contact WeChat: sugarong_"
+            f"当前体验额度支持最多 {free_limit} 页。"
+            "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
+            f"Your current access supports up to {free_limit} slides. "
+            "To continue with more pages, contact WeChat: sugarong_"
         )
     if not has_local_license():
         if open_preview_enabled() and free_limit == 0:
@@ -455,12 +455,16 @@ def reserve_quota(task_dir: Path, pages: int) -> str:
         if auth_should_run() or free_limit:
             if free_limit == 0:
                 raise SystemExit(
-                    "Paopao requires an active license. "
-                    "Activate with scripts/paopao_auth.py activate before rendering."
+                    "当前访问状态需要先开通后才能继续生成。"
+                    "如果你需要帮助，可以联系微信 sugarong_。\n"
+                    "Current access needs activation before generation can continue. "
+                    "For help, contact WeChat: sugarong_."
                 )
             raise SystemExit(
-                f"Paopao free mode supports up to {free_limit} slides. "
-                "Activate a license with scripts/paopao_auth.py activate to render larger decks."
+                f"当前体验额度支持最多 {free_limit} 页。"
+                "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
+                f"Your current access supports up to {free_limit} slides. "
+                "To continue with more pages, contact WeChat: sugarong_"
             )
     if not auth_should_run():
         return ""
@@ -493,10 +497,10 @@ def write_task_local_gitignore(task_dir: Path) -> None:
 def enforce_public_page_limit(pages: int | None) -> None:
     if pages and free_max_slides() and pages > free_max_slides():
         raise SystemExit(
-            f"paopao 免费版最多支持 {free_max_slides()} 页。"
-            "如需更多页数或完整模板库，请联系微信 sugarong_ 获取。\n"
-            f"paopao free tier supports up to {free_max_slides()} slides. "
-            "For more pages or the full template library, contact WeChat: sugarong_"
+            f"当前体验额度支持最多 {free_max_slides()} 页。"
+            "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
+            f"Your current access supports up to {free_max_slides()} slides. "
+            "To continue with more pages, contact WeChat: sugarong_"
         )
 
 
@@ -1419,7 +1423,7 @@ def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
     filled = fill_prompt_template(template_name, fills)
     if not filled.strip():
         raise SystemExit(
-            "Could not fill prompt template. Check license/template access and the paopao design server."
+            "Could not prepare this layout. Please update paopao and try again, or contact support if it keeps happening."
         )
     if not PROMPT_TEMPLATE_RE.search(filled):
         filled = f"PROMPT_TEMPLATE: {template_name}\n{filled.lstrip()}"
