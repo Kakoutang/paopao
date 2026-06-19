@@ -3199,7 +3199,14 @@ def check_spec_files(task_dir: Path, expected: int, issues: list[str]) -> int:
         observation, observation_issues = image_observation_record_issues(task_dir, idx)
         issues.extend(observation_issues)
         if len(text.strip()) < 500:
-            issues.append(f"slide{idx:02d}_spec.md too short")
+            issues.append(f"slide{idx:02d}_spec.md too short (minimum 500 characters)")
+        element_inventory_markers = ["| id", "| type", "| text", "position", "size"]
+        has_inventory = sum(1 for m in element_inventory_markers if m.lower() in text) >= 3
+        if not has_inventory:
+            issues.append(
+                f"slide{idx:02d}_spec.md missing Element Inventory table. "
+                "Spec must contain a table listing every visible element with id, type, text, and position."
+            )
         if not file_is_after_reference(task_dir, idx, spec):
             issues.append(
                 f"slide{idx:02d}_spec.md is older than image2_reference_{idx:02d}.png; "
@@ -4837,6 +4844,18 @@ def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> d
                             f"{MIN_FIDELITY_IMAGE_SCORE:.3f}; refill the measured reconstruction source and rerender "
                             "instead of delivering a rough interpretation"
                         )
+    all_evidences = []
+    for idx in range(1, expected + 1):
+        entry = slides[idx - 1] if idx - 1 < len(slides) else {}
+        if isinstance(entry, dict):
+            all_evidences.append(str(entry.get("evidence", "")).strip())
+    if len(all_evidences) > 1 and len(set(all_evidences)) < len(all_evidences):
+        issues.append(
+            "fidelity review: multiple slides share identical evidence text. "
+            "Each slide must have a unique, specific comparison — copy-pasted reviews indicate "
+            "the PPTX was not actually compared against each Image2 reference individually."
+        )
+
     return {
         "path": str(review.resolve()),
         "min_image_similarity_score": MIN_FIDELITY_IMAGE_SCORE,
@@ -4870,6 +4889,24 @@ def check_powerpoint_review(task_dir: Path, expected: int, issues: list[str]) ->
     )
     if summary is None:
         return None
+
+    slides = data.get("slides", [])
+    all_evidences = []
+    for idx in range(1, expected + 1):
+        entry = slides[idx - 1] if idx - 1 < len(slides) else {}
+        if isinstance(entry, dict):
+            ev = str(entry.get("evidence", "")).strip()
+            all_evidences.append(ev)
+            if len(ev) < 80:
+                issues.append(
+                    f"PowerPoint review slide {idx}: evidence must be at least 80 characters of specific inspection findings"
+                )
+    if len(all_evidences) > 1 and len(set(all_evidences)) < len(all_evidences):
+        issues.append(
+            "PowerPoint review: multiple slides share identical evidence text. "
+            "Each slide must be inspected individually with unique findings."
+        )
+
     return {"path": str(review.resolve()), **summary}
 
 
@@ -5760,6 +5797,320 @@ def cmd_run_task(args: argparse.Namespace) -> int:
     return 0 if status["deliverable"] else 1
 
 
+def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
+    """Determine the precise pipeline step the task is at and what to do next."""
+
+    state: dict[str, object] = {
+        "task_dir": str(task_dir),
+        "expected_pages": expected,
+    }
+
+    analysis_issues: list[str] = []
+    check_analysis_files(task_dir, expected, analysis_issues)
+    if analysis_issues:
+        state["step"] = "analysis"
+        state["step_number"] = 1
+        state["instruction"] = (
+            "Read source materials and produce:\n"
+            "  1. analysis/analysis_report.md — key data with sources\n"
+            "  2. analysis/slide_story.json — arc + per-page conclusions\n"
+            "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
+            "  4. analysis/final_prompt_XX.md for each page (fill from analysis_report using selected templates)\n"
+            "  5. analysis/prompt_selection_audit.md\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        )
+        state["issues"] = analysis_issues
+        return state
+
+    image2_issues: list[str] = []
+    image2_count = check_image2_files(task_dir, expected, image2_issues)
+    if image2_count < expected or image2_issues:
+        done_slides = sorted(
+            int(p.stem.split("_")[-1])
+            for p in (task_dir / "image2").glob("image2_reference_*.png")
+            if p.is_file()
+        )
+        missing = [i for i in range(1, expected + 1) if i not in done_slides]
+        if not (task_dir / "image2" / "image2_generation_manifest.json").exists():
+            state["step"] = "image2_prepare"
+            state["step_number"] = 2
+            state["instruction"] = (
+                "Run: paopao_run.py prepare-image2-prompts --task-dir <dir>\n"
+                "This locks the per-slide prompts for image generation."
+            )
+        elif missing:
+            slide = missing[0]
+            state["step"] = "image2_generate"
+            state["step_number"] = 2
+            state["current_slide"] = slide
+            state["instruction"] = (
+                f"Generate Image2 for slide {slide}:\n"
+                f"  1. Read image2/image2_prompt_{slide:02d}.md — use its FULL text as the image generation prompt\n"
+                f"  2. Call image_gen with the exact prompt text\n"
+                f"  3. Register: paopao_run.py register-image2-reference --task-dir <dir> "
+                f"--slide {slide} --image <output_path> --generation-request image2/generation_request_{slide:02d}.json "
+                f"--generated-prompt-sha256 <sha> --source image_gen_builtin --tool-call-id <id>\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+        else:
+            state["step"] = "image2_fix"
+            state["step_number"] = 2
+            state["instruction"] = "Fix Image2 registration issues listed below, then run next again."
+            state["issues"] = image2_issues
+        return state
+
+    user_review_path = task_dir / "qa" / "image2_user_review.json"
+    if not user_review_path.exists():
+        state["step"] = "image2_user_review"
+        state["step_number"] = 3
+        state["instruction"] = (
+            "Show all Image2 reference images to the user for approval.\n"
+            "After user responds, run:\n"
+            "  paopao_run.py record-image2-user-review --task-dir <dir> --approved <yes|no> --feedback '<text>'\n"
+            "Then run: paopao_run.py next --task-dir <dir>"
+        )
+        return state
+    else:
+        try:
+            review_data = json.loads(user_review_path.read_text(encoding="utf-8"))
+            if review_data.get("approved") not in (True, "yes", "approved"):
+                state["step"] = "image2_user_review"
+                state["step_number"] = 3
+                state["instruction"] = (
+                    "User requested changes. Regenerate the affected Image2 references, "
+                    "then record a new approval.\n"
+                    f"User feedback: {review_data.get('feedback', '')}"
+                )
+                return state
+        except Exception:
+            pass
+
+    boundary_path = task_dir / "qa" / "post_image_memory_boundary.json"
+    if not boundary_path.exists():
+        state["step"] = "memory_boundary"
+        state["step_number"] = 4
+        state["instruction"] = (
+            "Run: paopao_run.py forget-after-image2 --task-dir <dir>\n"
+            "This enforces the memory boundary — after this point, reconstruction "
+            "must be based solely on the selected Image2 reference images."
+        )
+        return state
+
+    for slide_idx in range(1, expected + 1):
+        obs_path = image2_observation_path(task_dir, slide_idx)
+        if not obs_path.exists():
+            state["step"] = "observation"
+            state["step_number"] = 5
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Observe slide {slide_idx} Image2 reference:\n"
+                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png\n"
+                f"  2. Describe EVERY visible element using this checklist:\n"
+                f"     A. Nav: tab count, each tab text, active tab, indicator style\n"
+                f"     B. Title: exact text, line count, styling\n"
+                f"     C. Content: module count, position (left/right/top/bottom), relative sizes\n"
+                f"     D. Charts/Tables: type, row/column count, data patterns\n"
+                f"     E. Takeaway: height, left label, right text, divider\n"
+                f"     F. Source: text, position\n"
+                f"  3. Record: paopao_run.py record-image2-observation --task-dir <dir> "
+                f"--slide {slide_idx} --evidence '<your detailed observation>'\n"
+                f"     Evidence must be at least 120 characters of concrete visual facts.\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+
+    for slide_idx in range(1, expected + 1):
+        contract_path = visual_contract_path(task_dir, slide_idx)
+        if not contract_path.exists():
+            state["step"] = "visual_contract"
+            state["step_number"] = 6
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Extract visual contract for slide {slide_idx}:\n"
+                f"  Run: paopao_run.py extract-image2-contract --task-dir <dir> --slide {slide_idx}\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+
+    spec_issues: list[str] = []
+    check_spec_files(task_dir, expected, spec_issues)
+    spec_only_issues = [i for i in spec_issues if "spec" in i.lower()]
+    if spec_only_issues:
+        for slide_idx in range(1, expected + 1):
+            spec_path = task_dir / "spec" / f"slide{slide_idx:02d}_spec.md"
+            if not spec_path.exists() or spec_path.stat().st_size < 500:
+                state["step"] = "spec"
+                state["step_number"] = 7
+                state["current_slide"] = slide_idx
+                state["instruction"] = (
+                    f"Write the structured spec for slide {slide_idx}:\n"
+                    f"  1. Open image2/image2_reference_{slide_idx:02d}.png\n"
+                    f"  2. Read spec/slide{slide_idx:02d}_image_observation.json for your recorded observations\n"
+                    f"  3. Write spec/slide{slide_idx:02d}_spec.md with ALL required sections:\n"
+                    f"     - Canvas Contract (slide size, root layout, margins, palette)\n"
+                    f"     - Element Inventory (table of every element with id, type, text, position, size)\n"
+                    f"     - Layout Grid (nav, title, content, takeaway, source tracks)\n"
+                    f"     - Component Specs (each component's detailed specs)\n"
+                    f"     - Icon Plan (each icon with meaning and implementation)\n"
+                    f"     - Conversion-Risk Notes (CSS features to avoid, PPTX-stable replacements)\n"
+                    f"     - Direct PPTX Build Checklist\n"
+                    f"  Must include: reconstruction_source: image2_reference_only\n"
+                    f"  Must include: prompt_context_discarded: true\n"
+                    f"  Must include: observation_record_path: slide{slide_idx:02d}_image_observation.json\n"
+                    f"  Must be at least 500 characters.\n"
+                    f"When done, run: paopao_run.py next --task-dir <dir>"
+                )
+                return state
+        state["step"] = "spec_fix"
+        state["step_number"] = 7
+        state["instruction"] = "Fix spec issues listed below, then run next again."
+        state["issues"] = spec_only_issues
+        return state
+
+    pptx_dir = task_dir / "pptx"
+    pptx_files = sorted(p for p in pptx_dir.glob("*.pptx") if p.is_file() and not p.name.startswith("~$"))
+    if not pptx_files:
+        for slide_idx in range(1, expected + 1):
+            state["step"] = "direct_pptx"
+            state["step_number"] = 8
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Build the direct PPTX painter for slide {slide_idx}:\n"
+                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png — look at it carefully\n"
+                f"  2. Read spec/slide{slide_idx:02d}_spec.md for the element inventory and layout grid\n"
+                f"  3. Write python-pptx code that recreates EVERY element you see:\n"
+                f"     - Match positions, sizes, colors, text content from the reference\n"
+                f"     - Use native charts for chart content, native tables for table content\n"
+                f"     - Every text must be editable, no whole-slide images\n"
+                f"  4. This is slide {slide_idx} of {expected}. Build ALL {expected} slides in one painter script,\n"
+                f"     but write each slide function by looking at its own reference image.\n"
+                f"  5. Run the painter to generate the PPTX.\n"
+                f"  6. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path direct_pptx --pptx <path>\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+
+    actual_dir = task_dir / "qa" / "pptx_actual"
+    actual_pngs = sorted(actual_dir.glob("slide-*.png"))
+    if len(actual_pngs) < expected:
+        state["step"] = "pptx_export"
+        state["step_number"] = 9
+        state["instruction"] = (
+            "Export PPTX slide previews:\n"
+            "  1. Open the generated PPTX in PowerPoint\n"
+            "  2. Export each slide as PNG to qa/pptx_actual/slide-1.png, slide-2.png, ...\n"
+            "  3. Also export a PDF to qa/pptx_actual/actual.pdf\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        )
+        return state
+
+    fidelity_path = task_dir / "qa" / "fidelity_review.json"
+    fidelity_ok = True
+    if not fidelity_path.exists():
+        fidelity_ok = False
+    else:
+        try:
+            fidelity_data = json.loads(fidelity_path.read_text(encoding="utf-8"))
+            slides = fidelity_data.get("slides", [])
+            evidences = [str(s.get("evidence", "")) for s in slides if isinstance(s, dict)]
+            if len(set(evidences)) < len(evidences):
+                fidelity_ok = False
+            for s in slides:
+                if isinstance(s, dict) and len(str(s.get("evidence", ""))) < 80:
+                    fidelity_ok = False
+        except Exception:
+            fidelity_ok = False
+
+    if not fidelity_ok:
+        state["step"] = "fidelity_review"
+        state["step_number"] = 10
+        state["instruction"] = (
+            "Compare EACH slide's PPTX preview against its Image2 reference:\n"
+            "  For each slide (1 to {expected}):\n"
+            "    1. Open image2/image2_reference_XX.png\n"
+            "    2. Open qa/pptx_actual/slide-X.png\n"
+            "    3. Write a UNIQUE, SPECIFIC comparison for this slide:\n"
+            "       - What matches well\n"
+            "       - What differs (position, size, color, text, missing elements)\n"
+            "       - Whether it needs fixing\n"
+            "  Save as qa/fidelity_review.json with per-slide evidence.\n"
+            "  EACH slide MUST have different evidence text — no copy-paste.\n"
+            "  Evidence must be at least 80 characters per slide.\n"
+            "If any slide has issues, go back and fix the painter, re-export, then re-review.\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        ).format(expected=expected)
+        return state
+
+    ppt_review_path = task_dir / "qa" / "powerpoint_review.json"
+    if not ppt_review_path.exists():
+        state["step"] = "powerpoint_review"
+        state["step_number"] = 11
+        state["instruction"] = (
+            "Open the PPTX in PowerPoint and inspect the editing interface:\n"
+            "  For each slide:\n"
+            "    - Is text editable and properly formatted?\n"
+            "    - Are charts native (double-click opens data editor)?\n"
+            "    - Are there overlapping elements or clipped text?\n"
+            "    - Does the nav text appear centered?\n"
+            "  Save as qa/powerpoint_review.json with actual_pptx_opened: true.\n"
+            "  Each slide must have unique evidence.\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        )
+        return state
+
+    pipeline_issues: list[str] = []
+    pipeline_counts: dict[str, object] = {}
+    pptx = pptx_files[-1]
+    pipeline_counts.update(check_pipeline_contract(task_dir, expected, pptx, pipeline_issues))
+    if pipeline_issues:
+        fixable = [i for i in pipeline_issues if "similarity" in i.lower() or "fidelity" in i.lower()]
+        structural = [i for i in pipeline_issues if i not in fixable]
+        if fixable and not structural:
+            state["step"] = "iterate_pptx"
+            state["step_number"] = 12
+            state["instruction"] = (
+                "Similarity scores are below threshold. Fix the PPTX:\n"
+                "  1. Open EACH failing slide's Image2 reference and PPTX preview side by side\n"
+                "  2. Identify specific differences\n"
+                "  3. Update the painter code to fix those differences\n"
+                "  4. Regenerate PPTX, re-export PNGs, redo fidelity review\n"
+                "  5. Run: paopao_run.py next --task-dir <dir>\n"
+                "Failing checks:"
+            )
+            state["issues"] = fixable
+        else:
+            state["step"] = "pipeline_fix"
+            state["step_number"] = 12
+            state["instruction"] = "Fix pipeline issues listed below."
+            state["issues"] = pipeline_issues
+        return state
+
+    state["step"] = "finalize"
+    state["step_number"] = 13
+    state["instruction"] = (
+        "All checks passed. Finalize delivery:\n"
+        "  Run: paopao_run.py finalize-delivery --task-dir <dir> --pptx <path>\n"
+        "This runs the final gate and packages the deliverable."
+    )
+    return state
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    expected = args.pages or expected_pages_from_task(task_dir)
+    if not expected:
+        raise SystemExit("Missing expected page count. Pass --pages or initialize task with --pages.")
+
+    state = _pipeline_step_state(task_dir, expected)
+
+    state_path = task_dir / "qa" / "pipeline_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(json.dumps(state, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir).resolve()
     keep_private = bool(args.keep_private_prompts or os.getenv(PROMPT_ARCHIVE_ENV) == "1")
@@ -6317,6 +6668,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_task.add_argument("--pages", type=int, default=None)
     run_task.add_argument("--pptx", default="")
     run_task.set_defaults(func=cmd_run_task)
+
+    next_cmd = sub.add_parser(
+        "next",
+        help="Pipeline controller: reports the single next step the agent must perform",
+    )
+    next_cmd.add_argument("--task-dir", required=True)
+    next_cmd.add_argument("--pages", type=int, default=None)
+    next_cmd.set_defaults(func=cmd_next)
 
     audit = sub.add_parser("audit-task", help="Run a full task audit and summarize blockers before delivery")
     audit.add_argument("--task-dir", required=True)
