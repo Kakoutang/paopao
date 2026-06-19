@@ -11,8 +11,6 @@ This public preview is intended for early feedback.
 - Works locally in your AI workspace.
 - Quality is being updated frequently; if a result looks imperfect, try again later or reduce the page count for a cleaner first pass.
 
-For the full commercial version or higher limits, contact WeChat: `sugarong_`.
-
 ## Install
 
 Install this repository as a Codex plugin, then mention paopao when asking for a deck.
@@ -92,4 +90,4 @@ The public preview is intentionally limited. It may not match the full commercia
 
 ## Support
 
-For feedback, access issues, or upgrades, contact WeChat: `sugarong_`.
+For feedback or access issues, contact WeChat: `sugarong_`.

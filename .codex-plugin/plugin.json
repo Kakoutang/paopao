@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "paopao",
     "shortDescription": "Turn source documents into editable consulting-style PPTX decks.",
-    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks through a gated public runtime. Free edition includes 5 layout templates and up to 10 slides per deck. Full template library (90+ layouts) available via WeChat: sugarong_",
+    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks through a guided public preview runtime. Free preview includes selected layout templates and up to 10 slides per deck.",
     "developerName": "Paopao",
     "category": "Productivity",
     "capabilities": [
