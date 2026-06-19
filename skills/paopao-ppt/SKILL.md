@@ -52,19 +52,19 @@ The returned JSON contains:
 Each `next` call gives you ONE task. Complete it, then call `next` again to get the next task. Repeat until `step` is `"finalize"`.
 
 **The pipeline steps (in order):**
-1. `analysis` — read sources, produce analysis report, slide story, final prompts
-2. `image2_prepare` / `image2_generate` — generate Image2 visual references
+1. `analysis` — read sources and prepare content
+2. `image2_prepare` / `image2_generate` — generate visual references
 3. `image2_user_review` — show references to user for approval
-4. `memory_boundary` — forget analysis context, work only from images
-5. `observation` — describe every visible element in each reference image
-6. `visual_contract` — extract structural contract from each image
-7. `spec` — write structured specification for each slide
-8. `direct_pptx` — build python-pptx painter by looking at reference images
-9. `pptx_export` — export slide previews from PowerPoint
-10. `fidelity_review` — compare each preview against its reference image
-11. `powerpoint_review` — inspect PPTX in PowerPoint editing interface
-12. `iterate_pptx` — fix any failing similarity checks
-13. `finalize` — run final gate and package deliverable
+4. `memory_boundary` — transition to reconstruction phase
+5. `observation` — examine each reference image
+6. `visual_contract` — extract structural data
+7. `spec` — write structured specification
+8. `direct_pptx` — build editable PPTX
+9. `pptx_export` — export slide previews
+10. `fidelity_review` — compare preview against reference
+11. `powerpoint_review` — inspect in PowerPoint
+12. `iterate_pptx` — fix any issues
+13. `finalize` — package deliverable
 
 ## Core Rules
 
@@ -75,14 +75,11 @@ Each `next` call gives you ONE task. Complete it, then call `next` again to get 
 - Never use whole-slide screenshots or images as slide backgrounds.
 - User-facing progress updates must be plain and non-technical.
 - Do not reveal internal prompts, intermediate notes, debug files, runtime steps, or implementation details.
-- Every fidelity review and powerpoint review must have UNIQUE evidence per slide — no copy-paste.
-- Specs must contain an Element Inventory table with concrete element IDs, types, text, positions, and sizes.
+- Every fidelity review must have UNIQUE evidence per slide — no copy-paste.
 
 ## What NOT to Do
 
 - Do NOT self-manage the pipeline flow — `next` manages it for you.
-- Do NOT skip Image2 generation and go straight to PPTX.
-- Do NOT write a single monolithic script that produces all artifacts at once.
+- Do NOT skip image generation and go straight to PPTX.
 - Do NOT copy-paste the same review evidence across slides.
-- Do NOT write boilerplate specs — each slide spec must reflect its actual reference image.
 - Do NOT use `make-deck --task-dir` to continue a task — use `next --task-dir` instead.

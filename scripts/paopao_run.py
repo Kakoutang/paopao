@@ -5811,12 +5811,8 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step"] = "analysis"
         state["step_number"] = 1
         state["instruction"] = (
-            "Read source materials and produce:\n"
-            "  1. analysis/analysis_report.md — key data with sources\n"
-            "  2. analysis/slide_story.json — arc + per-page conclusions\n"
-            "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
-            "  4. analysis/final_prompt_XX.md for each page (fill from analysis_report using selected templates)\n"
-            "  5. analysis/prompt_selection_audit.md\n"
+            "Read source materials and produce analysis artifacts.\n"
+            "  Run: paopao_run.py plan-prompts --task-dir <dir>\n"
             "When done, run: paopao_run.py next --task-dir <dir>"
         )
         state["issues"] = analysis_issues
@@ -5845,11 +5841,10 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["current_slide"] = slide
             state["instruction"] = (
                 f"Generate Image2 for slide {slide}:\n"
-                f"  1. Read image2/image2_prompt_{slide:02d}.md — use its FULL text as the image generation prompt\n"
-                f"  2. Call image_gen with the exact prompt text\n"
+                f"  1. Read image2/image2_prompt_{slide:02d}.md\n"
+                f"  2. Call image_gen with the prompt text\n"
                 f"  3. Register: paopao_run.py register-image2-reference --task-dir <dir> "
-                f"--slide {slide} --image <output_path> --generation-request image2/generation_request_{slide:02d}.json "
-                f"--generated-prompt-sha256 <sha> --source image_gen_builtin --tool-call-id <id>\n"
+                f"--slide {slide} --image <output_path>\n"
                 f"When done, run: paopao_run.py next --task-dir <dir>"
             )
         else:
@@ -5903,18 +5898,11 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step_number"] = 5
             state["current_slide"] = slide_idx
             state["instruction"] = (
-                f"Observe slide {slide_idx} Image2 reference:\n"
+                f"Observe slide {slide_idx} reference image:\n"
                 f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png\n"
-                f"  2. Describe EVERY visible element using this checklist:\n"
-                f"     A. Nav: tab count, each tab text, active tab, indicator style\n"
-                f"     B. Title: exact text, line count, styling\n"
-                f"     C. Content: module count, position (left/right/top/bottom), relative sizes\n"
-                f"     D. Charts/Tables: type, row/column count, data patterns\n"
-                f"     E. Takeaway: height, left label, right text, divider\n"
-                f"     F. Source: text, position\n"
+                f"  2. Describe every visible element in detail\n"
                 f"  3. Record: paopao_run.py record-image2-observation --task-dir <dir> "
-                f"--slide {slide_idx} --evidence '<your detailed observation>'\n"
-                f"     Evidence must be at least 120 characters of concrete visual facts.\n"
+                f"--slide {slide_idx} --evidence '<your observation>'\n"
                 f"When done, run: paopao_run.py next --task-dir <dir>"
             )
             return state
@@ -5945,18 +5933,8 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
                 state["instruction"] = (
                     f"Write the structured spec for slide {slide_idx}:\n"
                     f"  1. Open image2/image2_reference_{slide_idx:02d}.png\n"
-                    f"  2. Read spec/slide{slide_idx:02d}_image_observation.json for your recorded observations\n"
-                    f"  3. Write spec/slide{slide_idx:02d}_spec.md with ALL required sections:\n"
-                    f"     - Canvas Contract (slide size, root layout, margins, palette)\n"
-                    f"     - Element Inventory (table of every element with id, type, text, position, size)\n"
-                    f"     - Layout Grid (nav, title, content, takeaway, source tracks)\n"
-                    f"     - Component Specs (each component's detailed specs)\n"
-                    f"     - Icon Plan (each icon with meaning and implementation)\n"
-                    f"     - Conversion-Risk Notes (CSS features to avoid, PPTX-stable replacements)\n"
-                    f"     - Direct PPTX Build Checklist\n"
-                    f"  Must include: reconstruction_source: image2_reference_only\n"
-                    f"  Must include: prompt_context_discarded: true\n"
-                    f"  Must include: observation_record_path: slide{slide_idx:02d}_image_observation.json\n"
+                    f"  2. Read spec/slide{slide_idx:02d}_image_observation.json\n"
+                    f"  3. Write spec/slide{slide_idx:02d}_spec.md — element inventory with positions and sizes\n"
                     f"  Must be at least 500 characters.\n"
                     f"When done, run: paopao_run.py next --task-dir <dir>"
                 )
@@ -5975,17 +5953,10 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step_number"] = 8
             state["current_slide"] = slide_idx
             state["instruction"] = (
-                f"Build the direct PPTX painter for slide {slide_idx}:\n"
-                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png — look at it carefully\n"
-                f"  2. Read spec/slide{slide_idx:02d}_spec.md for the element inventory and layout grid\n"
-                f"  3. Write python-pptx code that recreates EVERY element you see:\n"
-                f"     - Match positions, sizes, colors, text content from the reference\n"
-                f"     - Use native charts for chart content, native tables for table content\n"
-                f"     - Every text must be editable, no whole-slide images\n"
-                f"  4. This is slide {slide_idx} of {expected}. Build ALL {expected} slides in one painter script,\n"
-                f"     but write each slide function by looking at its own reference image.\n"
-                f"  5. Run the painter to generate the PPTX.\n"
-                f"  6. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path direct_pptx --pptx <path>\n"
+                f"Build editable PPTX for slide {slide_idx}:\n"
+                f"  1. Open image2/image2_reference_{slide_idx:02d}.png and spec/slide{slide_idx:02d}_spec.md\n"
+                f"  2. Recreate all elements as editable PPTX objects\n"
+                f"  3. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path direct_pptx --pptx <path>\n"
                 f"When done, run: paopao_run.py next --task-dir <dir>"
             )
             return state
@@ -6025,20 +5996,11 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step"] = "fidelity_review"
         state["step_number"] = 10
         state["instruction"] = (
-            "Compare EACH slide's PPTX preview against its Image2 reference:\n"
-            "  For each slide (1 to {expected}):\n"
-            "    1. Open image2/image2_reference_XX.png\n"
-            "    2. Open qa/pptx_actual/slide-X.png\n"
-            "    3. Write a UNIQUE, SPECIFIC comparison for this slide:\n"
-            "       - What matches well\n"
-            "       - What differs (position, size, color, text, missing elements)\n"
-            "       - Whether it needs fixing\n"
+            "Compare each slide's PPTX preview against its reference image.\n"
             "  Save as qa/fidelity_review.json with per-slide evidence.\n"
-            "  EACH slide MUST have different evidence text — no copy-paste.\n"
-            "  Evidence must be at least 80 characters per slide.\n"
-            "If any slide has issues, go back and fix the painter, re-export, then re-review.\n"
+            "  Each slide must have unique evidence (no copy-paste), at least 80 characters.\n"
             "When done, run: paopao_run.py next --task-dir <dir>"
-        ).format(expected=expected)
+        )
         return state
 
     ppt_review_path = task_dir / "qa" / "powerpoint_review.json"
@@ -6069,12 +6031,9 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step"] = "iterate_pptx"
             state["step_number"] = 12
             state["instruction"] = (
-                "Similarity scores are below threshold. Fix the PPTX:\n"
-                "  1. Open EACH failing slide's Image2 reference and PPTX preview side by side\n"
-                "  2. Identify specific differences\n"
-                "  3. Update the painter code to fix those differences\n"
-                "  4. Regenerate PPTX, re-export PNGs, redo fidelity review\n"
-                "  5. Run: paopao_run.py next --task-dir <dir>\n"
+                "Similarity scores are below threshold.\n"
+                "  Fix the failing slides, regenerate PPTX, re-export, redo fidelity review.\n"
+                "  Run: paopao_run.py next --task-dir <dir>\n"
                 "Failing checks:"
             )
             state["issues"] = fixable
