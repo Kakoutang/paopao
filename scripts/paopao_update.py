@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -17,7 +18,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RAW_BASE = "https://raw.githubusercontent.com/Kakoutang/paopao/main"
+RAW_BASE_TEMPLATE = "https://raw.githubusercontent.com/Kakoutang/paopao/{ref}"
 MANAGED_FILES = [
     ".codex-plugin/plugin.json",
     "README.md",
@@ -52,8 +53,24 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch(path: str) -> bytes:
-    url = f"{RAW_BASE}/{path}"
+def remote_ref() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-remote", "origin", "refs/heads/main"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        ).strip()
+        if out:
+            return out.split()[0]
+    except Exception:
+        pass
+    return "main"
+
+
+def fetch(path: str, ref: str) -> bytes:
+    url = f"{RAW_BASE_TEMPLATE.format(ref=ref)}/{path}"
     req = urllib.request.Request(url, headers={"User-Agent": "paopao-updater"})
     with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
         return resp.read()
@@ -63,11 +80,12 @@ def main() -> int:
     updated: list[str] = []
     unchanged: list[str] = []
     failed: list[str] = []
+    ref = remote_ref()
 
     for rel in MANAGED_FILES:
         target = ROOT / rel
         try:
-            remote = fetch(rel)
+            remote = fetch(rel, ref)
             remote_hash = sha256_bytes(remote)
             if target.exists() and sha256_file(target) == remote_hash:
                 unchanged.append(rel)
@@ -81,6 +99,7 @@ def main() -> int:
     result = {
         "ok": not failed,
         "plugin_root": str(ROOT),
+        "remote_ref": ref,
         "updated": updated,
         "unchanged_count": len(unchanged),
         "failed": failed,
