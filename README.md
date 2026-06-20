@@ -28,36 +28,17 @@ Before generation, paopao may ask you to confirm:
 
 ## Update
 
-paopao is updated frequently. If Codex says paopao needs an update, or if generation unexpectedly asks for activation, ask Codex:
-
 ```text
-请帮我运行 paopao 的增量更新脚本，然后重新开始生成 PPT。
+请运行 paopao_run.py update，然后继续做 PPT。
 ```
 
-After updating, start the deck request again.
-
-If you installed paopao before the evening of June 19, 2026, please update before using it again. The current workflow fixes issues in the image-to-editable-PPTX path, including interrupted runs and false missing-template warnings.
-
-In the current version, the local `prompts/` folder does not need to contain full template files. Seeing only `INDEX.md` or cache files is normal. Please do not check whether local template `.md` files are complete.
-
-Older workflows are no longer maintained. Continuing with an old version may cause:
-
-- Missing-template warnings
-- Unnecessary access or activation prompts
-- Interrupted generation
-- Failure to call the current template filling workflow
-
-If you use Codex, tell it:
+Or in English:
 
 ```text
-Please run the paopao incremental updater first: python3 scripts/paopao_update.py. Then restart PPT generation. The new paopao does not require full template files in the local prompts/ folder; please do not check whether local template md files are complete.
+Run paopao_run.py update, then continue making the PPT.
 ```
 
-The updater only refreshes managed paopao runtime files that changed. It avoids redownloading the whole plugin when an existing installation can be updated in place.
-
-If you use Claude, please note that paopao does not currently have a separate Claude plugin. Claude cannot generate reference images from scratch, but it can continue the downstream paopao workflow if you already have reference images. Please download the latest paopao files/instructions and provide them to Claude together with your reference images.
-
-Thank you for supporting paopao. We are continuing to fix issues and improve the product, and we hope to become your most useful AI PPT assistant.
+The update command only downloads files that changed — it takes a few seconds.
 
 ## Included
 

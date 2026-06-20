@@ -6475,6 +6475,60 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
     return 0 if all(v != "FAILED" for v in results.values()) else 1
 
 
+def cmd_update(_: argparse.Namespace) -> int:
+    """Self-contained incremental updater. Downloads only changed files."""
+    import ssl
+    import urllib.request
+    import urllib.error
+
+    RAW_BASE = "https://raw.githubusercontent.com/Kakoutang/paopao/main"
+    MANAGED = [
+        ".codex-plugin/plugin.json",
+        "README.md",
+        "prompts/INDEX.md",
+        "scripts/check_public_release.py",
+        "scripts/paopao_auth.py",
+        "scripts/paopao_run.py",
+        "scripts/paopao_update.py",
+        "scripts/pptx_qa.py",
+        "skills/paopao-ppt/SKILL.md",
+    ]
+
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+
+    updated, unchanged, failed = [], 0, []
+    for rel in MANAGED:
+        target = PLUGIN_ROOT / rel
+        try:
+            req = urllib.request.Request(
+                f"{RAW_BASE}/{rel}",
+                headers={"User-Agent": "paopao-updater"},
+            )
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                remote = resp.read()
+            remote_hash = hashlib.sha256(remote).hexdigest()
+            if target.exists() and sha256_file(target) == remote_hash:
+                unchanged += 1
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(remote)
+            updated.append(rel)
+        except Exception as exc:
+            failed.append(f"{rel}: {exc}")
+
+    print(json.dumps({
+        "ok": not failed,
+        "updated": updated,
+        "unchanged": unchanged,
+        "failed": failed,
+    }, ensure_ascii=False, indent=2))
+    return 0 if not failed else 1
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     required_modules = ["pptx", "lxml"]
     optional_modules = ["playwright"]
@@ -6486,13 +6540,36 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         name: importlib.util.find_spec(name) is not None
         for name in optional_modules
     }
+
+    update_available = False
+    try:
+        import ssl, urllib.request
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            "https://raw.githubusercontent.com/Kakoutang/paopao/main/scripts/paopao_run.py",
+            headers={"User-Agent": "paopao-doctor"}, method="HEAD",
+        )
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            remote_len = int(resp.headers.get("Content-Length", 0))
+        local_len = (PLUGIN_ROOT / "scripts" / "paopao_run.py").stat().st_size
+        if abs(remote_len - local_len) > 500:
+            update_available = True
+    except Exception:
+        pass
+
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
         "required_modules": required_checks,
         "optional_modules": optional_checks,
-        "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
+        "update_available": update_available,
     }
+    if update_available:
+        checks["update_hint"] = "Run: paopao_run.py update"
     print(json.dumps(checks, indent=2, ensure_ascii=False))
     required_files_ok = all(v for k, v in checks.items() if k.endswith("_exists"))
     modules_ok = all(required_checks.values())
@@ -6730,6 +6807,9 @@ def build_parser() -> argparse.ArgumentParser:
     package = sub.add_parser("package", help="Build a zip package of this plugin")
     package.add_argument("--output", required=True)
     package.set_defaults(func=cmd_package)
+
+    update = sub.add_parser("update", help="Incremental self-update — download only changed files")
+    update.set_defaults(func=cmd_update)
 
     doctor = sub.add_parser("doctor", help="Check local plugin files")
     doctor.set_defaults(func=cmd_doctor)
