@@ -31,7 +31,7 @@ Before generation, paopao may ask you to confirm:
 paopao is updated frequently. If Codex says paopao needs an update, or if generation unexpectedly asks for activation, ask Codex:
 
 ```text
-请帮我更新 paopao 插件到最新版，然后重新开始生成 PPT。
+请帮我运行 paopao 的增量更新脚本，然后重新开始生成 PPT。
 ```
 
 After updating, start the deck request again.
@@ -50,8 +50,10 @@ Older workflows are no longer maintained. Continuing with an old version may cau
 If you use Codex, tell it:
 
 ```text
-Please reinstall the latest paopao plugin, then restart PPT generation. The new paopao does not require full template files in the local prompts/ folder; please do not check whether local template md files are complete.
+Please run the paopao incremental updater first: python3 scripts/paopao_update.py. Then restart PPT generation. The new paopao does not require full template files in the local prompts/ folder; please do not check whether local template md files are complete.
 ```
+
+The updater only refreshes managed paopao runtime files that changed. It avoids redownloading the whole plugin when an existing installation can be updated in place.
 
 If you use Claude, please note that paopao does not currently have a separate Claude plugin. Claude cannot generate reference images from scratch, but it can continue the downstream paopao workflow if you already have reference images. Please download the latest paopao files/instructions and provide them to Claude together with your reference images.
 

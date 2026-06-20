@@ -29,8 +29,8 @@ CONFIG_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao"))
 LICENSE_PATH = CONFIG_DIR / "license.json"
 DEFAULT_SERVER_URL = "https://paopao-license-api.onrender.com"
 DEFAULT_TIMEOUT = 20
-UPDATE_INSTRUCTION_ZH = "请帮我更新 paopao 插件到最新版，然后重新开始生成 PPT。"
-UPDATE_INSTRUCTION_EN = "Please update my paopao plugin to the latest version, then restart the PPT generation."
+UPDATE_INSTRUCTION_ZH = "请先运行 paopao 的增量更新脚本：python3 scripts/paopao_update.py，然后重新开始生成 PPT；如果没有这个脚本，再重新下载安装最新版 paopao 插件。"
+UPDATE_INSTRUCTION_EN = "Please run the paopao incremental updater first: python3 scripts/paopao_update.py, then restart PPT generation. If the updater is unavailable, reinstall the latest paopao plugin."
 
 
 class AuthError(RuntimeError):

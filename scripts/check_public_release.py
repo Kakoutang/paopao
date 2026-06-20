@@ -18,6 +18,7 @@ ALLOWED_TRACKED = {
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
+    "scripts/paopao_update.py",
     "scripts/pptx_qa.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
