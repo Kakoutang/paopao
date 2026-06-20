@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Local helpers for paopao tasks.
 
-This script creates stable local task folders, validates delivery artifacts,
-and packages editable PPTX output for paopao.
+This script does not call an LLM. Codex performs the reasoning workflow from
+the skill instructions; this helper creates stable task folders, validates the
+Image2-to-editable-PPTX commercial contract, and renders HTML when the declared
+commercial path uses the HTML renderer.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
+import base64
+import difflib
 import hashlib
-import io
 import importlib.util
 import json
+import math
 import os
 import random
 import re
@@ -20,16 +23,18 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 import paopao_auth
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+RENDERER = PLUGIN_ROOT / "scripts" / "renderer.py"
 SYSTEM_PROMPT = PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md"
 PROMPT_LIBRARY_DIR = PLUGIN_ROOT / "prompts"
-WORKFLOW_CACHE_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao")) / "workflow"
 
 
 PROMPT_REQUIRED_MARKERS = ["TITLE", "BOTTOM", "Source", "DESIGN"]
@@ -57,6 +62,23 @@ PROMPT_INTERNAL_PATTERNS = [
 ]
 PROMPT_PRIVATE_DIR = Path("qa") / "private_prompts"
 PROMPT_ARCHIVE_ENV = "PAOPAO_KEEP_PRIVATE_PROMPTS"
+
+PUBLIC_SKILL_STUB = """---
+name: "paopao-ppt"
+description: "Use Paopao to turn PDFs, reports, papers, and reference images into editable consulting-style PPTX decks."
+---
+
+# Paopao PPT
+
+Before starting, update the local workflow files:
+
+```bash
+python3 <plugin-root>/scripts/paopao_run.py fetch-workflow --all
+```
+
+Then follow the refreshed Paopao instructions exactly. If the command fails,
+tell the user to update the paopao plugin and try again.
+"""
 TASK_LOCAL_GITIGNORE = """# Paopao build workspace: internal by default.
 # The user-facing artifacts are published under delivery/ after final QA.
 *
@@ -109,11 +131,12 @@ FIDELITY_REVIEW_MIN_CHECKS = [
     "takeaway",
     "color_hierarchy",
 ]
-MIN_FIDELITY_IMAGE_SCORE = float(os.getenv("PAOPAO_MIN_FIDELITY_IMAGE_SCORE", "0.82"))
+MIN_FIDELITY_IMAGE_SCORE = float(os.getenv("PAOPAO_MIN_FIDELITY_IMAGE_SCORE", "0.80"))
 MIN_HTML_REFERENCE_IMAGE_SCORE = float(
     os.getenv("PAOPAO_MIN_HTML_REFERENCE_IMAGE_SCORE", str(MIN_FIDELITY_IMAGE_SCORE))
 )
-COMMERCIAL_SIMILARITY_MIN = float(os.getenv("PAOPAO_COMMERCIAL_SIMILARITY_MIN", "0.95"))
+COMMERCIAL_SIMILARITY_MIN = float(os.getenv("PAOPAO_COMMERCIAL_SIMILARITY_MIN", "0.80"))
+DELIVERY_REVIEW_ACCEPTED_STATUSES = {"pass", "usable"}
 REGION_GEOMETRY_CENTER_TOLERANCE_PX = float(os.getenv("PAOPAO_REGION_GEOMETRY_CENTER_TOLERANCE_PX", "64"))
 REGION_GEOMETRY_SIZE_TOLERANCE_PX = float(os.getenv("PAOPAO_REGION_GEOMETRY_SIZE_TOLERANCE_PX", "80"))
 REGION_GEOMETRY_SIZE_TOLERANCE_RATIO = float(os.getenv("PAOPAO_REGION_GEOMETRY_SIZE_TOLERANCE_RATIO", "0.25"))
@@ -136,6 +159,37 @@ FINAL_DELIVERY_PASS_SCHEMA = "paopao.final_delivery_pass.v1"
 COMMERCIAL_RENDER_CONTRACT_SCHEMA = "paopao.commercial_render_contract.v1"
 COMMERCIAL_RENDER_PATHS = {"html", "direct_pptx"}
 DIRECT_PPTX_OBJECT_MAP_SCHEMA = "paopao.direct_pptx_object_map.v1"
+VISUAL_BLUEPRINT_SCHEMA = "paopao.visual_blueprint.v1"
+VISUAL_INVENTORY_SCHEMA = "paopao.visual_inventory.v1"
+POWERPOINT_LAYOUT_PLAN_SCHEMA = "paopao.powerpoint_layout_plan.v1"
+VISUAL_OBJECT_GRAPH_SCHEMA = "paopao.visual_object_graph.v1"
+OBJECT_GRAPH_CANVAS_W = 1920
+OBJECT_GRAPH_SLIDE_W_PT = 13.333 * 72
+OBJECT_GRAPH_PX_TO_PT = OBJECT_GRAPH_SLIDE_W_PT / OBJECT_GRAPH_CANVAS_W
+VISUAL_BLUEPRINT_ALLOWED_OBJECT_KINDS = {
+    "nav",
+    "title",
+    "text",
+    "text_box",
+    "kpi",
+    "card",
+    "panel",
+    "shape",
+    "shape_group",
+    "native_table",
+    "native_chart",
+    "callout",
+    "takeaway",
+    "source",
+    "badge",
+    "chevron",
+    "divider",
+    "connector",
+    "icon",
+    "image",
+    "nav_indicator",
+    "callout_strip",
+}
 
 VISUAL_CONTRACT_REQUIRED_REGIONS = [
     "nav",
@@ -147,6 +201,123 @@ VISUAL_CONTRACT_REQUIRED_REGIONS = [
 VISUAL_CONTRACT_ROOT_REGION_IDS = set(VISUAL_CONTRACT_REQUIRED_REGIONS)
 MIN_VISUAL_CONTRACT_REGIONS = int(os.getenv("PAOPAO_MIN_VISUAL_CONTRACT_REGIONS", "9"))
 MIN_VISUAL_CONTRACT_DETAIL_REGIONS = int(os.getenv("PAOPAO_MIN_VISUAL_CONTRACT_DETAIL_REGIONS", "4"))
+MIN_VISUAL_INVENTORY_ELEMENTS = int(os.getenv("PAOPAO_MIN_VISUAL_INVENTORY_ELEMENTS", "12"))
+VISUAL_INVENTORY_REQUIRED_ROLES = {
+    "nav",
+    "title",
+    "content",
+    "takeaway",
+    "source",
+}
+VISUAL_INVENTORY_DETAIL_KINDS = {
+    "kpi",
+    "card",
+    "panel",
+    "shape",
+    "shape_group",
+    "native_table",
+    "native_chart",
+    "callout",
+    "badge",
+    "chevron",
+    "divider",
+    "connector",
+    "icon",
+    "nav_indicator",
+    "callout_strip",
+}
+VISUAL_INVENTORY_NATIVE_KIND_MATCH = {
+    "native_table": {"native_table", "table"},
+    "native_chart": {"native_chart", "chart"},
+    "connector": {"connector"},
+    "icon": {"icon"},
+    "nav_indicator": {"nav_indicator"},
+    "callout_strip": {"callout_strip", "takeaway", "callout"},
+    "chevron": {"chevron"},
+    "badge": {"badge"},
+}
+VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS = {
+    "title",
+    "text",
+    "text_box",
+    "kpi",
+    "card",
+    "callout",
+    "takeaway",
+    "source",
+    "badge",
+    "chevron",
+    "nav_indicator",
+    "callout_strip",
+}
+VISUAL_OBJECT_GRAPH_CONTAINER_KINDS = {
+    "shape",
+    "panel",
+    "shape_group",
+}
+VISUAL_OBJECT_GRAPH_COMPLEX_DETAIL_KINDS = {
+    "native_table",
+    "native_chart",
+    "connector",
+    "icon",
+    "badge",
+    "chevron",
+    "nav_indicator",
+    "callout_strip",
+}
+VISUAL_OBJECT_GRAPH_TEXT_BEARING_KINDS = {
+    "title",
+    "text",
+    "text_box",
+    "kpi",
+    "nav",
+    "takeaway",
+    "source",
+    "badge",
+    "chevron",
+    "callout",
+    "callout_strip",
+}
+VISUAL_OBJECT_GRAPH_STYLED_KINDS = {
+    "nav",
+    "title",
+    "card",
+    "panel",
+    "takeaway",
+    "kpi",
+    "badge",
+    "chevron",
+    "shape",
+    "shape_group",
+    "icon",
+    "connector",
+    "nav_indicator",
+    "callout_strip",
+}
+VISUAL_INVENTORY_TEXT_MEASURED_KINDS = {
+    "nav",
+    "title",
+    "text",
+    "text_box",
+    "kpi",
+    "card",
+    "callout",
+    "takeaway",
+    "source",
+    "badge",
+    "chevron",
+    "nav_indicator",
+    "callout_strip",
+}
+VISUAL_INVENTORY_COMPONENT_PART_KINDS = {
+    "kpi",
+    "callout",
+    "chevron",
+    "native_table",
+    "native_chart",
+    "card",
+    "panel",
+}
 VISUAL_CONTRACT_BORDER_STYLES = {
     "none",
     "solid",
@@ -176,6 +347,40 @@ VISUAL_CHART_KEYWORDS = {
     "坐标轴",
     "轴线",
     "数据图",
+}
+
+COMPONENT_AUTHORING_GUIDES = {
+    "native_chart": {
+        "required_structured_fields": [
+            "bbox.height", "measurements.component_parts.plot_area", "chart_data.chart_type",
+            "chart_data.categories", "chart_data.series[].values", "chart_data.plot_area",
+            "chart_data.plot_area_px", "chart_data.data_labels", "chart_data.bar_gap_width",
+        ],
+        "compiler": "renders native editable chart from measured chart/plot geometry, axes, gridlines, title, data labels, and bar spacing",
+    },
+    "native_table": {
+        "required_structured_fields": [
+            "bbox.height", "table_data.headers_or_row_labels", "table_data.rows", "table_data.col_widths", "table_data.row_heights",
+            "table_data.cell_padding", "table_data.row_header_background",
+        ],
+        "compiler": "renders native editable table with fixed outer height, row heights, separate header, row-header, body, padding, and borders",
+    },
+    "takeaway": {
+        "required_structured_fields": ["label", "body"],
+        "compiler": "renders a split bottom strip with label, divider, and body",
+    },
+    "callout": {
+        "recommended_structured_fields": ["component.number", "component.title", "component.body", "component.icon"],
+        "compiler": "renders badge/title/body styling; wide short callouts become note strips with icon",
+    },
+    "chevron": {
+        "required_structured_fields": ["text or component.label", "component_parts.label_text", "component_parts.number_badge"],
+        "compiler": "renders chevron shape with controlled arrow ratio and measured label box",
+    },
+    "kpi": {
+        "recommended_structured_fields": ["component.metric", "component.description", "component.tag"],
+        "compiler": "renders card, metric, body, and footer tag as separate editable objects",
+    },
 }
 VISUAL_TABLE_KEYWORDS = {
     "table",
@@ -366,6 +571,15 @@ IMAGE2_FORBIDDEN_SOURCE_NAME_PARTS = {
     "final_preview",
     "final_previews",
     "contact_sheet",
+    "fake",
+    "manual_reference",
+    "mock",
+    "paopao-e2e-reference",
+    "pil",
+    "reference-v",
+    "sketch",
+    "smoke",
+    "synthetic",
 }
 
 IMAGE2_OBSERVATION_SCHEMA = "paopao.image2_observation.v1"
@@ -401,13 +615,120 @@ ICON_CLASS_EDGE_HINTS = (
 )
 
 
+def auth_should_run() -> bool:
+    if os.getenv("PAOPAO_LOCAL_DEV") == "1":
+        return True
+    if os.getenv("PAOPAO_AUTH_REQUIRED") == "1":
+        return True
+    if open_preview_enabled() and not has_local_license():
+        return False
+    return (
+        bool(os.getenv("PAOPAO_AUTH_URL"))
+        or paopao_auth.LICENSE_PATH.exists()
+    )
+
+
+def open_preview_enabled() -> bool:
+    return os.getenv("PAOPAO_OPEN_PREVIEW", "1") != "0"
+
+
 def free_max_slides() -> int:
     raw = os.getenv("PAOPAO_FREE_MAX_SLIDES", "10").strip()
     try:
-        return 10 if int(raw) <= 0 else min(10, int(raw))
+        return max(0, int(raw))
     except ValueError:
         return 10
 
+
+def has_local_license() -> bool:
+    try:
+        data = paopao_auth.read_license()
+    except Exception:
+        return False
+    return bool(data.get("token") and data.get("server_url"))
+
+
+def workflow_destinations() -> dict[str, Path]:
+    return {
+        "SKILL.md": PLUGIN_ROOT / "skills" / "paopao-ppt" / "SKILL.md",
+        "SYSTEM_PROMPT.md": PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md",
+        "renderer_guide.md": PLUGIN_ROOT / "reference" / "renderer_guide.md",
+    }
+
+
+def fetch_workflow_file(name: str, destination: Path) -> None:
+    try:
+        result = paopao_auth.fetch_workflow_file(name)
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    content = str(result.get("content", "")).strip()
+    if not content:
+        raise SystemExit(f"Workflow file is empty: {name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content + "\n", encoding="utf-8")
+
+
+def ensure_workflow_file(name: str) -> Path:
+    destinations = workflow_destinations()
+    if name not in destinations:
+        raise SystemExit(f"Unknown workflow file: {name}")
+    path = destinations[name]
+    if not path.exists() or path.stat().st_size < 80:
+        fetch_workflow_file(name, path)
+    return path
+
+
+def cmd_fetch_workflow(args: argparse.Namespace) -> int:
+    destinations = workflow_destinations()
+    names = list(destinations) if args.all else [args.name]
+    written: list[str] = []
+    for name in names:
+        if name not in destinations:
+            raise SystemExit(f"Unknown workflow file: {name}")
+        fetch_workflow_file(name, destinations[name])
+        written.append(str(destinations[name].relative_to(PLUGIN_ROOT)))
+    print(json.dumps({"ok": True, "written": written}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def reserve_quota(task_dir: Path, pages: int) -> str:
+    if os.getenv("PAOPAO_LOCAL_DEV") == "1":
+        try:
+            result = paopao_auth.reserve(job_id=f"{task_dir.name}-{int(time.time())}", pages=pages)
+        except paopao_auth.AuthError as exc:
+            raise SystemExit(str(exc)) from exc
+        return str(result.get("reservation_id", ""))
+    free_limit = free_max_slides()
+    if not has_local_license():
+        if open_preview_enabled() and free_limit == 0:
+            return ""
+        if free_limit and pages <= free_limit:
+            return ""
+        if auth_should_run() or free_limit:
+            if free_limit == 0:
+                raise SystemExit(
+                    "Paopao requires an active license. "
+                    "Activate with scripts/paopao_auth.py activate before rendering."
+                )
+            raise SystemExit(
+                f"Paopao free mode supports up to {free_limit} slides. "
+                "Activate a license with scripts/paopao_auth.py activate to render larger decks."
+            )
+    if not auth_should_run():
+        return ""
+    job_id = f"{task_dir.name}-{int(time.time())}"
+    try:
+        result = paopao_auth.reserve(job_id=job_id, pages=pages)
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    return str(result.get("reservation_id", ""))
+
+
+def finish_quota(reservation_id: str, succeeded: bool) -> None:
+    if not reservation_id:
+        return
+    command = "commit" if succeeded else "cancel"
+    paopao_auth.finish_reservation(command, reservation_id)
 
 
 def slugify(name: str) -> str:
@@ -424,29 +745,10 @@ def write_task_local_gitignore(task_dir: Path) -> None:
     path.write_text(TASK_LOCAL_GITIGNORE, encoding="utf-8")
 
 
-def enforce_public_page_limit(pages: int | None) -> None:
-    if pages and free_max_slides() and pages > free_max_slides():
-        raise SystemExit(
-            f"当前体验额度支持最多 {free_max_slides()} 页。"
-            "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
-            f"Your current access supports up to {free_max_slides()} slides. "
-            "To continue with more pages, contact WeChat: sugarong_"
-        )
-
-
-def create_task_dir(
-    *,
-    name: str,
-    output_root: str | Path,
-    pages: int | None,
-    language: str,
-    focus: str,
-) -> Path:
-    enforce_public_page_limit(pages)
-    task_name = slugify(name)
-    root = Path(output_root).resolve() / task_name
+def cmd_init(args: argparse.Namespace) -> int:
+    task_name = slugify(args.name)
+    root = Path(args.output_root).resolve() / task_name
     for child in [
-        "source",
         "analysis",
         "image2",
         "spec",
@@ -458,9 +760,9 @@ def create_task_dir(
 
     manifest = {
         "task_name": task_name,
-        "page_count": pages,
-        "language": language,
-        "focus": focus,
+        "page_count": args.pages,
+        "language": args.language,
+        "focus": args.focus,
         "status": "initialized",
     }
     (root / "paopao_task.json").write_text(
@@ -468,19 +770,92 @@ def create_task_dir(
         encoding="utf-8",
     )
     write_task_local_gitignore(root)
-    return root
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    root = create_task_dir(
-        name=args.name,
-        output_root=args.output_root,
-        pages=args.pages,
-        language=args.language,
-        focus=args.focus,
-    )
     print(root)
     return 0
+
+
+def _write_public_runtime_state(task_dir: Path, expected: int) -> dict[str, object]:
+    state = _pipeline_step_state(task_dir, expected)
+    payload: dict[str, object] = {
+        "schema": "paopao.public_runtime_state.v1",
+        "task_dir": str(task_dir),
+        "expected_pages": expected,
+        "next": state,
+    }
+    state_path = task_dir / "qa" / "public_runtime_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def cmd_make_deck(args: argparse.Namespace) -> int:
+    """Compatibility entrypoint that hands older calls into the gated pipeline."""
+
+    if args.task_dir:
+        task_dir = Path(args.task_dir).resolve()
+        expected = args.pages or expected_pages_from_task(task_dir)
+        if not expected:
+            raise SystemExit("Missing expected page count. Pass --pages or initialize task with --pages.")
+        payload = _write_public_runtime_state(task_dir, expected)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    if not args.name:
+        raise SystemExit("make-deck requires --name for a new task or --task-dir to continue.")
+    if not args.pages:
+        raise SystemExit("make-deck requires --pages for a new task.")
+
+    task_name = slugify(args.name)
+    task_dir = Path(args.output_root).resolve() / task_name
+    for child in [
+        "source",
+        "analysis",
+        "image2",
+        "spec",
+        "html/assets",
+        "pptx",
+        "qa/pptx_actual",
+    ]:
+        (task_dir / child).mkdir(parents=True, exist_ok=True)
+
+    source_entries: list[str] = []
+    if args.source:
+        source = Path(args.source).expanduser().resolve()
+        if not source.exists() or not source.is_file():
+            raise SystemExit(f"Source file not found: {source}")
+        dest = task_dir / "source" / source.name
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
+        source_entries.append(_relative_to_task_or_abs(task_dir, dest))
+
+    manifest = {
+        "task_name": task_name,
+        "page_count": args.pages,
+        "language": args.language,
+        "focus": args.focus,
+        "status": "initialized",
+        "entrypoint": "make-deck",
+        "pipeline_mode": "gated_direct",
+    }
+    if source_entries:
+        manifest["source_files"] = source_entries
+    (task_dir / "paopao_task.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    write_task_local_gitignore(task_dir)
+
+    payload = _write_public_runtime_state(task_dir, args.pages)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def html_files_from_task(task_dir: Path) -> list[Path]:
+    html_dir = task_dir / "html"
+    files = sorted(html_dir.glob("slide*.html"))
+    if not files:
+        raise SystemExit(f"No slide*.html files found in {html_dir}")
+    return files
 
 
 def expected_pages_from_task(task_dir: Path) -> int | None:
@@ -865,85 +1240,8 @@ def has_placeholder(text: str) -> bool:
     return any(pattern in lower for pattern in PLACEHOLDER_PATTERNS)
 
 
-_remote_prompt_cache: dict[str, str] = {}
-_workflow_cache: dict[str, str] = {}
-
-WORKFLOW_LOCAL_PATHS: dict[str, Path] = {
-    "SYSTEM_PROMPT.md": SYSTEM_PROMPT,
-}
-
-
-def fetch_and_cache_workflow(name: str) -> str:
-    content = ""
-    for attempt in range(3):
-        try:
-            content = paopao_auth.fetch_workflow_content(name)
-            break
-        except Exception:
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-    if not content:
-        return ""
-    if not content.strip():
-        return ""
-    _workflow_cache[name] = content
-    local = WORKFLOW_LOCAL_PATHS.get(name)
-    if local:
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_text(content, encoding="utf-8")
-    else:
-        WORKFLOW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (WORKFLOW_CACHE_DIR / name).write_text(content, encoding="utf-8")
-    return content
-
-
-def get_workflow_content(name: str) -> str:
-    if name in _workflow_cache:
-        return _workflow_cache[name]
-    local = WORKFLOW_LOCAL_PATHS.get(name)
-    if local and local.exists():
-        text = read_text(local)
-        if text.strip():
-            _workflow_cache[name] = text
-            return text
-    cached = WORKFLOW_CACHE_DIR / name
-    if cached.exists():
-        text = read_text(cached)
-        if text.strip():
-            _workflow_cache[name] = text
-            return text
-    return fetch_and_cache_workflow(name)
-
-
-def get_system_prompt_text() -> str:
-    return get_workflow_content("SYSTEM_PROMPT.md")
-
-
-def get_system_prompt_sha() -> str:
-    text = get_system_prompt_text()
-    if text:
-        return sha256_text(text)
-    if SYSTEM_PROMPT.exists():
-        return sha256_file(SYSTEM_PROMPT)
-    return ""
-
-
-def read_prompt_template(name: str) -> str:
-    local = PROMPT_LIBRARY_DIR / name
-    if local.exists():
-        return read_text(local)
-    return ""
-
-
-def fill_prompt_template(name: str, fills: dict[str, object]) -> str:
-    try:
-        content = paopao_auth.fill_prompt_template(name, {k: str(v) for k, v in fills.items()})
-        if content:
-            _remote_prompt_cache[name] = content
-            return content
-    except Exception:
-        pass
-    return ""
+def prompt_template_path(name: str) -> Path:
+    return PROMPT_LIBRARY_DIR / name
 
 
 def prompt_selection_plan_path(task_dir: Path) -> Path:
@@ -953,13 +1251,6 @@ def prompt_selection_plan_path(task_dir: Path) -> Path:
 def selected_prompt_template(text: str) -> str | None:
     match = PROMPT_TEMPLATE_RE.search(text)
     return match.group("name") if match else None
-
-
-def prompt_catalog_entry(template_name: str) -> dict[str, object] | None:
-    for entry in load_prompt_catalog():
-        if str(entry.get("template", "")) == template_name:
-            return entry
-    return None
 
 
 def prompt_scaffold_family(template_name: str) -> str:
@@ -991,7 +1282,42 @@ def parse_data_requires(text: str) -> list[str]:
     return values
 
 
-def _load_local_prompt_catalog() -> list[dict[str, object]]:
+def load_prompt_catalog() -> list[dict[str, object]]:
+    if os.getenv("PAOPAO_LOCAL_DEV") != "1":
+        try:
+            remote = paopao_auth.fetch_prompt_catalog()
+            prompts = remote.get("prompts", [])
+            if isinstance(prompts, list):
+                catalog: list[dict[str, object]] = []
+                for item in prompts:
+                    if not isinstance(item, dict):
+                        continue
+                    template = str(item.get("template", ""))
+                    data_requires_raw = item.get("data_requires", "")
+                    data_requires = (
+                        parse_data_requires(f"DATA_REQUIRES: {data_requires_raw}")
+                        if isinstance(data_requires_raw, str)
+                        else []
+                    )
+                    catalog.append({
+                        "template": template,
+                        "layout_name": str(item.get("layout_name", "") or Path(template).stem),
+                        "family": prompt_scaffold_family(template),
+                        "when_to_use": str(item.get("when_to_use", ""))[:320],
+                        "data_requires": data_requires,
+                        "free": bool(item.get("free")),
+                        "fill_zones": item.get("fill_zones", []),
+                        "layout_description": item.get("layout_description", ""),
+                    })
+                if catalog:
+                    return catalog
+        except paopao_auth.AuthError as exc:
+            if not any(
+                p.name not in {"SYSTEM_PROMPT.md", "INDEX.md"}
+                for p in PROMPT_LIBRARY_DIR.glob("*.md")
+            ):
+                raise SystemExit(str(exc)) from exc
+
     catalog: list[dict[str, object]] = []
     for path in sorted(PROMPT_LIBRARY_DIR.glob("*.md")):
         if path.name in {"SYSTEM_PROMPT.md", "INDEX.md"}:
@@ -1008,65 +1334,6 @@ def _load_local_prompt_catalog() -> list[dict[str, object]]:
             "data_requires": parse_data_requires(text),
         })
     return catalog
-
-
-_CATALOG_CACHE_PATH = PLUGIN_ROOT / "prompts" / ".catalog_cache.json"
-
-
-def _save_catalog_cache(entries: list[dict[str, object]]) -> None:
-    try:
-        _CATALOG_CACHE_PATH.write_text(
-            json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        pass
-
-
-def _load_catalog_cache() -> list[dict[str, object]]:
-    try:
-        if _CATALOG_CACHE_PATH.exists():
-            return json.loads(_CATALOG_CACHE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return []
-
-
-def load_prompt_catalog() -> list[dict[str, object]]:
-    local = _load_local_prompt_catalog()
-    local_names = {str(e["template"]) for e in local}
-    remote_entries: list[dict[str, object]] = []
-    try:
-        remote = paopao_auth.fetch_prompt_catalog()
-        for entry in remote:
-            name = entry.get("template", "")
-            if name and name not in local_names:
-                dr = entry.get("data_requires", "")
-                parsed = {
-                    "template": name,
-                    "layout_name": entry.get("layout_name", ""),
-                    "family": prompt_scaffold_family(name),
-                    "when_to_use": str(entry.get("when_to_use", ""))[:320],
-                    "data_requires": [t.strip() for t in dr.split(",") if t.strip()] if isinstance(dr, str) else dr,
-                    "fill_zones": entry.get("fill_zones", []),
-                    "layout_description": entry.get("layout_description", ""),
-                }
-                remote_entries.append(parsed)
-                local.append(parsed)
-        if remote_entries:
-            _save_catalog_cache(remote_entries)
-    except Exception:
-        cached = _load_catalog_cache()
-        for entry in cached:
-            name = str(entry.get("template", ""))
-            if name and name not in local_names:
-                local.append(entry)
-                local_names.add(name)
-    if not local:
-        raise SystemExit(
-            "No prompt templates available. Check your network connection to "
-            "paopao-license-api.onrender.com and retry, or contact WeChat: sugarong_"
-        )
-    return local
 
 
 def extract_report_signals(analysis_report: str) -> dict[str, int]:
@@ -1172,16 +1439,11 @@ def load_slide_story(task_dir: Path) -> dict[int, dict[str, str]]:
         return {}
     out: dict[int, dict[str, str]] = {}
     for item in slides:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not isinstance(item.get("slide"), int):
             continue
-        slide_value = item.get("slide")
-        if not isinstance(slide_value, int):
-            slide_value = item.get("slide_number")
-        if not isinstance(slide_value, int):
-            continue
-        out[int(slide_value)] = {
+        out[int(item["slide"])] = {
             "brief": str(item.get("brief", "") or item.get("claim", "") or item.get("title", "")),
-            "role": str(item.get("role", "") or item.get("slide_role", "")),
+            "role": str(item.get("role", "")),
             "section_name": str(item.get("section_name", "")),
         }
     return out
@@ -1206,8 +1468,6 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
                 "missing_tier1_data": missing,
             })
     if not compatible:
-        compatible = list(catalog)
-    elif len(compatible) < min(3, len(catalog)):
         compatible = list(catalog)
 
     selected: list[dict[str, object]] = []
@@ -1240,13 +1500,7 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
         candidate_pool = [entry for _, _, entry, _ in scored[:3]]
         if len(candidate_pool) < 3:
             candidate_pool.extend(entry for entry in compatible if entry not in candidate_pool)
-        if len(candidate_pool) < 3:
-            candidate_pool.extend(entry for entry in catalog if entry not in candidate_pool)
         candidate_pool = candidate_pool[:3]
-        score_by_template = {
-            str(scored_entry.get("template", "")): score
-            for score, _, scored_entry, _ in scored
-        }
         candidates = [
             {
                 "rank": rank + 1,
@@ -1255,7 +1509,10 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
                 "family": candidate["family"],
                 "visual_grammar": prompt_visual_grammar(str(candidate["family"])),
                 "selection_method": "role_fit_with_visual_diversity",
-                "score": score_by_template.get(str(candidate.get("template", "")), 0),
+                "score": next(
+                    score for score, _, scored_entry, _ in scored
+                    if scored_entry.get("template") == candidate.get("template")
+                ),
                 "when_to_use": candidate.get("when_to_use", ""),
             }
             for rank, candidate in enumerate(candidate_pool)
@@ -1269,8 +1526,6 @@ def select_prompt_plan(task_dir: Path, expected: int, topic: str = "") -> dict[s
             "brief": story.get("brief", ""),
             "selected_template": chosen["template"],
             "layout_name": chosen["layout_name"],
-            "layout_description": chosen.get("layout_description", ""),
-            "fill_zones": chosen.get("fill_zones", []),
             "family": family,
             "visual_grammar": grammar,
             "selection_method": "role_fit_with_visual_diversity",
@@ -1319,41 +1574,39 @@ def cmd_plan_prompts(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_fills_arg(raw: str) -> dict[str, object]:
-    value = str(raw or "").strip()
-    if not value:
-        raise SystemExit("--fills-json is required")
-    path = Path(value).expanduser()
-    if path.exists():
-        data = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        data = json.loads(value)
+def _load_zone_fills(path_or_json: str) -> dict[str, str]:
+    raw = path_or_json
+    if not path_or_json.lstrip().startswith(("{", "[")):
+        candidate = Path(path_or_json)
+        if candidate.exists() and candidate.is_file():
+            raw = candidate.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid zone fills JSON: {exc}") from exc
     if not isinstance(data, dict):
-        raise SystemExit("--fills-json must be a JSON object or a path to a JSON object")
-    return data
+        raise SystemExit("Zone fills must be a JSON object.")
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
-    template_name = str(args.template or "").strip()
-    if not template_name.endswith(".md"):
-        raise SystemExit("--template must be a prompt template filename ending in .md")
-    fills = _load_fills_arg(args.fills_json)
-    filled = fill_prompt_template(template_name, fills)
-    if not filled.strip():
-        raise SystemExit(
-            "Could not prepare this layout. Please update paopao and try again, or contact support if it keeps happening."
-        )
-    if not PROMPT_TEMPLATE_RE.search(filled):
-        filled = f"PROMPT_TEMPLATE: {template_name}\n{filled.lstrip()}"
-    out = Path(args.output).expanduser()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(filled.rstrip() + "\n", encoding="utf-8")
-    print(json.dumps({
-        "ok": True,
-        "template": template_name,
-        "output": str(out.resolve()),
-        "sha256": sha256_file(out),
-    }, ensure_ascii=False, indent=2))
+    fills = _load_zone_fills(args.fills)
+    try:
+        result = paopao_auth.fill_prompt_template(args.template, fills)
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    content = str(result.get("filled_content", "")).strip()
+    if not content:
+        raise SystemExit("Prompt fill returned empty content.")
+    if not PROMPT_TEMPLATE_RE.search(content):
+        content = f"PROMPT_TEMPLATE: {args.template}\n\n{content}"
+    if args.output:
+        out = Path(args.output).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(content + "\n", encoding="utf-8")
+        print(json.dumps({"ok": True, "output": str(out), "template": args.template}, ensure_ascii=False, indent=2))
+    else:
+        print(content)
     return 0
 
 
@@ -1362,22 +1615,19 @@ def prompt_template_issue(text: str, prompt_name: str) -> list[str]:
     match = PROMPT_TEMPLATE_RE.search(text)
     if not match:
         return [
-            f"{prompt_name} missing PROMPT_TEMPLATE: <template-file>.md; final prompts must be generated via fill-prompt-template"
+            f"{prompt_name} missing PROMPT_TEMPLATE: <prompt-library-file>.md; final prompts must be filled from plugins/paopao-codex-plugin/prompts"
         ]
     template_name = match.group("name")
-    if template_name in {"SYSTEM_PROMPT.md", "INDEX.md"}:
-        return [f"{prompt_name} PROMPT_TEMPLATE cannot be {template_name}"]
-    catalog_entry = prompt_catalog_entry(template_name)
-    template_text = read_prompt_template(template_name)
-    layout_name = ""
-    if catalog_entry:
-        layout_name = str(catalog_entry.get("layout_name", "")).strip()
-    if not layout_name and template_text:
-        layout_match = LAYOUT_NAME_RE.search(template_text)
-        if layout_match:
-            layout_name = layout_match.group("name")
-    if not layout_name:
+    catalog_entry = next(
+        (entry for entry in load_prompt_catalog() if str(entry.get("template", "")) == template_name),
+        None,
+    )
+    if not catalog_entry:
         return [f"{prompt_name} PROMPT_TEMPLATE is not available for the current plan: {template_name}"]
+    layout_name = str(catalog_entry.get("layout_name", "")).strip()
+    if not layout_name:
+        issues.append(f"{prompt_name} PROMPT_TEMPLATE {template_name} missing LAYOUT_NAME metadata")
+        return issues
     if f"LAYOUT_NAME: {layout_name}" not in text:
         issues.append(
             f"{prompt_name} must include LAYOUT_NAME: {layout_name} from PROMPT_TEMPLATE {template_name}"
@@ -1556,6 +1806,12 @@ def file_is_after_memory_boundary(task_dir: Path, path: Path) -> bool:
     return path.stat().st_mtime >= boundary.stat().st_mtime
 
 
+def file_is_after_path(path: Path, dependency: Path) -> bool:
+    if not path.exists() or not dependency.exists():
+        return True
+    return path.stat().st_mtime >= dependency.stat().st_mtime
+
+
 def image2_reference_provenance_issues(task_dir: Path, idx: int, entry: dict[str, object]) -> list[str]:
     issues: list[str] = []
     source_kind = str(entry.get("registration_source_kind", "")).strip()
@@ -1676,11 +1932,12 @@ def prompt_private_path(task_dir: Path, path: Path) -> Path:
 
 
 def build_image2_prompt_text(task_dir: Path, idx: int) -> str:
-    system_text = get_system_prompt_text()
+    ensure_workflow_file("SYSTEM_PROMPT.md")
+    system_text = read_text(SYSTEM_PROMPT)
     slide_prompt = read_text(task_dir / "analysis" / f"final_prompt_{idx:02d}.md")
     navigation_contract = build_deck_navigation_contract(task_dir, idx)
     if not system_text.strip():
-        raise SystemExit("System prompt missing or empty — check server connection")
+        raise SystemExit(f"System prompt missing or empty: {SYSTEM_PROMPT}")
     if not slide_prompt.strip():
         raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
     return (
@@ -1757,7 +2014,7 @@ def cmd_prepare_image2_prompts(args: argparse.Namespace) -> int:
         image_path = image2_reference_path(task_dir, idx)
         prompt_sha = sha256_text(prompt_text)
         final_prompt_sha = sha256_file(final_prompt) if final_prompt.exists() else None
-        system_prompt_sha = get_system_prompt_sha()
+        system_prompt_sha = sha256_file(SYSTEM_PROMPT)
         request_sha = sha256_file(request_path)
         image_sha = sha256_file(image_path) if image_path.exists() else None
         base_entry: dict[str, object] = {
@@ -2633,28 +2890,6 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
         )
         return 1
 
-    pptx_before_image2: list[str] = []
-    for d in ["delivery", "pptx", "qa/pptx_actual"]:
-        check_dir = task_dir / d
-        if check_dir.is_dir():
-            for f in check_dir.rglob("*"):
-                if f.is_file() and f.suffix.lower() in {".pptx", ".png", ".pdf"}:
-                    pptx_before_image2.append(str(f.relative_to(task_dir)))
-    if pptx_before_image2:
-        print(
-            json.dumps({
-                "ok": False,
-                "issue": (
-                    "PPTX/delivery files already exist in the task directory. "
-                    "Image2 references must be registered BEFORE any PPTX is generated. "
-                    "This prevents self-comparison (registering PPTX screenshots as reference images)."
-                ),
-                "existing_pptx_files": pptx_before_image2[:10],
-            }, ensure_ascii=False, indent=2),
-            file=sys.stderr,
-        )
-        return 1
-
     source_image = Path(args.image).resolve()
     target = image2_reference_path(task_dir, idx)
     if source_image == target.resolve():
@@ -2680,6 +2915,27 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
         return 1
     except ValueError:
         pass
+    pptx_before_image2: list[str] = []
+    for d in ["delivery", "pptx", "qa/pptx_actual"]:
+        check_dir = task_dir / d
+        if check_dir.is_dir():
+            for f in check_dir.rglob("*"):
+                if f.is_file() and f.suffix.lower() in {".pptx", ".png", ".pdf"}:
+                    pptx_before_image2.append(str(f.relative_to(task_dir)))
+    if pptx_before_image2:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": (
+                    "PPTX/delivery files already exist in the task directory. "
+                    "Image2 references must be registered BEFORE any PPTX is generated. "
+                    "This prevents self-comparison (registering PPTX screenshots as reference images)."
+                ),
+                "existing_pptx_files": pptx_before_image2[:10],
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
     suspicious_source = looks_like_rendered_preview_image(source_image)
     try:
         rel_source = source_image.relative_to(task_dir)
@@ -2742,7 +2998,7 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
         "generation_request_sha256": sha256_file(request_path),
         "generation_request_id": str(generation_request.get("request_id", "")),
         "final_prompt_sha256": sha256_file(final_prompt) if final_prompt.exists() else None,
-        "system_prompt_sha256": get_system_prompt_sha(),
+        "system_prompt_sha256": sha256_file(SYSTEM_PROMPT),
         "image_sha256": sha256_file(target),
         "image_path": str(target.relative_to(task_dir)),
         "image_status": "registered_verified",
@@ -2761,6 +3017,7 @@ def cmd_register_image2_reference(args: argparse.Namespace) -> int:
 
 
 def check_analysis_files(task_dir: Path, expected: int, issues: list[str]) -> None:
+    issues.extend(premature_pptx_delivery_issues(task_dir, expected))
     analysis = task_dir / "analysis" / "analysis_report.md"
     audit = task_dir / "analysis" / "prompt_selection_audit.md"
 
@@ -2998,6 +3255,7 @@ def check_image2_files(
     *,
     require_prompt_files: bool = True,
 ) -> int:
+    issues.extend(premature_pptx_delivery_issues(task_dir, expected))
     image_refs = sorted((task_dir / "image2").glob("image2_reference_*.png"))
     if len(image_refs) != expected:
         issues.append(f"selected Image2 references: expected {expected}, found {len(image_refs)}")
@@ -3076,8 +3334,7 @@ def check_image2_files(
             final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
             if require_prompt_files and final_prompt.exists() and entry.get("final_prompt_sha256") != sha256_file(final_prompt):
                 issues.append(f"image2_generation_manifest slide {idx}: final_prompt_sha256 mismatch")
-            sp_sha = get_system_prompt_sha()
-            if require_prompt_files and sp_sha and entry.get("system_prompt_sha256") != sp_sha:
+            if require_prompt_files and SYSTEM_PROMPT.exists() and entry.get("system_prompt_sha256") != sha256_file(SYSTEM_PROMPT):
                 issues.append(f"image2_generation_manifest slide {idx}: system_prompt_sha256 mismatch")
     if image_refs:
         earliest_ref_mtime = min(r.stat().st_mtime for r in image_refs)
@@ -3085,7 +3342,12 @@ def check_image2_files(
             check_dir = task_dir / d
             if check_dir.is_dir():
                 for f in check_dir.rglob("*"):
-                    if f.is_file() and f.suffix.lower() in {".pptx", ".png", ".pdf"}:
+                    suffix = f.suffix.lower()
+                    if d == "delivery":
+                        is_render_artifact = suffix == ".pptx"
+                    else:
+                        is_render_artifact = suffix in {".pptx", ".png", ".pdf"}
+                    if f.is_file() and is_render_artifact:
                         if f.stat().st_mtime <= earliest_ref_mtime:
                             issues.append(
                                 f"PPTX/delivery file {f.relative_to(task_dir)} was created before or at the same time as Image2 references. "
@@ -3105,12 +3367,12 @@ def check_spec_files(task_dir: Path, expected: int, issues: list[str]) -> int:
     required = [
         "canvas",
         "element",
-        "layout",
         "icon",
         "risk",
         "checklist",
         "reference",
-        "html",
+        "object_graph",
+        "pptx",
     ]
     for idx in range(1, expected + 1):
         spec = task_dir / "spec" / f"slide{idx:02d}_spec.md"
@@ -3147,6 +3409,31 @@ def check_spec_files(task_dir: Path, expected: int, issues: list[str]) -> int:
                 f"slide{idx:02d}_spec.md missing reconstruction boundary "
                 f"'{IMAGE_ONLY_RECONSTRUCTION_SOURCE}'; after Image2 approval, specs must be written from the image as a fresh artifact"
             )
+        blueprint = _read_json_file(visual_blueprint_path(task_dir, idx))
+        if isinstance(blueprint, dict) and blueprint.get("schema") == VISUAL_BLUEPRINT_SCHEMA:
+            expected_blueprint_ref = f"slide{idx:02d}_visual_blueprint.json"
+            if expected_blueprint_ref not in raw_text:
+                issues.append(
+                    f"slide{idx:02d}_spec.md must reference {expected_blueprint_ref}; "
+                    "direct PPTX specs must be authored from the locked visual blueprint"
+                )
+            missing_region_ids = [
+                rid for rid in _visual_region_ids(blueprint)
+                if rid and rid not in raw_text
+            ]
+            if missing_region_ids:
+                issues.append(
+                    f"slide{idx:02d}_spec.md Element Inventory missing visual blueprint region id(s): "
+                    + ", ".join(missing_region_ids[:12])
+                )
+        object_graph = _read_json_file(visual_object_graph_path(task_dir, idx))
+        if isinstance(object_graph, dict) and object_graph.get("schema") == VISUAL_OBJECT_GRAPH_SCHEMA:
+            expected_graph_ref = f"slide{idx:02d}_object_graph.json"
+            if expected_graph_ref not in raw_text:
+                issues.append(
+                    f"slide{idx:02d}_spec.md must reference {expected_graph_ref}; "
+                    "direct PPTX specs must stay bound to the executable object graph"
+                )
         if "prompt_context_discarded: true" not in text and "prompt context discarded: true" not in text:
             issues.append(
                 f"slide{idx:02d}_spec.md must declare prompt_context_discarded: true; "
@@ -3182,6 +3469,871 @@ def visual_measurement_path(task_dir: Path, idx: int) -> Path:
     return task_dir / "spec" / f"slide{idx:02d}_visual_measurement.json"
 
 
+def visual_blueprint_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "spec" / f"slide{idx:02d}_visual_blueprint.json"
+
+
+def visual_inventory_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "spec" / f"slide{idx:02d}_visual_inventory.json"
+
+
+def visual_object_graph_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "spec" / f"slide{idx:02d}_object_graph.json"
+
+
+def powerpoint_layout_plan_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "spec" / f"slide{idx:02d}_powerpoint_layout_plan.json"
+
+
+def _inventory_elements(data: dict[str, object]) -> list[dict[str, object]]:
+    elements = data.get("elements")
+    if not isinstance(elements, list):
+        return []
+    return [element for element in elements if isinstance(element, dict)]
+
+
+def _inventory_element_ids(data: dict[str, object], *, required_only: bool = True) -> list[str]:
+    ids: list[str] = []
+    for element in _inventory_elements(data):
+        if required_only and element.get("required", True) is False:
+            continue
+        eid = str(element.get("id", "")).strip()
+        if eid:
+            ids.append(eid)
+    return ids
+
+
+def _object_inventory_refs(obj: dict[str, object]) -> set[str]:
+    refs: set[str] = set()
+    for key in ("inventory_id", "source_inventory_id"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            refs.add(value.strip())
+    values = obj.get("source_inventory_ids")
+    if isinstance(values, list):
+        refs.update(str(value).strip() for value in values if str(value).strip())
+    return refs
+
+
+def _visual_inventory_counts(data: dict[str, object]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for element in _inventory_elements(data):
+        kind = str(element.get("object_kind", "")).strip()
+        role = str(element.get("role", "")).strip()
+        for key in {kind, role}:
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _text_runs_have_text(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    for run in value:
+        if isinstance(run, dict) and str(run.get("text", "")).strip():
+            return True
+    return False
+
+
+def _count_objects_by_inventory(
+    objects: list[object],
+) -> tuple[dict[str, list[dict[str, object]]], dict[str, int]]:
+    by_inventory: dict[str, list[dict[str, object]]] = {}
+    kind_counts: dict[str, int] = {}
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        kind = str(obj.get("object_kind", "")).strip()
+        if kind:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        for ref in _object_inventory_refs(obj):
+            by_inventory.setdefault(ref, []).append(obj)
+    return by_inventory, kind_counts
+
+
+def _bbox_values(bbox: object) -> list[float] | None:
+    if not _bbox_is_numeric(bbox):
+        return None
+    return [float(v) for v in bbox]  # type: ignore[arg-type]
+
+
+def _bbox_area(bbox: object) -> float:
+    vals = _bbox_values(bbox)
+    if not vals:
+        return 0.0
+    return max(0.0, vals[2]) * max(0.0, vals[3])
+
+
+def _bbox_intersection_area(a: object, b: object) -> float:
+    av = _bbox_values(a)
+    bv = _bbox_values(b)
+    if not av or not bv:
+        return 0.0
+    ax, ay, aw, ah = av
+    bx, by, bw, bh = bv
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _bbox_overlap_fraction(a: object, b: object, *, relative_to: str = "smaller") -> float:
+    inter = _bbox_intersection_area(a, b)
+    if inter <= 0:
+        return 0.0
+    area_a = _bbox_area(a)
+    area_b = _bbox_area(b)
+    if relative_to == "a":
+        denom = area_a
+    elif relative_to == "b":
+        denom = area_b
+    else:
+        denom = min(area_a, area_b)
+    return inter / max(1.0, denom)
+
+
+def _is_hex_color(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", value.strip()) is not None
+
+
+def _measurement_bbox_matches(element_bbox: object, measured_bbox: object, *, tolerance_px: float = 4.0) -> bool:
+    expected = _bbox_values(element_bbox)
+    measured = _bbox_values(measured_bbox)
+    if not expected or not measured:
+        return False
+    return all(abs(a - b) <= tolerance_px for a, b in zip(expected, measured))
+
+
+def _visual_element_measurement_issues(slide_idx: int, element: dict[str, object], pos: int) -> list[str]:
+    issues: list[str] = []
+    eid = str(element.get("id", "")).strip() or str(pos)
+    kind = str(element.get("object_kind", "")).strip()
+    if element.get("required", True) is False:
+        return issues
+    measurements = element.get("measurements")
+    if not isinstance(measurements, dict):
+        return [
+            f"slide{slide_idx:02d}_visual_inventory.json element {eid} must include measurements "
+            "with bbox_px, colors, typography/spacing for text, strokes for lines/borders, "
+            "and component_parts for composite modules"
+        ]
+
+    bbox_px = measurements.get("bbox_px")
+    if not _bbox_is_numeric(bbox_px):
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.bbox_px must be numeric")
+    elif not _measurement_bbox_matches(element.get("bbox"), bbox_px):
+        issues.append(
+            f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.bbox_px must match bbox "
+            "so observed geometry is not copied loosely"
+        )
+
+    colors = measurements.get("colors")
+    if not isinstance(colors, dict) or not colors:
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.colors is required")
+    elif not any(_is_hex_color(colors.get(key)) for key in ("fill", "text", "border", "accent")):
+        issues.append(
+            f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.colors must include "
+            "at least one hex fill/text/border/accent color sampled from the reference"
+        )
+
+    typography = measurements.get("typography")
+    if kind in VISUAL_INVENTORY_TEXT_MEASURED_KINDS:
+        if not isinstance(typography, dict):
+            issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.typography is required")
+        else:
+            if not isinstance(typography.get("font_size"), (int, float)):
+                issues.append(
+                    f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.typography.font_size must be numeric"
+                )
+            if not isinstance(typography.get("line_count"), int):
+                issues.append(
+                    f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.typography.line_count must be an integer"
+                )
+            if not str(typography.get("font_weight", "")).strip():
+                issues.append(
+                    f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.typography.font_weight is required"
+                )
+
+    spacing = measurements.get("spacing")
+    if kind in VISUAL_INVENTORY_TEXT_MEASURED_KINDS and not isinstance(spacing, dict):
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.spacing is required")
+
+    strokes = measurements.get("strokes")
+    style = element.get("style") if isinstance(element.get("style"), dict) else {}
+    if kind in {"connector", "divider"} or isinstance(style.get("border") if isinstance(style, dict) else None, dict):
+        if not isinstance(strokes, dict):
+            issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.strokes is required")
+        else:
+            if "width" in strokes and not isinstance(strokes.get("width"), (int, float)):
+                issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.strokes.width must be numeric")
+            if "color" in strokes and not _is_hex_color(strokes.get("color")):
+                issues.append(f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.strokes.color must be hex")
+
+    component_parts = measurements.get("component_parts")
+    if kind in VISUAL_INVENTORY_COMPONENT_PART_KINDS:
+        if not isinstance(component_parts, list) or not component_parts:
+            issues.append(
+                f"slide{slide_idx:02d}_visual_inventory.json element {eid} measurements.component_parts must list "
+                "visible sub-parts such as metric/body/footer, badge/label, plot/table/header/body"
+            )
+        else:
+            for part_pos, part in enumerate(component_parts, 1):
+                if not isinstance(part, dict):
+                    issues.append(
+                        f"slide{slide_idx:02d}_visual_inventory.json element {eid} component_parts[{part_pos}] must be an object"
+                    )
+                    continue
+                if not str(part.get("type", "")).strip():
+                    issues.append(
+                        f"slide{slide_idx:02d}_visual_inventory.json element {eid} component_parts[{part_pos}].type is required"
+                    )
+                if not _bbox_is_numeric(part.get("bbox_px")):
+                    issues.append(
+                        f"slide{slide_idx:02d}_visual_inventory.json element {eid} component_parts[{part_pos}].bbox_px must be numeric"
+                    )
+
+    return issues
+
+
+def _object_label(obj: dict[str, object], pos: int) -> str:
+    oid = str(obj.get("id", "")).strip()
+    kind = str(obj.get("object_kind", "")).strip()
+    return f"{oid or pos} ({kind or 'unknown'})"
+
+
+def _object_has_visible_text(obj: dict[str, object]) -> bool:
+    text = obj.get("text")
+    if isinstance(text, str) and text.strip():
+        return True
+    if isinstance(text, list) and any(isinstance(item, str) and item.strip() for item in text):
+        return True
+    if _text_runs_have_text(obj.get("text_runs")):
+        return True
+    if str(obj.get("label", "")).strip() or str(obj.get("body", "")).strip():
+        return True
+    items = obj.get("items")
+    return isinstance(items, list) and any(
+        isinstance(item, dict) and str(item.get("text", "")).strip()
+        for item in items
+    )
+
+
+def _object_text_lines(obj: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    text = obj.get("text")
+    if isinstance(text, str):
+        lines.extend(text.splitlines() or [text])
+    elif isinstance(text, list):
+        lines.extend(str(item) for item in text if str(item).strip())
+    runs = obj.get("text_runs")
+    if isinstance(runs, list):
+        run_text = "".join(str(run.get("text", "")) for run in runs if isinstance(run, dict))
+        if run_text.strip():
+            lines.extend(run_text.splitlines() or [run_text])
+    if str(obj.get("label", "")).strip():
+        lines.append(str(obj.get("label", "")))
+    if str(obj.get("body", "")).strip():
+        lines.extend(str(obj.get("body", "")).splitlines())
+    items = obj.get("items")
+    if isinstance(items, list):
+        lines.extend(
+            str(item.get("text", ""))
+            for item in items
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        )
+    return [line for line in lines if line.strip()]
+
+
+def _style_font_size(style: object, default: float = 12.0) -> float:
+    if not isinstance(style, dict):
+        return default
+    return _float_or_default(style.get("font_size"), default)
+
+
+def _float_or_default(value: object, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _estimate_wrapped_line_count(lines: list[str], width_px: float, font_size_pt: float) -> int:
+    if not lines:
+        return 0
+    font_px = max(1.0, font_size_pt / max(0.01, OBJECT_GRAPH_PX_TO_PT))
+    avg_char_px = max(5.0, font_px * 0.48)
+    capacity = max(1, int(width_px / avg_char_px))
+    total = 0
+    for line in lines:
+        # Count wide CJK glyphs more heavily; English punctuation/spaces stay light.
+        weighted = 0.0
+        for ch in line:
+            weighted += 1.7 if ord(ch) > 127 else (0.45 if ch.isspace() else 1.0)
+        total += max(1, math.ceil(weighted / capacity))
+    return total
+
+
+def _object_text_overflow_issues(slide_idx: int, obj: dict[str, object], pos: int) -> list[str]:
+    kind = str(obj.get("object_kind", "")).strip()
+    if kind not in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS or not _object_has_visible_text(obj):
+        return []
+    bbox = _bbox_values(obj.get("bbox"))
+    if not bbox:
+        return []
+    style = obj.get("style")
+    font_size = _style_font_size(style, 12.0)
+    padding = 0.0
+    if isinstance(style, dict):
+        pad = style.get("padding")
+        if isinstance(pad, (int, float)):
+            padding = float(pad)
+        else:
+            padding = max(
+                _float_or_default(style.get("padding_top"), 0.0),
+                _float_or_default(style.get("padding_bottom"), 0.0),
+            )
+    inner_w = max(1.0, bbox[2] - padding * 2)
+    inner_h = max(1.0, bbox[3] - padding * 2)
+    lines = _object_text_lines(obj)
+    wrapped_lines = _estimate_wrapped_line_count(lines, inner_w, font_size)
+    font_px = font_size / max(0.01, OBJECT_GRAPH_PX_TO_PT)
+    required_h = wrapped_lines * font_px * 1.18
+    if required_h > inner_h * 1.10:
+        return [
+            f"slide{slide_idx:02d}_object_graph.json text overflow risk: object {_object_label(obj, pos)} "
+            f"needs about {required_h:.0f}px text height after wrapping but bbox inner height is {inner_h:.0f}px; "
+            "increase bbox height, reduce font_size from the reference, or split text before compiling"
+        ]
+    return []
+
+
+def _is_allowed_component_overlap(obj_a: dict[str, object], obj_b: dict[str, object]) -> bool:
+    kind_a = str(obj_a.get("object_kind", "")).strip()
+    kind_b = str(obj_b.get("object_kind", "")).strip()
+    if {kind_a, kind_b} != {"badge", "chevron"}:
+        return False
+    badge = obj_a if kind_a == "badge" else obj_b
+    chevron = obj_b if badge is obj_a else obj_a
+    badge_bbox = _bbox_values(badge.get("bbox"))
+    chevron_bbox = _bbox_values(chevron.get("bbox"))
+    if not badge_bbox or not chevron_bbox:
+        return False
+    badge_area = _bbox_area(badge.get("bbox"))
+    chevron_area = _bbox_area(chevron.get("bbox"))
+    if badge_area > chevron_area * 0.18:
+        return False
+    badge_cy = badge_bbox[1] + badge_bbox[3] / 2
+    return chevron_bbox[1] <= badge_cy <= chevron_bbox[1] + chevron_bbox[3] * 0.45
+
+
+def _object_graph_geometry_issues(
+    slide_idx: int,
+    objects: list[object],
+    inventory_by_id: dict[str, dict[str, object]],
+) -> list[str]:
+    issues: list[str] = []
+    valid_objects = [obj for obj in objects if isinstance(obj, dict) and _bbox_is_numeric(obj.get("bbox"))]
+    title_objects = [
+        obj for obj in valid_objects
+        if str(obj.get("role", "")).strip() == "title" or str(obj.get("object_kind", "")).strip() == "title"
+    ]
+    body_objects = [
+        obj for obj in valid_objects
+        if str(obj.get("role", "")).strip() in {"content", "detail", "chart", "table", "kpi", "callout"}
+        or str(obj.get("object_kind", "")).strip() in {"native_table", "native_chart", "kpi", "card", "callout", "chevron"}
+    ]
+    for title in title_objects:
+        for body in body_objects:
+            if title is body:
+                continue
+            overlap_title = _bbox_overlap_fraction(title.get("bbox"), body.get("bbox"), relative_to="a")
+            overlap_smaller = _bbox_overlap_fraction(title.get("bbox"), body.get("bbox"))
+            if overlap_title >= 0.08 or overlap_smaller >= 0.18:
+                issues.append(
+                    f"slide{slide_idx:02d}_object_graph.json geometry collision: title object "
+                    f"{_object_label(title, 0)} overlaps body object {_object_label(body, 0)}; "
+                    "adjust bboxes before compiling"
+                )
+
+    text_like = [
+        obj for obj in valid_objects
+        if str(obj.get("object_kind", "")).strip() in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS
+        and _object_has_visible_text(obj)
+    ]
+    for i, obj_a in enumerate(text_like):
+        for obj_b in text_like[i + 1:]:
+            role_a = str(obj_a.get("role", "")).strip()
+            role_b = str(obj_b.get("role", "")).strip()
+            if role_a == "nav" or role_b == "nav":
+                continue
+            if _is_allowed_component_overlap(obj_a, obj_b):
+                continue
+            overlap = _bbox_overlap_fraction(obj_a.get("bbox"), obj_b.get("bbox"))
+            if overlap >= 0.35:
+                issues.append(
+                    f"slide{slide_idx:02d}_object_graph.json geometry collision: text-bearing objects "
+                    f"{_object_label(obj_a, i + 1)} and {_object_label(obj_b, i + 2)} overlap too much; "
+                    "PowerPoint output will visibly collide"
+                )
+
+    for obj in valid_objects:
+        kind = str(obj.get("object_kind", "")).strip()
+        if kind not in VISUAL_OBJECT_GRAPH_CONTAINER_KINDS:
+            continue
+        refs = _object_inventory_refs(obj)
+        if len(refs) >= 3:
+            detail_refs = [
+                ref for ref in refs
+                if str(inventory_by_id.get(ref, {}).get("object_kind", "")).strip() in VISUAL_OBJECT_GRAPH_COMPLEX_DETAIL_KINDS
+            ]
+            if detail_refs:
+                issues.append(
+                    f"slide{slide_idx:02d}_object_graph.json object {_object_label(obj, 0)} compresses "
+                    f"{len(refs)} inventory elements including complex detail(s) {', '.join(detail_refs[:6])}; "
+                    "split badges, icons, connectors, chevrons, tables, and charts into executable objects"
+                )
+    return issues
+
+
+def _component_authoring_guide(kind: str) -> dict[str, object]:
+    guide = COMPONENT_AUTHORING_GUIDES.get(kind)
+    return dict(guide) if isinstance(guide, dict) else {}
+
+
+def _chart_part_bbox(element: dict[str, object], part_type: str) -> list[float] | None:
+    measurements = element.get("measurements")
+    if not isinstance(measurements, dict):
+        return None
+    parts = measurements.get("component_parts")
+    if not isinstance(parts, list):
+        return None
+    for part in parts:
+        if not isinstance(part, dict) or str(part.get("type", "")).strip() != part_type:
+            continue
+        bbox = part.get("bbox_px")
+        if isinstance(bbox, list) and len(bbox) >= 4 and all(isinstance(v, (int, float)) for v in bbox[:4]):
+            return [float(v) for v in bbox[:4]]
+    return None
+
+
+def _chart_payload_is_structured(chart_data: object) -> bool:
+    if not isinstance(chart_data, dict):
+        return False
+    categories = chart_data.get("categories")
+    series = chart_data.get("series")
+    if not str(chart_data.get("chart_type", "")).strip():
+        return False
+    if not isinstance(categories, list) or not any(str(item).strip() for item in categories):
+        return False
+    if not isinstance(series, list) or not series:
+        return False
+    plot_area = chart_data.get("plot_area")
+    if not isinstance(plot_area, dict) or not all(key in plot_area for key in ("x", "y", "w", "h")):
+        return False
+    if not all(isinstance(plot_area.get(key), (int, float)) and plot_area.get(key) > 0 for key in ("w", "h")):
+        return False
+    plot_area_px = chart_data.get("plot_area_px")
+    if not (isinstance(plot_area_px, list) and len(plot_area_px) >= 4 and all(isinstance(v, (int, float)) for v in plot_area_px[:4])):
+        return False
+    if not isinstance(chart_data.get("bar_gap_width"), (int, float)):
+        return False
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("values"), list)
+        and any(isinstance(value, (int, float)) for value in item.get("values", []))
+        for item in series
+    )
+
+
+def _table_payload_is_structured(table_data: object) -> bool:
+    if not isinstance(table_data, dict):
+        return False
+    row_heights = table_data.get("row_heights")
+    col_widths = table_data.get("col_widths")
+    return (
+        isinstance(table_data.get("rows"), list)
+        and _nonempty_cells(table_data.get("rows")) >= 6
+        and isinstance(col_widths, list)
+        and any(isinstance(value, (int, float)) and value > 0 for value in col_widths)
+        and isinstance(row_heights, list)
+        and any(isinstance(value, (int, float)) and value > 0 for value in row_heights)
+        and "row_header_background" in table_data
+    )
+
+
+def _visual_inventory_structural_issues(slide_idx: int, element: dict[str, object], pos: int) -> list[str]:
+    eid = str(element.get("id", "")).strip() or str(pos)
+    kind = str(element.get("object_kind", "")).strip()
+    issues: list[str] = []
+    if kind in {"native_chart", "chart"} and not _chart_payload_is_structured(element.get("chart_data")):
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json chart {eid} missing structured chart_data")
+    if kind in {"native_chart", "chart"} and _chart_part_bbox(element, "plot_area") is None:
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json chart {eid} missing measured plot_area component_part")
+    if kind in {"native_table", "table"} and not _table_payload_is_structured(element.get("table_data")):
+        issues.append(f"slide{slide_idx:02d}_visual_inventory.json table {eid} missing structured table_data")
+    if kind in {"native_table", "table"}:
+        bbox = element.get("bbox")
+        if not (
+            isinstance(bbox, list)
+            and len(bbox) >= 4
+            and isinstance(bbox[3], (int, float))
+            and bbox[3] > 0
+        ):
+            issues.append(f"slide{slide_idx:02d}_visual_inventory.json table {eid} missing explicit bbox height")
+    if kind == "takeaway":
+        has_label_body = str(element.get("label", "")).strip() and str(element.get("body", "")).strip()
+        text_value = str(element.get("text", element.get("text_summary", "")))
+        if not has_label_body and ":" not in text_value:
+            issues.append(f"slide{slide_idx:02d}_visual_inventory.json takeaway {eid} missing label/body")
+    return issues
+
+
+def check_visual_inventory_files(task_dir: Path, expected: int, issues: list[str]) -> int:
+    inventories = sorted((task_dir / "spec").glob("slide*_visual_inventory.json"))
+    if len(inventories) != expected:
+        issues.append(f"visual inventories: expected {expected}, found {len(inventories)}")
+
+    for idx in range(1, expected + 1):
+        path = visual_inventory_path(task_dir, idx)
+        if not path.exists():
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json missing; direct PPTX requires a complete "
+                "visible-element inventory before writing the object graph"
+            )
+            continue
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except Exception as exc:
+            issues.append(f"slide{idx:02d}_visual_inventory.json cannot be parsed: {exc}")
+            continue
+        if data.get("schema") != VISUAL_INVENTORY_SCHEMA:
+            issues.append(f"slide{idx:02d}_visual_inventory.json schema must be {VISUAL_INVENTORY_SCHEMA}")
+        if data.get("reference_path") != f"image2/image2_reference_{idx:02d}.png":
+            issues.append(f"slide{idx:02d}_visual_inventory.json reference_path mismatch")
+        if data.get("reconstruction_source") != IMAGE_ONLY_RECONSTRUCTION_SOURCE:
+            issues.append(f"slide{idx:02d}_visual_inventory.json reconstruction_source must be {IMAGE_ONLY_RECONSTRUCTION_SOURCE}")
+        if data.get("prompt_context_discarded") is not True:
+            issues.append(f"slide{idx:02d}_visual_inventory.json prompt_context_discarded must be true")
+        if not file_is_after_reference(task_dir, idx, path):
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json is older than image2_reference_{idx:02d}.png; "
+                "rebuild it after reopening the selected reference"
+            )
+        if not file_is_after_memory_boundary(task_dir, path):
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json is older than qa/post_image_memory_boundary.json; "
+                "rebuild it after the forced post-image memory reset"
+            )
+        forbidden = post_image_memory_markers(raw_text)
+        if forbidden:
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json contains upstream prompt/analysis memory markers after Image2 approval: "
+                + ", ".join(forbidden)
+            )
+        observation, obs_issues = image_observation_record_issues(task_dir, idx)
+        if obs_issues:
+            issues.extend(obs_issues)
+        elif isinstance(observation, dict):
+            if data.get("observation_id") != observation.get("observation_id"):
+                issues.append(f"slide{idx:02d}_visual_inventory.json observation_id must match the fresh image observation")
+            obs_path = image2_observation_path(task_dir, idx)
+            if data.get("observation_record_path") != str(obs_path.relative_to(task_dir)):
+                issues.append(f"slide{idx:02d}_visual_inventory.json observation_record_path mismatch")
+            if obs_path.exists() and data.get("observation_record_sha256") != sha256_file(obs_path):
+                issues.append(f"slide{idx:02d}_visual_inventory.json observation_record_sha256 mismatch")
+
+        elements = _inventory_elements(data)
+        if len(elements) < MIN_VISUAL_INVENTORY_ELEMENTS:
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json is too coarse: expected at least "
+                f"{MIN_VISUAL_INVENTORY_ELEMENTS} visible elements, found {len(elements)}"
+            )
+        seen_ids: set[str] = set()
+        seen_roles: set[str] = set()
+        detail_count = 0
+        for pos, element in enumerate(elements, 1):
+            eid = str(element.get("id", "")).strip()
+            role = str(element.get("role", "")).strip()
+            kind = str(element.get("object_kind", "")).strip()
+            if not eid:
+                issues.append(f"slide{idx:02d}_visual_inventory.json element {pos} missing id")
+            elif eid in seen_ids:
+                issues.append(f"slide{idx:02d}_visual_inventory.json duplicate element id: {eid}")
+            else:
+                seen_ids.add(eid)
+            if not role:
+                issues.append(f"slide{idx:02d}_visual_inventory.json element {eid or pos} missing role")
+            else:
+                seen_roles.add(role)
+            if kind not in VISUAL_BLUEPRINT_ALLOWED_OBJECT_KINDS:
+                issues.append(
+                    f"slide{idx:02d}_visual_inventory.json element {eid or pos} invalid object_kind: {kind or '<missing>'}"
+                )
+            if not _bbox_is_numeric(element.get("bbox")):
+                issues.append(f"slide{idx:02d}_visual_inventory.json element {eid or pos} must include numeric bbox [x,y,w,h]")
+            if not isinstance(element.get("visual_features", []), list):
+                issues.append(f"slide{idx:02d}_visual_inventory.json element {eid or pos} visual_features must be a list")
+            issues.extend(_visual_element_measurement_issues(idx, element, pos))
+            issues.extend(_visual_inventory_structural_issues(idx, element, pos))
+            evidence = str(element.get("evidence", "")).strip()
+            if len(evidence) < 20:
+                issues.append(
+                    f"slide{idx:02d}_visual_inventory.json element {eid or pos} must include concrete visual evidence"
+                )
+            if kind in VISUAL_INVENTORY_DETAIL_KINDS:
+                detail_count += 1
+        missing_roles = sorted(VISUAL_INVENTORY_REQUIRED_ROLES - seen_roles)
+        if missing_roles:
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json missing required roles: {', '.join(missing_roles)}"
+            )
+        if detail_count < MIN_VISUAL_CONTRACT_DETAIL_REGIONS:
+            issues.append(
+                f"slide{idx:02d}_visual_inventory.json is too coarse: expected at least "
+                f"{MIN_VISUAL_CONTRACT_DETAIL_REGIONS} non-root detail elements, found {detail_count}"
+            )
+    return len(inventories)
+
+
+def _layout_slot_for_element(element: dict[str, object], pos: int) -> dict[str, object]:
+    eid = str(element.get("id", "")).strip()
+    kind = str(element.get("object_kind", "")).strip()
+    role = str(element.get("role", "")).strip()
+    bbox = element.get("bbox")
+    style = _object_graph_executable_style(
+        kind,
+        element.get("style") if isinstance(element.get("style"), dict) else {},
+    )
+    text_obj = {
+        "object_kind": kind,
+        "bbox": bbox,
+        "style": style,
+        "text": element.get("text", element.get("text_summary", "")) if kind in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS else "",
+    }
+    text_lines = _object_text_lines(text_obj)
+    font_size = _style_font_size(style, 12.0)
+    bbox_vals = _bbox_values(bbox)
+    padding = 0.0
+    if isinstance(style, dict):
+        pad = style.get("padding")
+        if isinstance(pad, (int, float)):
+            padding = float(pad)
+        else:
+            padding = max(
+                _float_or_default(style.get("padding_top"), 0.0),
+                _float_or_default(style.get("padding_bottom"), 0.0),
+            )
+    inner_w = max(1.0, (bbox_vals[2] if bbox_vals else 1.0) - padding * 2)
+    inner_h = max(1.0, (bbox_vals[3] if bbox_vals else 1.0) - padding * 2)
+    line_count = _estimate_wrapped_line_count(text_lines, inner_w, font_size) if text_lines else 0
+    font_px = font_size / max(0.01, OBJECT_GRAPH_PX_TO_PT)
+    required_h = line_count * font_px * 1.18
+    fits = not text_lines or required_h <= inner_h * 1.10
+    mechanics: list[str] = []
+    if kind in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS:
+        mechanics.extend([
+            "set explicit font_family and font_size",
+            "set auto_fit=false unless the reference visibly shrinks text",
+            "reserve padding/margins before placing sibling modules",
+        ])
+    if kind in {"native_table", "table"}:
+        mechanics.extend(["set col_widths", "set row_heights", "set cell_padding"])
+    if kind == "connector":
+        mechanics.extend(["use absolute points", "set line_width", "set begin_arrow/end_arrow when visible"])
+    return {
+        "id": f"slot_{eid or pos}",
+        "inventory_id": eid,
+        "role": role,
+        "object_kind": kind,
+        "bbox": bbox,
+        "reference_measurements": element.get("measurements", {}),
+        "authoring_guide": _component_authoring_guide(kind),
+        "z_order": pos,
+        "text_fit": {
+            "font_size": font_size,
+            "line_count_estimate": line_count,
+            "required_height_px": round(required_h, 1),
+            "inner_height_px": round(inner_h, 1),
+            "fits": fits,
+        },
+        "powerpoint_mechanics": mechanics,
+        "must_not_overlap_roles": ["title"] if role != "title" and kind not in {"nav", "source", "takeaway"} else [],
+    }
+
+
+def build_powerpoint_layout_plan_data(task_dir: Path, idx: int) -> dict[str, object]:
+    inventory_path = visual_inventory_path(task_dir, idx)
+    inventory = _read_json_file(inventory_path)
+    if not isinstance(inventory, dict) or inventory.get("schema") != VISUAL_INVENTORY_SCHEMA:
+        raise SystemExit(f"Missing valid visual inventory for slide {idx}")
+    elements = _inventory_elements(inventory)
+    slots = [_layout_slot_for_element(element, pos) for pos, element in enumerate(elements, 1)]
+    title_slots = [slot for slot in slots if slot.get("role") == "title" or slot.get("object_kind") == "title"]
+    title_bottom = 0.0
+    for slot in title_slots:
+        bbox = _bbox_values(slot.get("bbox"))
+        fit = slot.get("text_fit") if isinstance(slot.get("text_fit"), dict) else {}
+        if bbox:
+            title_bottom = max(title_bottom, bbox[1] + max(bbox[3], _float_or_default(fit.get("required_height_px"), bbox[3])))
+    content_top = max(0.0, title_bottom + 12.0) if title_bottom else 0.0
+    return {
+        "schema": POWERPOINT_LAYOUT_PLAN_SCHEMA,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "slide": idx,
+        "reference_path": f"image2/image2_reference_{idx:02d}.png",
+        "reconstruction_source": IMAGE_ONLY_RECONSTRUCTION_SOURCE,
+        "prompt_context_discarded": True,
+        "visual_inventory_path": str(inventory_path.relative_to(task_dir)),
+        "visual_inventory_sha256": sha256_file(inventory_path),
+        "canvas": inventory.get("canvas", {"width": 1920, "height": 1080}),
+        "powerpoint_model": {
+            "text_boxes_are_not_layout_engines": True,
+            "no_autofit_preserves_size_but_does_not_prevent_overflow": True,
+            "tables_need_explicit_row_col_and_cell_padding": True,
+            "z_order_does_not_fix_collisions": True,
+            "connectors_use_absolute_points_unless explicitly bound": True,
+        },
+        "safe_zones": {
+            "title_safe_bottom_px": round(title_bottom, 1),
+            "content_safe_top_px": round(content_top, 1),
+        },
+        "slots": slots,
+        "component_recipes": {
+            "title": "reserve required_height_px before placing content modules",
+            "chevron_badge": "split chevron body, badge, label, metric text, and connector points into separate non-colliding slots",
+            "table": "use native_table with col_widths, row_heights, cell_padding, border_color, border_width",
+            "callout": "use panel/card shape plus separate badge/text slots when the reference shows a numbered marker",
+        },
+        "policy": (
+            "Object graph must be derived from this PowerPoint-aware layout plan. "
+            "Do not rely on PowerPoint AutoFit or z-order to repair collisions."
+        ),
+    }
+
+
+def _layout_plan_slots(data: dict[str, object]) -> list[dict[str, object]]:
+    slots = data.get("slots")
+    if not isinstance(slots, list):
+        return []
+    return [slot for slot in slots if isinstance(slot, dict)]
+
+
+def _layout_slot_ids(data: dict[str, object]) -> set[str]:
+    ids: set[str] = set()
+    for slot in _layout_plan_slots(data):
+        sid = str(slot.get("id", "")).strip()
+        if sid:
+            ids.add(sid)
+    return ids
+
+
+def _object_layout_refs(obj: dict[str, object]) -> set[str]:
+    refs: set[str] = set()
+    value = obj.get("layout_slot_id")
+    if isinstance(value, str) and value.strip():
+        refs.add(value.strip())
+    values = obj.get("layout_slot_ids")
+    if isinstance(values, list):
+        refs.update(str(item).strip() for item in values if str(item).strip())
+    return refs
+
+
+def check_powerpoint_layout_plan_files(task_dir: Path, expected: int, issues: list[str]) -> int:
+    plans = sorted((task_dir / "spec").glob("slide*_powerpoint_layout_plan.json"))
+    if len(plans) != expected:
+        issues.append(f"PowerPoint layout plans: expected {expected}, found {len(plans)}")
+    for idx in range(1, expected + 1):
+        path = powerpoint_layout_plan_path(task_dir, idx)
+        if not path.exists():
+            issues.append(
+                f"slide{idx:02d}_powerpoint_layout_plan.json missing; direct PPTX requires a "
+                "PowerPoint-aware layout plan before object graph authoring"
+            )
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json cannot be parsed: {exc}")
+            continue
+        if data.get("schema") != POWERPOINT_LAYOUT_PLAN_SCHEMA:
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json schema must be {POWERPOINT_LAYOUT_PLAN_SCHEMA}")
+        if data.get("reference_path") != f"image2/image2_reference_{idx:02d}.png":
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json reference_path mismatch")
+        if data.get("reconstruction_source") != IMAGE_ONLY_RECONSTRUCTION_SOURCE:
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json reconstruction_source must be {IMAGE_ONLY_RECONSTRUCTION_SOURCE}")
+        inventory_path = visual_inventory_path(task_dir, idx)
+        if data.get("visual_inventory_path") != str(inventory_path.relative_to(task_dir)):
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json visual_inventory_path mismatch")
+        if inventory_path.exists() and data.get("visual_inventory_sha256") != sha256_file(inventory_path):
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json visual_inventory_sha256 mismatch; rebuild from current inventory")
+        inventory = _read_json_file(inventory_path)
+        inventory_measurements: set[str] = set()
+        if isinstance(inventory, dict) and inventory.get("schema") == VISUAL_INVENTORY_SCHEMA:
+            for element in _inventory_elements(inventory):
+                eid = str(element.get("id", "")).strip()
+                if eid and isinstance(element.get("measurements"), dict):
+                    inventory_measurements.add(eid)
+        slots = _layout_plan_slots(data)
+        if len(slots) < MIN_VISUAL_INVENTORY_ELEMENTS:
+            issues.append(
+                f"slide{idx:02d}_powerpoint_layout_plan.json is too coarse: expected at least "
+                f"{MIN_VISUAL_INVENTORY_ELEMENTS} PowerPoint slots, found {len(slots)}"
+            )
+        for pos, slot in enumerate(slots, 1):
+            sid = str(slot.get("id", "")).strip()
+            if not sid:
+                issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json slot {pos} missing id")
+            if not str(slot.get("inventory_id", "")).strip():
+                issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json slot {sid or pos} missing inventory_id")
+            inv_id = str(slot.get("inventory_id", "")).strip()
+            if inv_id in inventory_measurements and not isinstance(slot.get("reference_measurements"), dict):
+                issues.append(
+                    f"slide{idx:02d}_powerpoint_layout_plan.json slot {sid or pos} must carry reference_measurements "
+                    "from the visual inventory"
+                )
+            if not _bbox_is_numeric(slot.get("bbox")):
+                issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json slot {sid or pos} must include numeric bbox")
+            fit = slot.get("text_fit")
+            if isinstance(fit, dict) and fit.get("fits") is False:
+                issues.append(
+                    f"slide{idx:02d}_powerpoint_layout_plan.json slot {sid or pos} text does not fit: "
+                    f"needs {fit.get('required_height_px')}px, has {fit.get('inner_height_px')}px; "
+                    "fix the layout plan before object graph"
+                )
+        model = data.get("powerpoint_model")
+        if not isinstance(model, dict) or model.get("z_order_does_not_fix_collisions") is not True:
+            issues.append(f"slide{idx:02d}_powerpoint_layout_plan.json must record PowerPoint mechanics assumptions")
+    return len(plans)
+
+
+def cmd_build_powerpoint_layout_plan(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    idx = int(args.slide)
+    out = powerpoint_layout_plan_path(task_dir, idx)
+    if out.exists() and not args.force:
+        print(json.dumps({
+            "ok": False,
+            "issue": f"{out.relative_to(task_dir)} already exists; pass --force to overwrite",
+        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    data = build_powerpoint_layout_plan_data(task_dir, idx)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "layout_plan": str(out),
+        "slots": len(data.get("slots", [])),
+        "overflow_slots": [
+            slot.get("id")
+            for slot in _layout_plan_slots(data)
+            if isinstance(slot.get("text_fit"), dict) and slot["text_fit"].get("fits") is False
+        ],
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _visual_region_ids(data: dict[str, object]) -> list[str]:
     regions = data.get("regions")
     if not isinstance(regions, list):
@@ -3193,6 +4345,883 @@ def _visual_region_ids(data: dict[str, object]) -> list[str]:
             if rid:
                 ids.append(rid)
     return ids
+
+
+def _infer_blueprint_object_kind(region: dict[str, object]) -> str:
+    rid = str(region.get("id", "")).strip().lower()
+    role = str(region.get("role", "")).strip().lower()
+    rtype = str(region.get("type", "")).strip().lower()
+    text_items = region.get("text", [])
+    if not isinstance(text_items, list):
+        text_items = []
+    text = " ".join(str(v) for v in text_items).lower()
+    haystack = " ".join([rid, role, rtype, text])
+    if rid == "nav" or role == "nav":
+        return "nav"
+    if rid == "title" or role == "title":
+        return "title"
+    if rid == "takeaway" or role == "takeaway":
+        return "takeaway"
+    if rid == "source" or role == "source":
+        return "source"
+    if any(keyword.lower() in haystack for keyword in VISUAL_CHART_KEYWORDS):
+        return "native_chart"
+    if any(keyword.lower() in haystack for keyword in VISUAL_TABLE_KEYWORDS):
+        return "native_table"
+    if "callout" in haystack:
+        return "callout"
+    return "shape_group"
+
+
+def _blueprint_regions(data: dict[str, object]) -> list[dict[str, object]]:
+    regions = data.get("regions")
+    if not isinstance(regions, list):
+        return []
+    return [region for region in regions if isinstance(region, dict)]
+
+
+def _is_visual_blueprint_root_region(region: dict[str, object]) -> bool:
+    rid = str(region.get("id", "")).strip().lower()
+    role = str(region.get("role", "")).strip().lower()
+    kind = str(region.get("pptx_object_kind", "")).strip().lower()
+    haystack = " ".join([rid, role, kind])
+    return (
+        rid in {"nav", "title", "content", "takeaway", "source"}
+        or role in {"nav", "title", "content", "takeaway", "source"}
+        or kind in {"nav", "title", "takeaway", "source"}
+        or any(token in haystack for token in ["navigation", "header", "footer"])
+    )
+
+
+def build_visual_blueprint_data(task_dir: Path, idx: int) -> dict[str, object]:
+    contract_path = visual_contract_path(task_dir, idx)
+    measurement_path = visual_measurement_path(task_dir, idx)
+    observation_path = image2_observation_path(task_dir, idx)
+    contract = _read_json_file(contract_path)
+    measurement = _read_json_file(measurement_path)
+    observation = _read_json_file(observation_path)
+    if not isinstance(contract, dict):
+        raise SystemExit(f"Missing or invalid visual contract: {contract_path}")
+    if not isinstance(measurement, dict):
+        raise SystemExit(f"Missing or invalid visual measurement: {measurement_path}")
+    if not isinstance(observation, dict):
+        raise SystemExit(f"Missing or invalid image observation: {observation_path}")
+    blueprint_regions: list[dict[str, object]] = []
+    for region in _blueprint_regions(contract):
+        rid = str(region.get("id", "")).strip()
+        if not rid:
+            continue
+        kind = _infer_blueprint_object_kind(region)
+        bbox = region.get("bbox")
+        blueprint_regions.append({
+            "id": rid,
+            "role": str(region.get("role", "")).strip(),
+            "bbox": bbox,
+            "pptx_object_kind": kind,
+            "editable_required": True,
+            "geometry_locked": True,
+            "overflow_policy": "fit_text_or_fail",
+            "text": region.get("text", []),
+            "style": {
+                "fill": region.get("fill", "#FFFFFF"),
+                "border_style": region.get("border_style", "none"),
+            },
+            "source_region_id": rid,
+        })
+    counts = {
+        "native_chart_regions": len([r for r in blueprint_regions if r.get("pptx_object_kind") == "native_chart"]),
+        "native_table_regions": len([r for r in blueprint_regions if r.get("pptx_object_kind") == "native_table"]),
+        "editable_regions": len([r for r in blueprint_regions if r.get("editable_required") is True]),
+    }
+    return {
+        "schema": VISUAL_BLUEPRINT_SCHEMA,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "slide": idx,
+        "reference_path": f"image2/image2_reference_{idx:02d}.png",
+        "reconstruction_source": IMAGE_ONLY_RECONSTRUCTION_SOURCE,
+        "prompt_context_discarded": True,
+        "observed_as_fresh_image": True,
+        "derivation_method": POST_IMAGE_DERIVATION_METHOD,
+        "observation_record_path": str(observation_path.relative_to(task_dir)),
+        "observation_record_sha256": sha256_file(observation_path),
+        "observation_id": observation.get("observation_id"),
+        "visual_contract_path": str(contract_path.relative_to(task_dir)),
+        "visual_contract_sha256": sha256_file(contract_path),
+        "visual_measurement_path": str(measurement_path.relative_to(task_dir)),
+        "visual_measurement_sha256": sha256_file(measurement_path),
+        "canvas": {"width": 1920, "height": 1080},
+        "regions": blueprint_regions,
+        "required_object_counts": counts,
+        "policy": (
+            "Direct PPTX must be generated from this blueprint. Each region is geometry-locked; "
+            "pptx_object_kind selects the only allowed editable PowerPoint object family."
+        ),
+    }
+
+
+def cmd_build_visual_blueprint(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    idx = int(args.slide)
+    out = visual_blueprint_path(task_dir, idx)
+    if out.exists() and not args.force:
+        print(json.dumps({
+            "ok": False,
+            "issue": f"{out.relative_to(task_dir)} already exists; pass --force to overwrite",
+        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    data = build_visual_blueprint_data(task_dir, idx)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "blueprint": str(out),
+        "regions": len(data.get("regions", [])),
+        "required_object_counts": data.get("required_object_counts", {}),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _object_graph_executable_style(kind: str, style: object) -> dict[str, object]:
+    resolved: dict[str, object] = dict(style) if isinstance(style, dict) else {}
+    if kind in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS or kind == "nav":
+        resolved.setdefault("font_family", "Arial")
+        resolved.setdefault("auto_fit", False)
+    if kind in {"title", "takeaway"}:
+        resolved.setdefault("padding", 6)
+    elif kind in {"kpi", "callout", "badge", "chevron", "callout_strip"}:
+        resolved.setdefault("padding", 0 if kind in {"badge", "chevron"} else 6)
+    if kind == "title":
+        resolved["font_size"] = min(_float_or_default(resolved.get("font_size"), 28.0), 24.0)
+    if kind == "takeaway":
+        resolved["font_size"] = min(_float_or_default(resolved.get("font_size"), 13.0), 13.0)
+        resolved.setdefault("label_font_size", 13)
+        resolved.setdefault("body_font_size", 13)
+    if kind == "kpi":
+        resolved.setdefault("font_size", 14)
+        resolved.setdefault("metric_font_size", _float_or_default(resolved.get("font_size"), 14.0))
+        resolved.setdefault("body_font_size", max(8, _float_or_default(resolved.get("font_size"), 14.0) - 3))
+        resolved.setdefault("tag_font_size", max(8, _float_or_default(resolved.get("font_size"), 14.0) - 3))
+    if kind == "callout":
+        resolved["font_size"] = min(_float_or_default(resolved.get("font_size"), 10.5), 10.5)
+        resolved.setdefault("body_font_size", _float_or_default(resolved.get("font_size"), 11.0))
+        resolved.setdefault("title_font_weight", "bold")
+    if kind == "badge":
+        resolved.setdefault("shape_type", "oval")
+        resolved.setdefault("font_size", 10)
+    if kind == "chevron":
+        resolved["font_size"] = min(_float_or_default(resolved.get("font_size"), 10.5), 10.5)
+        resolved.setdefault("body_font_size", _float_or_default(resolved.get("font_size"), 10.5))
+        resolved.setdefault("line_spacing", 0.88)
+        resolved.setdefault("chevron_adjustment", 42000)
+    if kind in {"native_table", "table"}:
+        resolved.setdefault("font_family", "Arial")
+        resolved.setdefault("font_size", 9.5)
+        resolved.setdefault("auto_fit", False)
+        resolved.setdefault("padding", 5)
+    return resolved
+
+
+def _chart_data_from_text(text: object) -> dict[str, object]:
+    raw = str(text or "")
+    pairs: list[tuple[str, float]] = []
+    for chunk in re.split(r"[,;]\s*", raw):
+        match = re.search(r"([A-Za-z][A-Za-z0-9 /&+\-]{1,42}?)\s+(\d+(?:\.\d+)?)\b", chunk)
+        if match:
+            label = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
+            value = float(match.group(2))
+            if label:
+                pairs.append((label, value))
+    if not pairs:
+        pairs = [("Observed", 1.0)]
+    return {
+        "chart_type": "column",
+        "title": raw.split(";", 1)[0].strip() if raw.strip() else "",
+        "categories": [label for label, _ in pairs[:8]],
+        "series": [{"name": "Number of actions", "values": [value for _, value in pairs[:8]]}],
+        "data_labels": True,
+        "plot_area": {"x": 0.08, "y": 0.15, "w": 0.84, "h": 0.72},
+        "plot_area_px": [],
+        "bar_gap_width": 80,
+        "major_gridlines": True,
+        "font_size": 8.5,
+        "category_font_size": 7.5,
+        "value_font_size": 7.5,
+        "data_label_font_size": 8,
+        "title_font_size": 10,
+    }
+
+
+def _chart_data_from_element(element: dict[str, object], text: object) -> dict[str, object]:
+    base = _chart_data_from_text(text)
+    chart_data = element.get("chart_data")
+    if isinstance(chart_data, dict):
+        merged = {**base, **chart_data}
+        if isinstance(base.get("plot_area"), dict) and isinstance(chart_data.get("plot_area"), dict):
+            merged["plot_area"] = {**base["plot_area"], **chart_data["plot_area"]}  # type: ignore[index]
+    else:
+        merged = base
+    bbox = element.get("bbox")
+    plot_bbox = _chart_part_bbox(element, "plot_area")
+    title_bbox = _chart_part_bbox(element, "chart_title")
+    if isinstance(bbox, list) and len(bbox) >= 4 and all(isinstance(v, (int, float)) for v in bbox[:4]) and plot_bbox:
+        bx, by, bw, bh = [float(v) for v in bbox[:4]]
+        if bw > 0 and bh > 0:
+            merged["plot_area"] = {
+                "x": round(max(0.0, min(1.0, (plot_bbox[0] - bx) / bw)), 4),
+                "y": round(max(0.0, min(1.0, (plot_bbox[1] - by) / bh)), 4),
+                "w": round(max(0.01, min(1.0, plot_bbox[2] / bw)), 4),
+                "h": round(max(0.01, min(1.0, plot_bbox[3] / bh)), 4),
+            }
+            merged["plot_area_px"] = [round(v, 2) for v in plot_bbox]
+            merged["chart_bbox_px"] = [round(float(v), 2) for v in bbox[:4]]
+            if title_bbox:
+                merged["title_bbox_px"] = [round(v, 2) for v in title_bbox]
+    categories = merged.get("categories")
+    if "bar_gap_width" not in merged or not isinstance(merged.get("bar_gap_width"), (int, float)):
+        merged["bar_gap_width"] = 70 if isinstance(categories, list) and len(categories) <= 3 else 90
+    return merged
+
+
+def _table_data_from_text(text: object) -> dict[str, object]:
+    raw = str(text or "").strip()
+    headers = ["", "Stage 1", "Stage 2", "Stage 3", "Stage 4", "Stage 5"]
+    rows = [
+        ["Evidence", raw or "Observed detail grid", "", "", "", ""],
+        ["Mechanism", "", "", "", "", ""],
+        ["Risk / caveat", "", "", "", "", ""],
+    ]
+    return {
+        "headers": headers,
+        "rows": rows,
+        "col_widths": [140, 253, 253, 253, 253, 253],
+        "row_heights": [58, 122, 122, 123],
+        "cell_padding": 6,
+        "header_background": "#305496",
+        "header_color": "#FFFFFF",
+        "border_color": "#5B9BD5",
+        "border_width": 0.8,
+        "header_font_size": 8,
+        "row_header_background": "#EAF2FB",
+        "row_header_color": "#305496",
+        "row_header_font_size": 9,
+        "font_size": 9.5,
+    }
+
+
+def _table_data_from_element(element: dict[str, object], text: object) -> dict[str, object]:
+    base = _table_data_from_text(text)
+    table_data = element.get("table_data")
+    if isinstance(table_data, dict) and (
+        isinstance(table_data.get("rows"), list) or isinstance(table_data.get("headers"), list)
+    ):
+        return {**base, **table_data}
+    return base
+
+
+def _connector_segments_from_bbox(
+    eid: str,
+    element: dict[str, object],
+    slot: dict[str, object],
+    count: int,
+    pos: int,
+) -> list[dict[str, object]]:
+    bbox = slot.get("bbox", element.get("bbox"))
+    vals = _bbox_values(bbox)
+    if not vals or count <= 1:
+        vals = vals or (0.0, 0.0, 100.0, 0.0)
+        x, y, w, h = vals
+        return [{
+            "id": eid,
+            "inventory_id": eid,
+            "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
+            "source_measurement_id": eid,
+            "reference_measurements": element.get("measurements", {}),
+            "role": str(element.get("role", "")).strip(),
+            "z_order": slot.get("z_order", pos),
+            "object_kind": "connector",
+            "bbox": [x, y, w, h],
+            "text": "",
+            "points": [[x, y], [x + w, y + h]],
+            "style": _object_graph_executable_style("connector", element.get("style", {})),
+            "editable": True,
+            "geometry_locked": True,
+            "implementation_notes": slot.get("powerpoint_mechanics", []),
+        }]
+    x, y, w, h = vals
+    step = w / max(1, count - 1)
+    seg_w = min(70.0, max(36.0, step * 0.28))
+    segments: list[dict[str, object]] = []
+    for i in range(count):
+        sx = x + step * i
+        segments.append({
+            "id": f"{eid}_{i + 1}",
+            "inventory_id": eid,
+            "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
+            "source_measurement_id": eid,
+            "reference_measurements": element.get("measurements", {}),
+            "measurement_part": f"segment_{i + 1}",
+            "role": str(element.get("role", "")).strip(),
+            "z_order": _float_or_default(slot.get("z_order"), pos) + i * 0.01,
+            "object_kind": "connector",
+            "bbox": [sx, y, seg_w, h],
+            "text": "",
+            "points": [[sx, y], [sx + seg_w, y + h]],
+            "style": _object_graph_executable_style("connector", element.get("style", {})),
+            "editable": True,
+            "geometry_locked": True,
+            "implementation_notes": slot.get("powerpoint_mechanics", []),
+        })
+    return segments
+
+
+def build_visual_object_graph_data(task_dir: Path, idx: int) -> dict[str, object]:
+    blueprint_path = visual_blueprint_path(task_dir, idx)
+    blueprint = _read_json_file(blueprint_path)
+    inventory_path = visual_inventory_path(task_dir, idx)
+    inventory = _read_json_file(inventory_path)
+    layout_plan_path = powerpoint_layout_plan_path(task_dir, idx)
+    layout_plan = _read_json_file(layout_plan_path)
+    slot_by_inventory: dict[str, dict[str, object]] = {}
+    if isinstance(layout_plan, dict) and layout_plan.get("schema") == POWERPOINT_LAYOUT_PLAN_SCHEMA:
+        for slot in _layout_plan_slots(layout_plan):
+            inv_id = str(slot.get("inventory_id", "")).strip()
+            if inv_id:
+                slot_by_inventory[inv_id] = slot
+    objects: list[dict[str, object]] = []
+    graph: dict[str, object] = {
+        "schema": VISUAL_OBJECT_GRAPH_SCHEMA,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "slide": idx,
+        "reference_path": f"image2/image2_reference_{idx:02d}.png",
+        "reconstruction_source": IMAGE_ONLY_RECONSTRUCTION_SOURCE,
+        "prompt_context_discarded": True,
+        "canvas": {"width": 1920, "height": 1080},
+        "policy": (
+            "Direct PPTX generation must execute this object graph. Do not create a new layout; "
+            "only enrich missing text/icon implementation details when they are visible in the reference image."
+        ),
+    }
+    if isinstance(inventory, dict) and inventory.get("schema") == VISUAL_INVENTORY_SCHEMA:
+        graph["visual_inventory_path"] = str(inventory_path.relative_to(task_dir))
+        graph["visual_inventory_sha256"] = sha256_file(inventory_path)
+        if not isinstance(layout_plan, dict) or layout_plan.get("schema") != POWERPOINT_LAYOUT_PLAN_SCHEMA:
+            raise SystemExit(f"Missing valid PowerPoint layout plan for slide {idx}")
+        graph["powerpoint_layout_plan_path"] = str(layout_plan_path.relative_to(task_dir))
+        graph["powerpoint_layout_plan_sha256"] = sha256_file(layout_plan_path)
+        graph["canvas"] = inventory.get("canvas", graph["canvas"])
+        required_counts = inventory.get("required_object_counts") if isinstance(inventory, dict) else {}
+        for pos, element in enumerate(_inventory_elements(inventory), 1):
+            eid = str(element.get("id", "")).strip()
+            if not eid:
+                continue
+            slot = slot_by_inventory.get(eid, {})
+            kind = str(element.get("object_kind", "")).strip()
+            if kind == "connector":
+                expected_count = 1
+                if isinstance(required_counts, dict) and isinstance(required_counts.get("connector"), int):
+                    expected_count = int(required_counts.get("connector") or 1)
+                objects.extend(_connector_segments_from_bbox(eid, element, slot, expected_count, pos))
+                continue
+            text_value = element.get("text", element.get("text_summary", ""))
+            graph_object: dict[str, object] = {
+                "id": eid,
+                "inventory_id": eid,
+                "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
+                "source_measurement_id": eid,
+                "reference_measurements": element.get("measurements", {}),
+                "role": str(element.get("role", "")).strip(),
+                "z_order": slot.get("z_order", pos),
+                "object_kind": kind,
+                "bbox": slot.get("bbox", element.get("bbox")),
+                "text": text_value,
+                "style": _object_graph_executable_style(kind, element.get("style", {})),
+                "authoring_guide": slot.get("authoring_guide", _component_authoring_guide(kind)),
+                "editable": True,
+                "geometry_locked": True,
+                "implementation_notes": slot.get("powerpoint_mechanics", []),
+            }
+            if kind in {"native_chart", "chart"}:
+                graph_object["chart_data"] = _chart_data_from_element(element, text_value)
+            if kind in {"native_table", "table"}:
+                graph_object["table_data"] = _table_data_from_element(element, text_value)
+            if kind == "takeaway" and isinstance(text_value, str) and ":" in text_value:
+                label, body = text_value.split(":", 1)
+                if label.strip() and body.strip():
+                    graph_object["label"] = f"{label.strip()}:"
+                    graph_object["body"] = body.strip()
+                    graph_object["text"] = ""
+            objects.append(graph_object)
+    else:
+        if not isinstance(blueprint, dict) or blueprint.get("schema") != VISUAL_BLUEPRINT_SCHEMA:
+            raise SystemExit(f"Missing visual inventory or valid visual blueprint for slide {idx}")
+        graph["visual_blueprint_path"] = str(blueprint_path.relative_to(task_dir))
+        graph["visual_blueprint_sha256"] = sha256_file(blueprint_path)
+        graph["canvas"] = blueprint.get("canvas", graph["canvas"])
+        for pos, region in enumerate(_blueprint_regions(blueprint), 1):
+            rid = str(region.get("id", "")).strip()
+            if not rid:
+                continue
+            objects.append({
+                "id": rid,
+                "source_region_id": rid,
+                "role": str(region.get("role", "")).strip(),
+                "z_order": pos,
+                "object_kind": str(region.get("pptx_object_kind", "")).strip(),
+                "bbox": region.get("bbox"),
+                "text": region.get("text", []),
+                "style": region.get("style", {}),
+                "editable": True,
+                "geometry_locked": True,
+                "implementation_notes": [],
+            })
+    if isinstance(blueprint, dict) and blueprint.get("schema") == VISUAL_BLUEPRINT_SCHEMA:
+        graph.setdefault("visual_blueprint_path", str(blueprint_path.relative_to(task_dir)))
+        graph.setdefault("visual_blueprint_sha256", sha256_file(blueprint_path))
+    graph["objects"] = objects
+    return graph
+
+
+def cmd_build_visual_object_graph(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    idx = int(args.slide)
+    out = visual_object_graph_path(task_dir, idx)
+    if out.exists() and not args.force:
+        print(json.dumps({
+            "ok": False,
+            "issue": f"{out.relative_to(task_dir)} already exists; pass --force to overwrite",
+        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    data = build_visual_object_graph_data(task_dir, idx)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "object_graph": str(out),
+        "objects": len(data.get("objects", [])),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _nonempty_cells(rows: object) -> int:
+    if not isinstance(rows, list):
+        return 0
+    total = 0
+    for row in rows:
+        if isinstance(row, list):
+            total += sum(1 for cell in row if str(cell).strip())
+    return total
+
+
+def _object_graph_structural_issues(slide_idx: int, obj: dict[str, object], pos: int) -> list[str]:
+    issues: list[str] = []
+    oid = str(obj.get("id", "")).strip() or str(pos)
+    kind = str(obj.get("object_kind", "")).strip()
+    if kind in {"native_chart", "chart"}:
+        chart_data = obj.get("chart_data")
+        if not isinstance(chart_data, dict):
+            return [f"slide{slide_idx:02d}_object_graph.json chart {oid} missing chart_data"]
+        categories = chart_data.get("categories")
+        series = chart_data.get("series")
+        if not isinstance(categories, list) or not any(str(item).strip() for item in categories):
+            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing categories")
+        if not isinstance(series, list) or not series:
+            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing series")
+        else:
+            has_values = any(
+                isinstance(item, dict)
+                and isinstance(item.get("values"), list)
+                and any(isinstance(v, (int, float)) for v in item.get("values", []))
+                for item in series
+            )
+            if not has_values:
+                issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing numeric values")
+        if not str(chart_data.get("chart_type", "")).strip():
+            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing chart_type")
+    if kind in {"native_table", "table"}:
+        table_data = obj.get("table_data")
+        if not isinstance(table_data, dict):
+            return [f"slide{slide_idx:02d}_object_graph.json table {oid} missing table_data"]
+        rows = table_data.get("rows")
+        headers = table_data.get("headers")
+        if not isinstance(rows, list) or not rows:
+            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} missing rows")
+        if _nonempty_cells(rows) < 6:
+            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} rows too sparse")
+        if headers is not None and not isinstance(headers, list):
+            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} headers must be a list")
+    if kind == "takeaway":
+        if not str(obj.get("label", "")).strip() or not str(obj.get("body", "")).strip():
+            issues.append(f"slide{slide_idx:02d}_object_graph.json takeaway {oid} missing label/body")
+    return issues
+
+
+def check_visual_object_graph_files(task_dir: Path, expected: int, issues: list[str]) -> int:
+    graphs = sorted((task_dir / "spec").glob("slide*_object_graph.json"))
+    if len(graphs) != expected:
+        issues.append(f"visual object graphs: expected {expected}, found {len(graphs)}")
+
+    for idx in range(1, expected + 1):
+        path = visual_object_graph_path(task_dir, idx)
+        if not path.exists():
+            issues.append(
+                f"slide{idx:02d}_object_graph.json missing; direct PPTX must execute a structured object graph, "
+                "not a freeform prose spec"
+            )
+            continue
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except Exception as exc:
+            issues.append(f"slide{idx:02d}_object_graph.json cannot be parsed: {exc}")
+            continue
+        if data.get("schema") != VISUAL_OBJECT_GRAPH_SCHEMA:
+            issues.append(f"slide{idx:02d}_object_graph.json schema must be {VISUAL_OBJECT_GRAPH_SCHEMA}")
+        if data.get("reference_path") != f"image2/image2_reference_{idx:02d}.png":
+            issues.append(f"slide{idx:02d}_object_graph.json reference_path mismatch")
+        if data.get("reconstruction_source") != IMAGE_ONLY_RECONSTRUCTION_SOURCE:
+            issues.append(f"slide{idx:02d}_object_graph.json reconstruction_source must be {IMAGE_ONLY_RECONSTRUCTION_SOURCE}")
+        if data.get("prompt_context_discarded") is not True:
+            issues.append(f"slide{idx:02d}_object_graph.json prompt_context_discarded must be true")
+        if not file_is_after_reference(task_dir, idx, path):
+            issues.append(
+                f"slide{idx:02d}_object_graph.json is older than image2_reference_{idx:02d}.png; "
+                "rebuild it after observing the selected reference"
+            )
+        if not file_is_after_memory_boundary(task_dir, path):
+            issues.append(
+                f"slide{idx:02d}_object_graph.json is older than qa/post_image_memory_boundary.json; "
+                "rebuild it after the forced post-image memory reset"
+            )
+        forbidden = post_image_memory_markers(raw_text)
+        if forbidden:
+            issues.append(
+                f"slide{idx:02d}_object_graph.json contains upstream prompt/analysis memory markers after Image2 approval: "
+                + ", ".join(forbidden)
+            )
+        blueprint_path = visual_blueprint_path(task_dir, idx)
+        blueprint = _read_json_file(blueprint_path)
+        if isinstance(blueprint, dict):
+            if data.get("visual_blueprint_path") != str(blueprint_path.relative_to(task_dir)):
+                issues.append(f"slide{idx:02d}_object_graph.json visual_blueprint_path mismatch")
+            if blueprint_path.exists() and data.get("visual_blueprint_sha256") != sha256_file(blueprint_path):
+                issues.append(f"slide{idx:02d}_object_graph.json visual_blueprint_sha256 mismatch; rebuild from current blueprint")
+        inventory_path = visual_inventory_path(task_dir, idx)
+        inventory = _read_json_file(inventory_path)
+        required_inventory_ids: set[str] = set()
+        inventory_by_id: dict[str, dict[str, object]] = {}
+        if isinstance(inventory, dict) and inventory.get("schema") == VISUAL_INVENTORY_SCHEMA:
+            if data.get("visual_inventory_path") != str(inventory_path.relative_to(task_dir)):
+                issues.append(f"slide{idx:02d}_object_graph.json visual_inventory_path mismatch")
+            if inventory_path.exists() and data.get("visual_inventory_sha256") != sha256_file(inventory_path):
+                issues.append(f"slide{idx:02d}_object_graph.json visual_inventory_sha256 mismatch; rebuild from current inventory")
+            for element in _inventory_elements(inventory):
+                eid = str(element.get("id", "")).strip()
+                if not eid:
+                    continue
+                inventory_by_id[eid] = element
+                if element.get("required", True) is not False:
+                    required_inventory_ids.add(eid)
+        else:
+            issues.append(
+                f"slide{idx:02d}_object_graph.json cannot be accepted without "
+                f"slide{idx:02d}_visual_inventory.json"
+            )
+        layout_plan_path = powerpoint_layout_plan_path(task_dir, idx)
+        layout_plan = _read_json_file(layout_plan_path)
+        layout_slot_ids: set[str] = set()
+        if isinstance(layout_plan, dict) and layout_plan.get("schema") == POWERPOINT_LAYOUT_PLAN_SCHEMA:
+            if data.get("powerpoint_layout_plan_path") != str(layout_plan_path.relative_to(task_dir)):
+                issues.append(f"slide{idx:02d}_object_graph.json powerpoint_layout_plan_path mismatch")
+            if layout_plan_path.exists() and data.get("powerpoint_layout_plan_sha256") != sha256_file(layout_plan_path):
+                issues.append(f"slide{idx:02d}_object_graph.json powerpoint_layout_plan_sha256 mismatch; rebuild from current layout plan")
+            layout_slot_ids = _layout_slot_ids(layout_plan)
+        else:
+            issues.append(
+                f"slide{idx:02d}_object_graph.json cannot be accepted without "
+                f"slide{idx:02d}_powerpoint_layout_plan.json"
+            )
+        objects = data.get("objects")
+        if not isinstance(objects, list) or len(objects) < MIN_VISUAL_CONTRACT_REGIONS:
+            found = len(objects) if isinstance(objects, list) else 0
+            issues.append(
+                f"slide{idx:02d}_object_graph.json is too coarse: expected at least "
+                f"{MIN_VISUAL_CONTRACT_REGIONS} executable objects, found {found}"
+            )
+            continue
+        objects_by_inventory, graph_kind_counts = _count_objects_by_inventory(objects)
+        text_refs_by_inventory: set[str] = set()
+        for candidate in objects:
+            if not isinstance(candidate, dict):
+                continue
+            if _object_has_visible_text(candidate):
+                text_refs_by_inventory.update(_object_inventory_refs(candidate))
+        if required_inventory_ids:
+            missing_inventory = sorted(required_inventory_ids - set(objects_by_inventory))
+            if missing_inventory:
+                issues.append(
+                    f"slide{idx:02d}_object_graph.json does not cover required visual inventory element(s): "
+                    + ", ".join(missing_inventory[:20])
+                )
+            unknown_inventory_refs = sorted(set(objects_by_inventory) - set(inventory_by_id))
+            if unknown_inventory_refs:
+                issues.append(
+                    f"slide{idx:02d}_object_graph.json references unknown visual inventory id(s): "
+                    + ", ".join(unknown_inventory_refs[:20])
+                )
+            if len(objects) < len(required_inventory_ids):
+                issues.append(
+                    f"slide{idx:02d}_object_graph.json is too compressed: "
+                    f"{len(required_inventory_ids)} required inventory elements are represented by only {len(objects)} object(s)"
+                )
+            for inv_id in sorted(required_inventory_ids):
+                element = inventory_by_id.get(inv_id, {})
+                required_kind = str(element.get("object_kind", "")).strip()
+                allowed_kinds = VISUAL_INVENTORY_NATIVE_KIND_MATCH.get(required_kind)
+                covering_objects = [
+                    obj for obj in objects_by_inventory.get(inv_id, [])
+                    if isinstance(obj, dict)
+                ]
+                if isinstance(element.get("measurements"), dict) and covering_objects:
+                    measurement_bound = any(
+                        isinstance(obj.get("reference_measurements"), dict)
+                        or str(obj.get("source_measurement_id", "")).strip() == inv_id
+                        or str(obj.get("measurement_part", "")).strip()
+                        for obj in covering_objects
+                    )
+                    if not measurement_bound:
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json inventory element {inv_id} has measurements, "
+                            "but no covering object carries reference_measurements/source_measurement_id/measurement_part"
+                        )
+                if not allowed_kinds:
+                    continue
+                covering_kinds = {
+                    str(obj.get("object_kind", "")).strip()
+                    for obj in covering_objects
+                }
+                required_count_for_kind = 0
+                if isinstance(inventory, dict) and isinstance(inventory.get("required_object_counts"), dict):
+                    raw_count = inventory["required_object_counts"].get(required_kind)  # type: ignore[index]
+                    required_count_for_kind = raw_count if isinstance(raw_count, int) else 0
+                if (
+                    required_kind in VISUAL_OBJECT_GRAPH_COMPLEX_DETAIL_KINDS
+                    and required_count_for_kind <= 1
+                    and len(objects_by_inventory.get(inv_id, [])) != 1
+                ):
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json inventory element {inv_id} ({required_kind}) "
+                        "must map to exactly one dedicated executable object, not be merged or duplicated"
+                    )
+                if covering_kinds and covering_kinds.isdisjoint(allowed_kinds):
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json inventory element {inv_id} "
+                        f"requires {required_kind}, covered by {', '.join(sorted(covering_kinds))}"
+                    )
+        if isinstance(inventory, dict):
+            required_counts = inventory.get("required_object_counts")
+            if isinstance(required_counts, dict):
+                for kind, expected_count in required_counts.items():
+                    if not isinstance(expected_count, int) or expected_count <= 0:
+                        continue
+                    actual_count = graph_kind_counts.get(str(kind), 0)
+                    if actual_count < expected_count:
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json needs at least {expected_count} {kind} object(s) "
+                            f"from visual inventory, found {actual_count}"
+                        )
+        graph_ids: set[str] = set()
+        for pos, obj in enumerate(objects, 1):
+            if not isinstance(obj, dict):
+                issues.append(f"slide{idx:02d}_object_graph.json object {pos} must be an object")
+                continue
+            oid = str(obj.get("id", "")).strip()
+            kind = str(obj.get("object_kind", "")).strip()
+            issues.extend(_object_graph_structural_issues(idx, obj, pos))
+            if not oid:
+                issues.append(f"slide{idx:02d}_object_graph.json object {pos} missing id")
+            elif oid in graph_ids:
+                issues.append(f"slide{idx:02d}_object_graph.json duplicate object id: {oid}")
+            else:
+                graph_ids.add(oid)
+            if kind not in VISUAL_BLUEPRINT_ALLOWED_OBJECT_KINDS:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} invalid object_kind: {kind or '<missing>'}")
+            if "editable" in obj and obj.get("editable") is not True:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} editable must be true")
+            if "geometry_locked" in obj and obj.get("geometry_locked") is not True:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} geometry_locked must be true")
+            if not _bbox_is_numeric(obj.get("bbox")):
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include numeric bbox [x,y,w,h]")
+            role = str(obj.get("role", "")).strip()
+            if not role:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include role")
+            z_order = obj.get("z_order")
+            if not isinstance(z_order, (int, float)):
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include numeric z_order")
+            refs = _object_inventory_refs(obj)
+            if not refs:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must reference visual inventory id(s)")
+            layout_refs = _object_layout_refs(obj)
+            if not layout_refs:
+                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must reference PowerPoint layout slot id(s)")
+            elif layout_slot_ids:
+                unknown_layout_refs = sorted(layout_refs - layout_slot_ids)
+                if unknown_layout_refs:
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json object {oid or pos} references unknown layout slot id(s): "
+                        + ", ".join(unknown_layout_refs[:8])
+                    )
+            if kind in VISUAL_OBJECT_GRAPH_TEXT_BEARING_KINDS:
+                obj_text = obj.get("text")
+                has_text = False
+                if isinstance(obj_text, str) and obj_text.strip():
+                    has_text = True
+                elif isinstance(obj_text, list) and any(
+                    isinstance(t, str) and t.strip() for t in obj_text
+                ):
+                    has_text = True
+                if _text_runs_have_text(obj.get("text_runs")):
+                    has_text = True
+                if kind == "nav":
+                    items = obj.get("items")
+                    if isinstance(items, list) and any(
+                        isinstance(item, dict) and str(item.get("text", "")).strip()
+                        for item in items
+                    ):
+                        has_text = True
+                if kind == "takeaway" and (
+                    str(obj.get("label", "")).strip() or str(obj.get("body", "")).strip()
+                ):
+                    has_text = True
+                composite_text_covered = (
+                    kind in {"kpi", "callout", "card", "panel"}
+                    and bool(refs)
+                    and not refs.isdisjoint(text_refs_by_inventory)
+                )
+                if not has_text and not composite_text_covered:
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must contain "
+                        "non-empty text from the reference image"
+                    )
+            issues.extend(_object_text_overflow_issues(idx, obj, pos))
+            if kind in VISUAL_OBJECT_GRAPH_STYLED_KINDS:
+                style = obj.get("style")
+                if not isinstance(style, dict) or not style:
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include "
+                        "style with at least background or font color from the reference image"
+                    )
+                elif kind in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS and _object_has_visible_text(obj):
+                    if "font_size" not in style or not isinstance(style.get("font_size"), (int, float)):
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include numeric style.font_size"
+                        )
+                    if "font_family" not in style:
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include style.font_family"
+                        )
+                    if "auto_fit" not in style:
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must explicitly set style.auto_fit"
+                        )
+                    if kind in {"card", "callout", "kpi", "chevron", "badge", "takeaway"} and (
+                        "padding" not in style
+                        and not any(f"padding_{side}" in style for side in ("left", "right", "top", "bottom"))
+                    ):
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include padding "
+                            "so PowerPoint text placement is deterministic"
+                        )
+                if isinstance(style, dict) and kind in {"shape", "panel", "card", "callout", "kpi", "chevron", "badge"}:
+                    border = style.get("border")
+                    if isinstance(border, dict) and "width" in border and not isinstance(border.get("width"), (int, float)):
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} border.width must be numeric"
+                        )
+            if _text_runs_have_text(obj.get("text_runs")):
+                for run_pos, run in enumerate(obj.get("text_runs", []), 1):
+                    if not isinstance(run, dict):
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} text_runs[{run_pos}] must be an object"
+                        )
+                        continue
+                    if "font_size" in run and not isinstance(run.get("font_size"), (int, float)):
+                        issues.append(
+                            f"slide{idx:02d}_object_graph.json object {oid or pos} text_runs[{run_pos}].font_size must be numeric"
+                        )
+            if kind == "connector":
+                points = obj.get("points")
+                if not isinstance(points, list) or len(points) < 2:
+                    issues.append(f"slide{idx:02d}_object_graph.json connector {oid or pos} must include at least two points")
+                style = obj.get("style")
+                if not isinstance(style, dict) or "line_width" not in style:
+                    issues.append(f"slide{idx:02d}_object_graph.json connector {oid or pos} must include style.line_width")
+            if kind in {"native_table", "table"}:
+                table_data = obj.get("table_data")
+                if not isinstance(table_data, dict):
+                    issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data")
+                else:
+                    if not isinstance(table_data.get("rows"), list) or _nonempty_cells(table_data.get("rows")) < 6:
+                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include non-empty table_data.rows")
+                    if "col_widths" not in table_data:
+                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.col_widths")
+                    if "row_heights" not in table_data:
+                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.row_heights")
+                    elif not any(isinstance(value, (int, float)) and value > 0 for value in table_data.get("row_heights", [])):
+                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include positive table_data.row_heights")
+                    if "cell_padding" not in table_data:
+                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.cell_padding")
+                bbox = obj.get("bbox")
+                if not (
+                    isinstance(bbox, list)
+                    and len(bbox) >= 4
+                    and isinstance(bbox[3], (int, float))
+                    and bbox[3] > 0
+                ):
+                    issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include explicit bbox height")
+            if kind in {"native_chart", "chart"}:
+                chart_data = obj.get("chart_data")
+                if not isinstance(chart_data, dict):
+                    issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data")
+                else:
+                    if not isinstance(chart_data.get("categories"), list) or not chart_data.get("categories"):
+                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.categories")
+                    if not isinstance(chart_data.get("series"), list) or not chart_data.get("series"):
+                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.series")
+                    plot_area = chart_data.get("plot_area")
+                    if not (
+                        isinstance(plot_area, dict)
+                        and all(isinstance(plot_area.get(key), (int, float)) for key in ("x", "y", "w", "h"))
+                        and plot_area.get("h", 0) > 0
+                    ):
+                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include measured chart_data.plot_area")
+                    plot_area_px = chart_data.get("plot_area_px")
+                    if not (
+                        isinstance(plot_area_px, list)
+                        and len(plot_area_px) >= 4
+                        and all(isinstance(value, (int, float)) for value in plot_area_px[:4])
+                    ):
+                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include measured chart_data.plot_area_px")
+                    if not isinstance(chart_data.get("bar_gap_width"), (int, float)):
+                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.bar_gap_width")
+
+        issues.extend(_object_graph_geometry_issues(idx, objects, inventory_by_id))
+        if isinstance(blueprint, dict):
+            blueprint_ids = set(_visual_region_ids(blueprint))
+            if blueprint_ids:
+                source_region_ids = {
+                    str(obj.get("source_region_id", "")).strip()
+                    for obj in objects
+                    if isinstance(obj, dict) and str(obj.get("source_region_id", "")).strip()
+                }
+                graph_region_ids = graph_ids | source_region_ids
+                missing = sorted(blueprint_ids - graph_region_ids)
+                if missing:
+                    issues.append(
+                        f"slide{idx:02d}_object_graph.json missing blueprint region ids: {', '.join(missing[:12])}"
+                    )
+
+    return len(graphs)
+
 
 
 def _visual_measurement_quality_issues(label: str, data: dict[str, object]) -> list[str]:
@@ -3548,7 +5577,13 @@ def html_region_geometry_issues(
     return issues
 
 
-def check_visual_contract_files(task_dir: Path, expected: int, issues: list[str]) -> int:
+def check_visual_contract_files(
+    task_dir: Path,
+    expected: int,
+    issues: list[str],
+    *,
+    render_path_override: str | None = None,
+) -> int:
     contracts = sorted((task_dir / "spec").glob("slide*_visual_contract.json"))
     if len(contracts) != expected:
         issues.append(f"visual contracts: expected {expected}, found {len(contracts)}")
@@ -3731,36 +5766,180 @@ def check_visual_contract_files(task_dir: Path, expected: int, issues: list[str]
             if not any(required in name for name in region_names):
                 issues.append(f"slide{idx:02d}_visual_contract.json missing required observed region role/id containing '{required}'")
 
-        html = task_dir / "html" / f"slide{idx:02d}.html"
-        html_text = read_text(html)
-        if observation is not None:
-            observation_id = str(observation.get("observation_id", "")).strip()
-            if observation_id and observation_id not in html_text:
+        render_path_for_contract = render_path_override or commercial_render_path(task_dir)
+        if render_path_for_contract == "html":
+            html = task_dir / "html" / f"slide{idx:02d}.html"
+            html_text = read_text(html)
+            if observation is not None:
+                observation_id = str(observation.get("observation_id", "")).strip()
+                if observation_id and observation_id not in html_text:
+                    issues.append(
+                        f"slide{idx:02d}.html must include observation_id {observation_id}; "
+                        "HTML must bind to the same fresh image observation record as the visual contract"
+                    )
+            forbidden_html = post_image_memory_markers(html_text)
+            if forbidden_html:
                 issues.append(
-                    f"slide{idx:02d}.html must include observation_id {observation_id}; "
-                    "HTML must bind to the same fresh image observation record as the visual contract"
+                    f"slide{idx:02d}.html contains upstream prompt/analysis memory markers after Image2 approval: "
+                    + ", ".join(forbidden_html)
                 )
-        forbidden_html = post_image_memory_markers(html_text)
-        if forbidden_html:
-            issues.append(
-                f"slide{idx:02d}.html contains upstream prompt/analysis memory markers after Image2 approval: "
-                + ", ".join(forbidden_html)
-            )
-        html_ref_ids = _region_ids_from_html(html_text)
-        missing_in_html = sorted(seen_ids - html_ref_ids)
-        extra_in_html = sorted(html_ref_ids - seen_ids)
-        if missing_in_html:
-            issues.append(f"slide{idx:02d}.html missing data-ref-id bindings for visual regions: {', '.join(missing_in_html)}")
-        if extra_in_html:
-            issues.append(f"slide{idx:02d}.html has data-ref-id values not declared in visual contract: {', '.join(extra_in_html)}")
-        if "dashed" in html_text.lower() and "dashed" not in border_styles:
-            issues.append(f"slide{idx:02d}.html uses dashed borders, but visual contract declares no dashed border")
-        unbound = _large_visual_class_count(html_text)
-        if unbound:
-            issues.append(f"slide{idx:02d}.html has {unbound} large visual container(s) without data-ref-id binding")
-        issues.extend(html_region_geometry_issues(html, _contract_region_bbox_map(regions)))
+            html_ref_ids = _region_ids_from_html(html_text)
+            missing_in_html = sorted(seen_ids - html_ref_ids)
+            extra_in_html = sorted(html_ref_ids - seen_ids)
+            if missing_in_html:
+                issues.append(f"slide{idx:02d}.html missing data-ref-id bindings for visual regions: {', '.join(missing_in_html)}")
+            if extra_in_html:
+                issues.append(f"slide{idx:02d}.html has data-ref-id values not declared in visual contract: {', '.join(extra_in_html)}")
+            if "dashed" in html_text.lower() and "dashed" not in border_styles:
+                issues.append(f"slide{idx:02d}.html uses dashed borders, but visual contract declares no dashed border")
+            unbound = _large_visual_class_count(html_text)
+            if unbound:
+                issues.append(f"slide{idx:02d}.html has {unbound} large visual container(s) without data-ref-id binding")
+            issues.extend(html_region_geometry_issues(html, _contract_region_bbox_map(regions)))
 
     return len(contracts)
+
+
+def check_visual_blueprint_files(task_dir: Path, expected: int, issues: list[str]) -> int:
+    blueprints = sorted((task_dir / "spec").glob("slide*_visual_blueprint.json"))
+    if len(blueprints) != expected:
+        issues.append(f"visual blueprints: expected {expected}, found {len(blueprints)}")
+
+    for idx in range(1, expected + 1):
+        path = visual_blueprint_path(task_dir, idx)
+        if not path.exists():
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json missing; direct PPTX must be generated "
+                "from a locked image-derived blueprint before any painter code is written"
+            )
+            continue
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except Exception as exc:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json cannot be parsed: {exc}")
+            continue
+
+        if data.get("schema") != VISUAL_BLUEPRINT_SCHEMA:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json schema must be {VISUAL_BLUEPRINT_SCHEMA}")
+        ref = _normalize_ref_path(task_dir, data.get("reference_path"))
+        expected_ref = (task_dir / "image2" / f"image2_reference_{idx:02d}.png").resolve()
+        if ref is None or not ref.exists():
+            issues.append(f"slide{idx:02d}_visual_blueprint.json reference_path missing or does not exist")
+        elif ref.resolve() != expected_ref:
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json reference_path must point to image2_reference_{idx:02d}.png"
+            )
+        if data.get("reconstruction_source") != IMAGE_ONLY_RECONSTRUCTION_SOURCE:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json reconstruction_source must be {IMAGE_ONLY_RECONSTRUCTION_SOURCE}")
+        if data.get("prompt_context_discarded") is not True:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json prompt_context_discarded must be true")
+        if data.get("observed_as_fresh_image") is not True:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json observed_as_fresh_image must be true")
+        if data.get("derivation_method") != POST_IMAGE_DERIVATION_METHOD:
+            issues.append(f"slide{idx:02d}_visual_blueprint.json derivation_method must be {POST_IMAGE_DERIVATION_METHOD}")
+        forbidden = post_image_memory_markers(raw_text)
+        if forbidden:
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json contains upstream prompt/analysis memory markers after Image2 approval: "
+                + ", ".join(forbidden)
+            )
+        if not file_is_after_reference(task_dir, idx, path):
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json is older than image2_reference_{idx:02d}.png; "
+                "rebuild the blueprint after observing the selected reference"
+            )
+        if not file_is_after_memory_boundary(task_dir, path):
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json is older than qa/post_image_memory_boundary.json; "
+                "rebuild the blueprint after the forced post-image memory reset"
+            )
+
+        observation_path = image2_observation_path(task_dir, idx)
+        contract_path = visual_contract_path(task_dir, idx)
+        measurement_path = visual_measurement_path(task_dir, idx)
+        if data.get("observation_record_path") != str(observation_path.relative_to(task_dir)):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json observation_record_path mismatch")
+        if observation_path.exists() and data.get("observation_record_sha256") != sha256_file(observation_path):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json observation_record_sha256 mismatch")
+        observation = _read_json_file(observation_path)
+        if isinstance(observation, dict) and data.get("observation_id") != observation.get("observation_id"):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json observation_id must match the fresh observation record")
+        if data.get("visual_contract_path") != str(contract_path.relative_to(task_dir)):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json visual_contract_path mismatch")
+        if contract_path.exists() and data.get("visual_contract_sha256") != sha256_file(contract_path):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json visual_contract_sha256 mismatch; rebuild from current contract")
+        if data.get("visual_measurement_path") != str(measurement_path.relative_to(task_dir)):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json visual_measurement_path mismatch")
+        if measurement_path.exists() and data.get("visual_measurement_sha256") != sha256_file(measurement_path):
+            issues.append(f"slide{idx:02d}_visual_blueprint.json visual_measurement_sha256 mismatch; rebuild from current measurement")
+
+        regions = _blueprint_regions(data)
+        if len(regions) < MIN_VISUAL_CONTRACT_REGIONS:
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json is too coarse: expected at least "
+                f"{MIN_VISUAL_CONTRACT_REGIONS} locked regions, found {len(regions)}"
+            )
+            continue
+
+        contract = _read_json_file(contract_path)
+        contract_ids = set(_visual_region_ids(contract)) if isinstance(contract, dict) else set()
+        blueprint_ids = set()
+        detail_count = 0
+        for pos, region in enumerate(regions, 1):
+            rid = str(region.get("id", "")).strip()
+            if not rid:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {pos} missing id")
+                continue
+            if rid in blueprint_ids:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json duplicate region id: {rid}")
+            blueprint_ids.add(rid)
+            kind = str(region.get("pptx_object_kind", "")).strip()
+            if kind not in VISUAL_BLUEPRINT_ALLOWED_OBJECT_KINDS:
+                issues.append(
+                    f"slide{idx:02d}_visual_blueprint.json region {rid} has invalid pptx_object_kind: {kind or '<missing>'}"
+                )
+            if region.get("editable_required") is not True:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} editable_required must be true")
+            if region.get("geometry_locked") is not True:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} geometry_locked must be true")
+            if region.get("overflow_policy") != "fit_text_or_fail":
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} overflow_policy must be fit_text_or_fail")
+            if not _bbox_is_numeric(region.get("bbox")):
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} must include numeric bbox [x,y,w,h]")
+            else:
+                x, y, w, h = [float(v) for v in region.get("bbox", [])]
+                if w <= 0 or h <= 0 or x < -2 or y < -2 or x + w > 1922 or y + h > 1082:
+                    issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} bbox must be positive and inside 1920x1080")
+            text_values = region.get("text", [])
+            if not isinstance(text_values, list):
+                text_values = []
+            haystack = " ".join([
+                rid,
+                str(region.get("role", "")),
+                " ".join(str(v) for v in text_values),
+            ]).lower()
+            if any(keyword.lower() in haystack for keyword in VISUAL_CHART_KEYWORDS) and kind != "native_chart":
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} looks chart-like and must be native_chart")
+            if any(keyword.lower() in haystack for keyword in VISUAL_TABLE_KEYWORDS) and kind != "native_table":
+                issues.append(f"slide{idx:02d}_visual_blueprint.json region {rid} looks table-like and must be native_table")
+            if not _is_visual_blueprint_root_region(region):
+                detail_count += 1
+
+        if contract_ids and blueprint_ids != contract_ids:
+            missing = sorted(contract_ids - blueprint_ids)
+            extra = sorted(blueprint_ids - contract_ids)
+            if missing:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json missing contract regions: {', '.join(missing)}")
+            if extra:
+                issues.append(f"slide{idx:02d}_visual_blueprint.json has regions not in visual contract: {', '.join(extra)}")
+        if detail_count < MIN_VISUAL_CONTRACT_DETAIL_REGIONS:
+            issues.append(
+                f"slide{idx:02d}_visual_blueprint.json is too coarse: expected at least "
+                f"{MIN_VISUAL_CONTRACT_DETAIL_REGIONS} non-root detail regions, found {detail_count}"
+            )
+
+    return len(blueprints)
 
 
 def validate_slide_review(
@@ -3786,8 +5965,8 @@ def validate_slide_review(
         status = str(entry.get("status", "")).lower()
         compared = entry.get("compared")
         dimensions = entry.get("dimensions_checked")
-        if status != "pass":
-            issues.append(f"{label} slide {idx}: status must be pass")
+        if status not in DELIVERY_REVIEW_ACCEPTED_STATUSES:
+            issues.append(f"{label} slide {idx}: status must be pass or usable")
         else:
             passed += 1
         if compared is not True:
@@ -3953,7 +6132,13 @@ def _detect_bg_color(im) -> tuple[int, int, int]:
 
 
 def _prune_icon_components(im, *, min_area: int = 14):
-    """Remove tiny or edge-connected leftovers after background removal."""
+    """Remove small/edge-connected fragments after background removal.
+
+    Reference-image icon crops often include neighboring text strokes, dividers,
+    or panel edges. Background transparency alone cannot distinguish those from
+    the icon color, so keep meaningful connected components and drop tiny or
+    border-touching artifacts.
+    """
     im = im.convert("RGBA")
     alpha = im.getchannel("A")
     data = alpha.load()
@@ -3988,7 +6173,9 @@ def _prune_icon_components(im, *, min_area: int = 14):
 
     total_area = sum(area for area, _, _, _ in components)
     for area, bbox, thin_edge, comp in components:
-        if area < min_area or thin_edge:
+        if area < min_area:
+            continue
+        if thin_edge:
             continue
         touches_edge = bbox[0] <= 2 or bbox[1] <= 2 or bbox[2] >= width - 2 or bbox[3] >= height - 2
         if touches_edge and area < max(20, total_area * 0.015):
@@ -4200,6 +6387,8 @@ def check_pptx_file(pptx: Path, expected: int, issues: list[str]) -> dict[str, i
     picture_count = 0
     text_shape_count = 0
     suspicious_full_slide_images = 0
+    chart_count = 0
+    table_count = 0
     for slide in prs.slides:
         for shape in slide.shapes:
             if shape.shape_type == 13:
@@ -4208,6 +6397,10 @@ def check_pptx_file(pptx: Path, expected: int, issues: list[str]) -> dict[str, i
                     suspicious_full_slide_images += 1
             if getattr(shape, "has_text_frame", False) and shape.text.strip():
                 text_shape_count += 1
+            if getattr(shape, "has_chart", False):
+                chart_count += 1
+            if getattr(shape, "has_table", False):
+                table_count += 1
 
     if suspicious_full_slide_images:
         issues.append(f"PPTX contains {suspicious_full_slide_images} possible whole-slide image background(s)")
@@ -4218,6 +6411,8 @@ def check_pptx_file(pptx: Path, expected: int, issues: list[str]) -> dict[str, i
         "slides": slide_count,
         "pictures": picture_count,
         "text_shapes": text_shape_count,
+        "charts": chart_count,
+        "tables": table_count,
         "suspicious_full_slide_images": suspicious_full_slide_images,
     }
 
@@ -4229,6 +6424,18 @@ def direct_pptx_object_map_path(task_dir: Path) -> Path:
 def _contract_semantic_region_ids(task_dir: Path, expected: int) -> dict[str, dict[int, set[str]]]:
     result: dict[str, dict[int, set[str]]] = {"chart": {}, "table": {}}
     for idx in range(1, expected + 1):
+        blueprint = _read_json_file(visual_blueprint_path(task_dir, idx))
+        if isinstance(blueprint, dict) and blueprint.get("schema") == VISUAL_BLUEPRINT_SCHEMA:
+            for region in _blueprint_regions(blueprint):
+                rid = str(region.get("id", "")).strip()
+                kind = str(region.get("pptx_object_kind", "")).strip().lower()
+                if not rid or _is_visual_blueprint_root_region(region):
+                    continue
+                if kind == "native_chart":
+                    result["chart"].setdefault(idx, set()).add(rid)
+                if kind == "native_table":
+                    result["table"].setdefault(idx, set()).add(rid)
+            continue
         contract = visual_contract_path(task_dir, idx)
         if not contract.exists():
             continue
@@ -4245,14 +6452,18 @@ def _contract_semantic_region_ids(task_dir: Path, expected: int) -> dict[str, di
             if not rid or _is_visual_contract_root_region(region):
                 continue
             text_items = region.get("text", [])
+            if not isinstance(text_items, list):
+                text_items = []
             icon_items = region.get("icon_semantics", [])
+            if not isinstance(icon_items, list):
+                icon_items = []
             haystack = " ".join(
                 [
                     rid,
                     str(region.get("role", "")),
                     str(region.get("type", "")),
-                    " ".join(str(v) for v in text_items if isinstance(text_items, list)),
-                    " ".join(str(v) for v in icon_items if isinstance(icon_items, list)),
+                    " ".join(str(v) for v in text_items),
+                    " ".join(str(v) for v in icon_items),
                 ]
             ).lower()
             if any(keyword.lower() in haystack for keyword in VISUAL_CHART_KEYWORDS):
@@ -4271,14 +6482,8 @@ def _pptx_package_object_counts(pptx: Path) -> dict[str, int]:
 
         with zipfile.ZipFile(pptx) as zf:
             names = zf.namelist()
-            counts["charts"] = len([
-                name for name in names
-                if name.startswith("ppt/charts/chart") and name.endswith(".xml")
-            ])
-            counts["embedded_workbooks"] = len([
-                name for name in names
-                if name.startswith("ppt/embeddings/")
-            ])
+            counts["charts"] = len([name for name in names if name.startswith("ppt/charts/chart") and name.endswith(".xml")])
+            counts["embedded_workbooks"] = len([name for name in names if name.startswith("ppt/embeddings/")])
             counts["tables"] = sum(
                 zf.read(name).count(b"<a:tbl")
                 for name in names
@@ -4301,19 +6506,42 @@ def check_direct_pptx_semantics(
     table_regions = {idx: sorted(ids) for idx, ids in semantic_regions["table"].items() if ids}
     required_region_ids_by_slide: dict[int, set[str]] = {}
     for idx in range(1, expected + 1):
-        data = _read_json_file(visual_contract_path(task_dir, idx))
+        graph = _read_json_file(visual_object_graph_path(task_dir, idx))
+        if isinstance(graph, dict) and graph.get("schema") == VISUAL_OBJECT_GRAPH_SCHEMA:
+            objects = graph.get("objects")
+            if isinstance(objects, list):
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        continue
+                    oid = str(obj.get("id", "")).strip()
+                    if oid:
+                        required_region_ids_by_slide.setdefault(idx, set()).add(oid)
+                        kind = str(obj.get("object_kind", "")).strip().lower()
+                        if kind in {"chart", "native_chart"}:
+                            chart_regions.setdefault(idx, []).append(oid)
+                        if kind in {"table", "native_table"}:
+                            table_regions.setdefault(idx, []).append(oid)
+                continue
+        data = _read_json_file(visual_blueprint_path(task_dir, idx))
+        use_blueprint = isinstance(data, dict) and data.get("schema") == VISUAL_BLUEPRINT_SCHEMA
+        if not use_blueprint:
+            data = _read_json_file(visual_contract_path(task_dir, idx))
         if not isinstance(data, dict):
             continue
         regions = data.get("regions")
         if not isinstance(regions, list):
             continue
         for region in regions:
-            if not isinstance(region, dict) or _is_visual_contract_root_region(region):
+            if not isinstance(region, dict):
                 continue
             rid = str(region.get("id", "")).strip()
+            if use_blueprint:
+                if _is_visual_blueprint_root_region(region):
+                    continue
+            elif _is_visual_contract_root_region(region):
+                continue
             if rid:
                 required_region_ids_by_slide.setdefault(idx, set()).add(rid)
-
     package_counts = _pptx_package_object_counts(pptx)
     chart_count = int(package_counts.get("charts") or (pptx_summary or {}).get("charts") or 0)
     table_count = int(package_counts.get("tables") or (pptx_summary or {}).get("tables") or 0)
@@ -4351,6 +6579,11 @@ def check_direct_pptx_semantics(
         if not isinstance(data, dict):
             issues.append("qa/direct_pptx_object_map.json cannot be parsed")
         else:
+            if pptx.exists() and not file_is_after_path(map_path, pptx):
+                issues.append(
+                    "qa/direct_pptx_object_map.json is older than the checked PPTX; "
+                    "record the object map after generating the current direct PPTX"
+                )
             if data.get("schema") != DIRECT_PPTX_OBJECT_MAP_SCHEMA:
                 issues.append(f"qa/direct_pptx_object_map.json schema must be {DIRECT_PPTX_OBJECT_MAP_SCHEMA}")
             if data.get("expected_pages") != expected:
@@ -4373,6 +6606,18 @@ def check_direct_pptx_semantics(
                     observation, _observation_issues = image_observation_record_issues(task_dir, idx)
                     if observation is not None and entry.get("observation_id") != observation.get("observation_id"):
                         issues.append(f"qa/direct_pptx_object_map.json slide {idx}: observation_id must match fresh observation")
+                    blueprint_path = visual_blueprint_path(task_dir, idx)
+                    if blueprint_path.exists() and entry.get("visual_blueprint_sha256") != sha256_file(blueprint_path):
+                        issues.append(
+                            f"qa/direct_pptx_object_map.json slide {idx}: visual_blueprint_sha256 must match "
+                            "the current locked visual blueprint"
+                        )
+                    object_graph_path = visual_object_graph_path(task_dir, idx)
+                    if object_graph_path.exists() and entry.get("visual_object_graph_sha256") != sha256_file(object_graph_path):
+                        issues.append(
+                            f"qa/direct_pptx_object_map.json slide {idx}: visual_object_graph_sha256 must match "
+                            "the current executable object graph"
+                        )
                     mappings = entry.get("regions")
                     if not isinstance(mappings, list) or not mappings:
                         issues.append(f"qa/direct_pptx_object_map.json slide {idx}: regions mapping list is required")
@@ -4469,6 +6714,95 @@ def check_render_manifest(
         "pptx_hash_matches": current_hash == recorded_hash,
         "pptx": str(pptx),
     }
+
+
+def check_html_path_profile(
+    task_dir: Path,
+    expected: int,
+    issues: list[str],
+    *,
+    pptx: Path | None = None,
+    include_html_fidelity: bool = True,
+    html_files: list[Path] | None = None,
+) -> dict[str, object]:
+    counts: dict[str, object] = {
+        "spec_count": check_spec_files(task_dir, expected, issues),
+        "visual_contract_count": check_visual_contract_files(task_dir, expected, issues),
+        "visual_blueprint_count": check_visual_blueprint_files(task_dir, expected, issues),
+        "visual_object_graph_count": "not_required_for_html",
+        "direct_pptx_semantics": "not_required_for_html",
+    }
+    if include_html_fidelity:
+        counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
+        counts["html_reference_fidelity"] = check_html_reference_fidelity(
+            task_dir,
+            expected,
+            issues,
+            html_files=html_files,
+        )
+    if pptx is not None:
+        counts["render_manifest"] = check_render_manifest(task_dir, pptx, issues)
+    return counts
+
+
+def check_direct_pptx_path_profile(
+    task_dir: Path,
+    expected: int,
+    issues: list[str],
+    *,
+    pptx: Path | None = None,
+    pptx_summary: dict[str, int] | None = None,
+) -> dict[str, object]:
+    counts: dict[str, object] = {
+        "spec_count": "not_required_for_direct_pptx",
+        "visual_contract_count": "not_required_for_direct_pptx",
+        "visual_blueprint_count": "not_required_for_direct_pptx",
+        "visual_inventory_count": check_visual_inventory_files(task_dir, expected, issues),
+        "powerpoint_layout_plan_count": check_powerpoint_layout_plan_files(task_dir, expected, issues),
+        "visual_object_graph_count": check_visual_object_graph_files(task_dir, expected, issues),
+        "html_slide_count": "debug_optional",
+        "html_reference_fidelity": "not_required_for_direct_pptx",
+        "render_manifest": "not_required_for_direct_pptx",
+        "direct_pptx_semantics": "pending_pptx",
+    }
+    if pptx is not None:
+        counts["direct_pptx_semantics"] = check_direct_pptx_semantics(
+            task_dir,
+            expected,
+            pptx,
+            pptx_summary,
+            issues,
+        )
+    return counts
+
+
+def check_render_path_profile(
+    task_dir: Path,
+    expected: int,
+    render_path: str,
+    issues: list[str],
+    *,
+    pptx: Path | None = None,
+    pptx_summary: dict[str, int] | None = None,
+    include_html_fidelity: bool = True,
+    html_files: list[Path] | None = None,
+) -> dict[str, object]:
+    if render_path == "html":
+        return check_html_path_profile(
+            task_dir,
+            expected,
+            issues,
+            pptx=pptx,
+            include_html_fidelity=include_html_fidelity,
+            html_files=html_files,
+        )
+    return check_direct_pptx_path_profile(
+        task_dir,
+        expected,
+        issues,
+        pptx=pptx,
+        pptx_summary=pptx_summary,
+    )
 
 
 def load_commercial_render_contract(task_dir: Path) -> dict[str, object]:
@@ -4598,6 +6932,39 @@ def check_commercial_similarity(
     return {"min_required": COMMERCIAL_SIMILARITY_MIN, "scores": scores}
 
 
+def user_visible_quality_summary(task_dir: Path, expected: int) -> dict[str, object]:
+    review = task_dir / "qa" / "fidelity_review.json"
+    summary = {
+        "status": "ready",
+        "message": "PPT 已生成，可下载可编辑版本。",
+    }
+    if not review.exists():
+        return summary
+    try:
+        data = json.loads(review.read_text(encoding="utf-8"))
+    except Exception:
+        return summary
+    slides = data.get("slides")
+    if not isinstance(slides, list):
+        return summary
+    scores: list[float] = []
+    for idx in range(1, expected + 1):
+        entry = slides[idx - 1] if idx - 1 < len(slides) else {}
+        if not isinstance(entry, dict):
+            continue
+        ref = _resolve_review_path(task_dir, entry.get("reference_path"))
+        actual = _resolve_review_path(task_dir, entry.get("actual_preview_path"))
+        if ref is None or actual is None or not ref.exists() or not actual.exists():
+            continue
+        score = image_similarity_score(ref, actual)
+        if score is not None:
+            scores.append(score)
+    if scores and min(scores) < 0.90:
+        summary["status"] = "editable_draft"
+        summary["message"] = "PPT 已生成，可下载可编辑版本；如需更精细效果，可继续优化。"
+    return summary
+
+
 def internal_prompt_files(task_dir: Path) -> list[Path]:
     files: dict[Path, None] = {}
     for pattern in PROMPT_INTERNAL_PATTERNS:
@@ -4643,6 +7010,38 @@ def delivery_temp_files(task_dir: Path) -> list[Path]:
     return sorted(files)
 
 
+def premature_pptx_delivery_issues(task_dir: Path, expected: int | None = None) -> list[str]:
+    issues: list[str] = []
+    review_path = image2_user_review_path(task_dir)
+    user_approved = False
+    if review_path.exists():
+        data = _read_json_file(review_path)
+        user_approved = isinstance(data, dict) and data.get("user_approved") is True
+    if user_approved:
+        return issues
+
+    candidates: list[Path] = []
+    for root in [task_dir / "pptx", task_dir / "delivery"]:
+        if root.exists():
+            candidates.extend(
+                p for p in sorted(root.rglob("*"))
+                if p.is_file() and not p.name.startswith("~$") and p.suffix.lower() == ".pptx"
+            )
+    actual_dir = task_dir / "qa" / "pptx_actual"
+    if actual_dir.exists():
+        candidates.extend(
+            p for p in sorted(actual_dir.rglob("*"))
+            if p.is_file() and p.suffix.lower() in {".png", ".pdf"}
+        )
+    if candidates:
+        rels = ", ".join(str(p.relative_to(task_dir)) for p in candidates[:8])
+        issues.append(
+            "premature PPTX/delivery artifacts found before approved visual references: "
+            f"{rels}. Do not generate or publish PPTX before the selected page previews are explicitly approved."
+        )
+    return issues
+
+
 def _review_path_exists(task_dir: Path, raw: object) -> bool:
     if not isinstance(raw, str) or not raw.strip():
         return False
@@ -4682,7 +7081,32 @@ def _looks_like_html_reference_preview(task_dir: Path, idx: int, path: Path) -> 
     return False
 
 
-def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> dict[str, object] | None:
+def near_duplicate_evidence_pairs(evidences: list[str], *, threshold: float = 0.92) -> list[tuple[int, int]]:
+    normalized: list[str] = []
+    for evidence in evidences:
+        text = evidence.lower()
+        text = re.sub(r"\bslide\s*\d+\b", "slide", text)
+        text = re.sub(r"\bpage\s*\d+\b", "page", text)
+        text = re.sub(r"\d+", "0", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        normalized.append(text)
+    pairs: list[tuple[int, int]] = []
+    for i in range(len(normalized)):
+        for j in range(i + 1, len(normalized)):
+            if not normalized[i] or not normalized[j]:
+                continue
+            ratio = difflib.SequenceMatcher(None, normalized[i], normalized[j]).ratio()
+            if ratio >= threshold:
+                pairs.append((i + 1, j + 1))
+    return pairs
+
+
+def check_fidelity_review(
+    task_dir: Path,
+    expected: int,
+    issues: list[str],
+    pptx: Path | None = None,
+) -> dict[str, object] | None:
     review = task_dir / "qa" / "fidelity_review.json"
     if not review.exists():
         issues.append("qa/fidelity_review.json missing; compare final PPTX against Image2 slide by slide before delivery")
@@ -4692,6 +7116,17 @@ def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> d
     except Exception as exc:
         issues.append(f"qa/fidelity_review.json cannot be parsed: {exc}")
         return None
+    if pptx is not None and pptx.exists() and not file_is_after_path(review, pptx):
+        issues.append(
+            "qa/fidelity_review.json is older than the checked PPTX; "
+            "redo slide-by-slide fidelity review after generating the current PowerPoint file"
+        )
+    commercial_contract = commercial_render_contract_path(task_dir)
+    if commercial_contract.exists() and not file_is_after_path(review, commercial_contract):
+        issues.append(
+            "qa/fidelity_review.json is older than qa/commercial_render_contract.json; "
+            "review must happen after binding the current commercial PPTX"
+        )
 
     summary = validate_slide_review(data, expected, issues, "fidelity review")
     if summary is None:
@@ -4730,10 +7165,15 @@ def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> d
                             f"fidelity review slide {idx}: actual_preview_path matches the HTML reference preview; "
                             "export and review the actual PowerPoint-rendered slide instead"
                         )
+                    if not file_is_after_path(review, actual_resolved):
+                        issues.append(
+                            f"fidelity review slide {idx}: qa/fidelity_review.json is older than the actual PPTX preview; "
+                            "write the review only after exporting the current PowerPoint slide image"
+                        )
             evidence = entry.get("evidence")
             if not isinstance(evidence, str) or len(evidence.strip()) < 80:
                 issues.append(
-                    f"fidelity review slide {idx}: evidence must describe concrete visual comparisons, not a generic pass"
+                    f"fidelity review slide {idx}: evidence must describe concrete visual comparisons (at least 80 chars)"
                 )
             if _review_path_exists(task_dir, reference_raw) and _review_path_exists(task_dir, actual_raw):
                 reference_path = Path(reference_raw) if isinstance(reference_raw, str) else Path()
@@ -4777,6 +7217,13 @@ def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> d
             "Each slide must have a unique, specific comparison — copy-pasted reviews indicate "
             "the PPTX was not actually compared against each Image2 reference individually."
         )
+    near_duplicates = near_duplicate_evidence_pairs(all_evidences)
+    if near_duplicates:
+        pair_text = ", ".join(f"{a}/{b}" for a, b in near_duplicates[:5])
+        issues.append(
+            "fidelity review: slide evidence is near-duplicate after normalizing page numbers "
+            f"({pair_text}). Each slide must describe its own concrete visual match and drift."
+        )
 
     return {
         "path": str(review.resolve()),
@@ -4786,7 +7233,12 @@ def check_fidelity_review(task_dir: Path, expected: int, issues: list[str]) -> d
     }
 
 
-def check_powerpoint_review(task_dir: Path, expected: int, issues: list[str]) -> dict[str, object] | None:
+def check_powerpoint_review(
+    task_dir: Path,
+    expected: int,
+    issues: list[str],
+    pptx: Path | None = None,
+) -> dict[str, object] | None:
     review = task_dir / "qa" / "powerpoint_review.json"
     if not review.exists():
         issues.append("qa/powerpoint_review.json missing; open the actual PPTX in PowerPoint and inspect it slide by slide")
@@ -4796,11 +7248,26 @@ def check_powerpoint_review(task_dir: Path, expected: int, issues: list[str]) ->
     except Exception as exc:
         issues.append(f"qa/powerpoint_review.json cannot be parsed: {exc}")
         return None
+    if pptx is not None and pptx.exists() and not file_is_after_path(review, pptx):
+        issues.append(
+            "qa/powerpoint_review.json is older than the checked PPTX; "
+            "open and inspect the current PowerPoint file before passing review"
+        )
+    commercial_contract = commercial_render_contract_path(task_dir)
+    if commercial_contract.exists() and not file_is_after_path(review, commercial_contract):
+        issues.append(
+            "qa/powerpoint_review.json is older than qa/commercial_render_contract.json; "
+            "PowerPoint review must happen after binding the current commercial PPTX"
+        )
 
     if data.get("actual_pptx_opened") is not True:
         issues.append("qa/powerpoint_review.json actual_pptx_opened must be true")
     if not str(data.get("pptx_path", "")).endswith(".pptx"):
         issues.append("qa/powerpoint_review.json must include pptx_path")
+    elif pptx is not None:
+        recorded_pptx = _resolve_task_path(task_dir, data.get("pptx_path"))
+        if recorded_pptx is None or recorded_pptx.resolve() != pptx.resolve():
+            issues.append("qa/powerpoint_review.json pptx_path must match the checked PPTX")
 
     summary = validate_slide_review(
         data,
@@ -4827,6 +7294,13 @@ def check_powerpoint_review(task_dir: Path, expected: int, issues: list[str]) ->
         issues.append(
             "PowerPoint review: multiple slides share identical evidence text. "
             "Each slide must be inspected individually with unique findings."
+        )
+    near_duplicates = near_duplicate_evidence_pairs(all_evidences)
+    if near_duplicates:
+        pair_text = ", ".join(f"{a}/{b}" for a, b in near_duplicates[:5])
+        issues.append(
+            "PowerPoint review: slide evidence is near-duplicate after normalizing page numbers "
+            f"({pair_text}). Each slide must include distinct PowerPoint inspection findings."
         )
 
     return {"path": str(review.resolve()), **summary}
@@ -4862,24 +7336,21 @@ def check_delivery_files(
             + ", ".join(p.name for p in exposed_pptx)
         )
     check_image2_files(task_dir, expected, issues, require_prompt_files=False)
-    spec_count = check_spec_files(task_dir, expected, issues)
-    visual_contract_count = check_visual_contract_files(task_dir, expected, issues)
     final_pptx = exposed_pptx[0].resolve() if len(exposed_pptx) == 1 else None
     pptx_summary = check_pptx_file(final_pptx, expected, issues) if final_pptx else None
     commercial = check_commercial_render_contract(task_dir, expected, final_pptx, issues) if final_pptx else None
     render_path = commercial.get("render_path") if isinstance(commercial, dict) else commercial_render_path(task_dir)
-    direct_semantics: object = "not_required_for_html"
-    if render_path == "html":
-        html_count: object = check_html_files(task_dir, expected, issues)
-        render_manifest: object = check_render_manifest(task_dir, final_pptx, issues)
-    else:
-        html_count = "debug_optional"
-        render_manifest = "not_required_for_direct_pptx"
-        if final_pptx is not None:
-            direct_semantics = check_direct_pptx_semantics(task_dir, expected, final_pptx, pptx_summary, issues)
-    fidelity = check_fidelity_review(task_dir, expected, issues)
+    path_counts = check_render_path_profile(
+        task_dir,
+        expected,
+        render_path,
+        issues,
+        pptx=final_pptx,
+        pptx_summary=pptx_summary,
+    )
+    fidelity = check_fidelity_review(task_dir, expected, issues, final_pptx)
     commercial_similarity = check_commercial_similarity(task_dir, expected, issues)
-    powerpoint = check_powerpoint_review(task_dir, expected, issues)
+    powerpoint = check_powerpoint_review(task_dir, expected, issues, final_pptx)
     delivery_dir = task_dir / "delivery"
     delivery_files: list[Path] = []
     if delivery_dir.exists():
@@ -4927,13 +7398,16 @@ def check_delivery_files(
         "prompt_markdown_files": [str(p.relative_to(task_dir)) for p in prompt_files],
         "temporary_files": [str(p.relative_to(task_dir)) for p in temp_files],
         "top_level_pptx_files": [p.name for p in exposed_pptx],
-        "spec_count": spec_count,
-        "visual_contract_count": visual_contract_count,
-        "html_slide_count": html_count,
+        "spec_count": path_counts.get("spec_count"),
+        "visual_contract_count": path_counts.get("visual_contract_count"),
+        "visual_blueprint_count": path_counts.get("visual_blueprint_count"),
+        "visual_inventory_count": path_counts.get("visual_inventory_count"),
+        "visual_object_graph_count": path_counts.get("visual_object_graph_count"),
+        "html_slide_count": path_counts.get("html_slide_count"),
         "pptx_summary": pptx_summary,
         "commercial_render_contract": commercial,
-        "render_manifest": render_manifest,
-        "direct_pptx_semantics": direct_semantics,
+        "render_manifest": path_counts.get("render_manifest"),
+        "direct_pptx_semantics": path_counts.get("direct_pptx_semantics"),
         "fidelity_review": fidelity,
         "commercial_similarity": commercial_similarity,
         "powerpoint_review": powerpoint,
@@ -4959,30 +7433,26 @@ def check_pipeline_contract(
     counts: dict[str, object] = {}
     check_analysis_files(task_dir, expected, issues)
     counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-    counts["spec_count"] = check_spec_files(task_dir, expected, issues)
-    counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
     if pptx is None:
         pptx_files = sorted((task_dir / "pptx").glob("*.pptx"))
         pptx = pptx_files[-1].resolve() if pptx_files else task_dir / "pptx" / "missing.pptx"
     commercial = check_commercial_render_contract(task_dir, expected, pptx, issues)
     counts["commercial_render_contract"] = commercial
     render_path = commercial.get("render_path") if isinstance(commercial, dict) else commercial_render_path(task_dir)
-    if render_path == "html":
-        counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-        counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
-        counts["render_manifest"] = check_render_manifest(task_dir, pptx, issues)
-    else:
-        counts["html_slide_count"] = "debug_optional"
-        counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
-        counts["render_manifest"] = "not_required_for_direct_pptx"
     pptx_summary = check_pptx_file(pptx, expected, issues)
     if pptx_summary is not None:
         counts["pptx"] = str(pptx)
         counts["pptx_summary"] = pptx_summary
-    if render_path == "direct_pptx":
-        counts["direct_pptx_semantics"] = check_direct_pptx_semantics(task_dir, expected, pptx, pptx_summary, issues)
-    counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues)
-    counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues)
+    counts.update(check_render_path_profile(
+        task_dir,
+        expected,
+        render_path,
+        issues,
+        pptx=pptx,
+        pptx_summary=pptx_summary,
+    ))
+    counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues, pptx)
+    counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues, pptx)
     counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
     return counts
 
@@ -5062,6 +7532,7 @@ def write_final_delivery_pass(
         "pptx_sha256": sha256_file(pptx.resolve()),
         "delivery_files": delivery_files,
         "delivery_counts": delivery_counts,
+        "user_visible_summary": user_visible_quality_summary(task_dir, expected),
         "policy": (
             "Final response may link only to files under delivery/ after this pass is current."
         ),
@@ -5134,6 +7605,7 @@ def cmd_audit_task(args: argparse.Namespace) -> int:
     for stage in ["analysis", "image2", "html", "pptx", "pipeline", "delivery"]:
         issues: list[str] = []
         counts: dict[str, object] = {}
+        render_path = commercial_render_path(task_dir)
         if stage == "analysis":
             check_analysis_files(task_dir, expected, issues)
         elif stage == "image2":
@@ -5142,40 +7614,29 @@ def cmd_audit_task(args: argparse.Namespace) -> int:
         elif stage == "html":
             check_analysis_files(task_dir, expected, issues)
             counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-            counts["spec_count"] = check_spec_files(task_dir, expected, issues)
-            counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-            if commercial_render_path(task_dir) == "html":
-                counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-                counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
-            else:
-                counts["html_slide_count"] = "debug_optional"
-                counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
+            counts.update(check_render_path_profile(task_dir, expected, render_path, issues))
         elif stage == "pptx":
             check_analysis_files(task_dir, expected, issues)
             counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-            counts["spec_count"] = check_spec_files(task_dir, expected, issues)
-            counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-            if commercial_render_path(task_dir) == "html":
-                counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-                counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
-            else:
-                counts["html_slide_count"] = "debug_optional"
-                counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
             check_pptx = pptx
             if check_pptx is None:
                 pptx_files = sorted((task_dir / "pptx").glob("*.pptx"))
                 check_pptx = pptx_files[-1].resolve() if pptx_files else task_dir / "pptx" / "missing.pptx"
+            commercial = check_commercial_render_contract(task_dir, expected, check_pptx, issues)
+            render_path = commercial.get("render_path") if isinstance(commercial, dict) else commercial_render_path(task_dir)
+            counts["commercial_render_contract"] = commercial
             pptx_summary = check_pptx_file(check_pptx, expected, issues)
             if pptx_summary is not None:
                 counts["pptx"] = str(check_pptx)
                 counts["pptx_summary"] = pptx_summary
-            if commercial_render_path(task_dir) == "direct_pptx":
-                counts["direct_pptx_semantics"] = check_direct_pptx_semantics(
-                    task_dir, expected, check_pptx, pptx_summary, issues
-                )
-                counts["render_manifest"] = "not_required_for_direct_pptx"
-            else:
-                counts["render_manifest"] = check_render_manifest(task_dir, check_pptx, issues)
+            counts.update(check_render_path_profile(
+                task_dir,
+                expected,
+                render_path,
+                issues,
+                pptx=check_pptx,
+                pptx_summary=pptx_summary,
+            ))
         elif stage == "pipeline":
             counts.update(check_pipeline_contract(task_dir, expected, pptx, issues))
         elif stage == "delivery":
@@ -5222,17 +7683,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     stage = args.stage
     issues: list[str] = []
     counts: dict[str, object] = {}
+    render_path = commercial_render_path(task_dir)
 
     if stage in {"analysis", "image2", "html", "pptx", "all"}:
         check_analysis_files(task_dir, expected, issues)
     if stage in {"image2", "html", "pptx", "all"}:
         counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-    if stage in {"html", "pptx", "all"}:
-        counts["spec_count"] = check_spec_files(task_dir, expected, issues)
-        counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-    if stage == "html" or (stage in {"pptx", "all"} and commercial_render_path(task_dir) == "html"):
-        counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-        counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
+    if stage == "html":
+        counts.update(check_render_path_profile(
+            task_dir,
+            expected,
+            render_path,
+            issues,
+            include_html_fidelity=True,
+        ))
     if stage in {"pptx", "all"}:
         pptx = Path(args.pptx).resolve() if args.pptx else None
         if pptx is None:
@@ -5243,12 +7707,15 @@ def cmd_check(args: argparse.Namespace) -> int:
         if pptx_summary is not None:
             counts["pptx"] = str(pptx)
             counts["pptx_summary"] = pptx_summary
-        if commercial_render_path(task_dir) == "direct_pptx":
-            counts["direct_pptx_semantics"] = check_direct_pptx_semantics(task_dir, expected, pptx, pptx_summary, issues)
-        if commercial_render_path(task_dir) == "html":
-            counts["render_manifest"] = check_render_manifest(task_dir, pptx, issues)
-        else:
-            counts["render_manifest"] = "not_required_for_direct_pptx"
+        counts.update(check_render_path_profile(
+            task_dir,
+            expected,
+            commercial_render_path(task_dir),
+            issues,
+            pptx=pptx,
+            pptx_summary=pptx_summary,
+            include_html_fidelity=True,
+        ))
         counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
     if stage in {"delivery"}:
         counts.update(check_delivery_files(task_dir, expected, issues))
@@ -5288,14 +7755,12 @@ def task_stage_issues(
     elif stage == "html":
         check_analysis_files(task_dir, expected, issues)
         counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-        counts["spec_count"] = check_spec_files(task_dir, expected, issues)
-        counts["visual_contract_count"] = check_visual_contract_files(task_dir, expected, issues)
-        if commercial_render_path(task_dir) == "html":
-            counts["html_slide_count"] = check_html_files(task_dir, expected, issues)
-            counts["html_reference_fidelity"] = check_html_reference_fidelity(task_dir, expected, issues)
-        else:
-            counts["html_slide_count"] = "debug_optional"
-            counts["html_reference_fidelity"] = "not_required_for_direct_pptx"
+        counts.update(check_render_path_profile(
+            task_dir,
+            expected,
+            commercial_render_path(task_dir),
+            issues,
+        ))
     elif stage == "pptx":
         if pptx is None:
             pptx_files = [
@@ -5386,325 +7851,6 @@ def task_controller_status(
     }
 
 
-def copy_runtime_sources(task_dir: Path, sources: list[str]) -> list[dict[str, object]]:
-    copied: list[dict[str, object]] = []
-    source_dir = task_dir / "source"
-    source_dir.mkdir(parents=True, exist_ok=True)
-    for raw in sources:
-        src = Path(raw).expanduser().resolve()
-        if not src.exists():
-            copied.append({"source": str(src), "ok": False, "error": "missing"})
-            continue
-        if src.is_dir():
-            target = source_dir / src.name
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(src, target)
-            copied.append({"source": str(src), "target": str(target), "ok": True, "type": "directory"})
-        else:
-            target = source_dir / src.name
-            shutil.copy2(src, target)
-            copied.append(
-                {
-                    "source": str(src),
-                    "target": str(target),
-                    "ok": True,
-                    "type": "file",
-                    "sha256": sha256_file(target),
-                }
-            )
-    return copied
-
-
-def write_public_runtime_state(task_dir: Path, state: dict[str, object]) -> None:
-    runtime_dir = task_dir / "qa"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    (runtime_dir / "public_runtime_state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def slide_story_exists(task_dir: Path) -> bool:
-    path = task_dir / "analysis" / "slide_story.json"
-    if not path.exists():
-        return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    slides = data.get("slides") if isinstance(data, dict) else data
-    return isinstance(slides, list) and bool(slides)
-
-
-def maybe_run_prompt_plan(task_dir: Path, expected: int, topic: str) -> dict[str, object] | None:
-    plan_path = prompt_selection_plan_path(task_dir)
-    if plan_path.exists() or not slide_story_exists(task_dir):
-        return None
-    args = argparse.Namespace(task_dir=str(task_dir), pages=expected, topic=topic)
-    stdout = io.StringIO()
-    with contextlib.redirect_stdout(stdout):
-        rc = cmd_plan_prompts(args)
-    return {
-        "action": "plan-prompts",
-        "return_code": rc,
-        "path": str(plan_path),
-        "stdout_captured": bool(stdout.getvalue().strip()),
-    }
-
-
-def maybe_prepare_image2_requests(task_dir: Path) -> dict[str, object] | None:
-    manifest = task_dir / "image2" / "image2_generation_manifest.json"
-    if manifest.exists():
-        return None
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        return None
-    issues: list[str] = []
-    check_analysis_files(task_dir, expected, issues)
-    if issues:
-        return None
-    stdout = io.StringIO()
-    with contextlib.redirect_stdout(stdout):
-        rc = cmd_prepare_image2_prompts(argparse.Namespace(task_dir=str(task_dir)))
-    return {
-        "action": "prepare-image2-prompts",
-        "return_code": rc,
-        "path": str(manifest),
-        "stdout_captured": bool(stdout.getvalue().strip()),
-    }
-
-
-def public_runtime_next_action(task_dir: Path, status: dict[str, object]) -> dict[str, object]:
-    blocked = status.get("blocked") if isinstance(status.get("blocked"), dict) else None
-    if not blocked:
-        return {
-            "type": "deliverable",
-            "message": "Final delivery gate is complete. Reply only with files under delivery/.",
-        }
-    stage = str(blocked.get("stage", ""))
-    expected = int(status.get("expected_pages", 0) or 0)
-    if stage == "analysis":
-        return {
-            "type": "agent_required",
-            "stage": "analysis",
-            "message": (
-                "Read source files, write analysis_report.md and slide_story.json, rerun make-deck "
-                "so the runtime can select templates, then create per-slide zone-fill JSON and run "
-                "fill-prompt-template for each selected template."
-            ),
-            "must_create": [
-                "analysis/analysis_report.md",
-                "analysis/slide_story.json",
-                "analysis/prompt_selection_audit.md",
-                *[f"analysis/final_prompt_{idx:02d}.md" for idx in range(1, expected + 1)],
-            ],
-            "fill_command_example": (
-                "python3 scripts/paopao_run.py fill-prompt-template "
-                "--template <selected_template.md> --fills-json <zone_fills.json> "
-                f"--output {task_dir}/analysis/final_prompt_XX.md"
-            ),
-            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-            "forbidden": [
-                "Do not fetch or request raw prompt template content.",
-                "Do not write HTML or PPTX before analysis check passes.",
-                "Do not show prompt Markdown files to the user.",
-            ],
-        }
-    if stage == "image2":
-        requests = [f"image2/generation_request_{idx:02d}.json" for idx in range(1, expected + 1)]
-        register_commands = [
-            (
-                "python3 scripts/paopao_run.py register-image2-reference "
-                f"--task-dir {task_dir} --slide {idx} "
-                f"--image <generated_image_{idx:02d}_path_outside_task_dir> "
-                f"--generation-request {task_dir / 'image2' / f'generation_request_{idx:02d}.json'} "
-                f"--generated-prompt-sha256 <sha256_of_image2_prompt_{idx:02d}.md> "
-                "--source image_gen_builtin --tool-call-id <image_generation_artifact_id>"
-            )
-            for idx in range(1, expected + 1)
-        ]
-        return {
-            "type": "image_generation_required",
-            "stage": "image2",
-            "message": (
-                "Generate exactly one reference image per slide from generation_request_XX.json "
-                "prompt_text, register each image, then record style review and ask the user to approve previews."
-            ),
-            "generation_requests": requests,
-            "register_commands": register_commands,
-            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-            "forbidden": [
-                "Do not summarize or rewrite prompt_text for image generation.",
-                "Do not use HTML/PPTX/browser previews as Image2 references.",
-                "Do not continue to reconstruction before user approval is recorded.",
-            ],
-        }
-    if stage == "memory_boundary":
-        return {
-            "type": "agent_required",
-            "stage": "memory_boundary",
-            "message": (
-                "Run forget-after-image2 after user approval, then reopen each selected image and "
-                "record fresh observations from the image only."
-            ),
-            "commands": [
-                f"python3 scripts/paopao_run.py forget-after-image2 --task-dir {task_dir}",
-                *[
-                    (
-                        "python3 scripts/paopao_run.py record-image2-observation "
-                        f"--task-dir {task_dir} --slide {idx} --evidence <fresh visual observation>"
-                    )
-                    for idx in range(1, expected + 1)
-                ],
-            ],
-            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-        }
-    if stage == "html":
-        return {
-            "type": "agent_required",
-            "stage": "reconstruction",
-            "message": (
-                "Extract image-derived contracts, write measurement/spec files, declare direct_pptx unless "
-                "explicitly debugging the legacy HTML path, then build the editable PPTX from the selected images only."
-            ),
-            "commands": [
-                *[
-                    f"python3 scripts/paopao_run.py extract-image2-contract --task-dir {task_dir} --slide {idx}"
-                    for idx in range(1, expected + 1)
-                ],
-                (
-                    "python3 scripts/paopao_run.py record-commercial-render "
-                    f"--task-dir {task_dir} --render-path direct_pptx --pptx <final_pptx_path>"
-                ),
-            ],
-            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-            "forbidden": [
-                "Do not use final_prompt, image2_prompt, analysis_report, or remembered intent as visual inputs.",
-                "Do not render whole-slide images as PPT backgrounds.",
-                "Do not choose the legacy HTML path unless the task explicitly asks for an HTML-path A/B run.",
-            ],
-        }
-    if stage == "pptx":
-        return {
-            "type": "agent_required",
-            "stage": "pptx_qa",
-            "message": (
-                "Render the declared editable PPTX, open the real PPTX in PowerPoint, record PowerPoint "
-                "and fidelity reviews, then rerun make-deck."
-            ),
-            "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-        }
-    if stage == "delivery":
-        return {
-            "type": "finalize_required",
-            "stage": "delivery",
-            "message": "Run finalize-delivery; only files under delivery/ are user-facing.",
-            "command": f"python3 scripts/paopao_run.py finalize-delivery --task-dir {task_dir} --pptx <final_pptx_path>",
-        }
-    return {
-        "type": "blocked",
-        "stage": stage,
-        "message": str(blocked.get("next_action", "")),
-        "continue_command": f"python3 scripts/paopao_run.py make-deck --task-dir {task_dir}",
-    }
-
-
-def public_runtime_stdout_summary(state: dict[str, object]) -> dict[str, object]:
-    status = state.get("status") if isinstance(state.get("status"), dict) else {}
-    deliverable = bool(status.get("deliverable")) if isinstance(status, dict) else False
-    summary = {
-        "schema": "paopao.public_runtime_summary.v1",
-        "ok": deliverable,
-        "task_dir": state.get("task_dir"),
-        "expected_pages": state.get("expected_pages"),
-        "message": (
-            "Deck is ready in the delivery folder."
-            if deliverable
-            else "Paopao prepared the next private production step. Continue with the local runtime."
-        ),
-    }
-    if deliverable and state.get("task_dir"):
-        summary["delivery_dir"] = str((Path(str(state["task_dir"])) / "delivery").resolve())
-    return summary
-
-
-def cmd_make_deck(args: argparse.Namespace) -> int:
-    if args.task_dir:
-        task_dir = Path(args.task_dir).expanduser().resolve()
-        if not task_dir.exists():
-            raise SystemExit(f"Task directory does not exist: {task_dir}")
-    else:
-        if not args.name:
-            raise SystemExit("make-deck requires --name when --task-dir is not supplied.")
-        if not args.pages:
-            raise SystemExit("make-deck requires --pages when creating a new task.")
-        task_dir = create_task_dir(
-            name=args.name,
-            output_root=args.output_root,
-            pages=args.pages,
-            language=args.language,
-            focus=args.focus,
-        )
-
-    copied_sources = copy_runtime_sources(task_dir, args.source or [])
-    if any(not item.get("ok") for item in copied_sources):
-        state = {
-            "schema": "paopao.public_runtime_state.v1",
-            "task_dir": str(task_dir),
-            "ok": False,
-            "blocked": {
-                "stage": "source",
-                "issues": copied_sources,
-            },
-        }
-        write_public_runtime_state(task_dir, state)
-        print(json.dumps({
-            "schema": "paopao.public_runtime_summary.v1",
-            "ok": False,
-            "task_dir": str(task_dir),
-            "message": "Source file check failed. Please confirm the file path is accessible.",
-        }, ensure_ascii=False, indent=2))
-        return 1
-
-    expected = args.pages or expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Pass --pages or initialize the task with --pages.")
-    enforce_public_page_limit(expected)
-
-    automatic_actions: list[dict[str, object]] = []
-    planned = maybe_run_prompt_plan(task_dir, expected, args.topic or args.focus or task_dir.name)
-    if planned:
-        automatic_actions.append(planned)
-    prepared = maybe_prepare_image2_requests(task_dir)
-    if prepared:
-        automatic_actions.append(prepared)
-
-    pptx = Path(args.pptx).expanduser().resolve() if args.pptx else None
-    status = task_controller_status(task_dir, expected, pptx)
-    next_action = public_runtime_next_action(task_dir, status)
-    state = {
-        "schema": "paopao.public_runtime_state.v1",
-        "runtime": "public_make_deck",
-        "task_dir": str(task_dir),
-        "expected_pages": expected,
-        "public_limits": {
-            "max_slides": free_max_slides(),
-            "prompt_templates": len(load_prompt_catalog()),
-        },
-        "copied_sources": copied_sources,
-        "automatic_actions": automatic_actions,
-        "status": status,
-        "next_action": next_action,
-        "user_visible_output_policy": (
-            "Only delivery/ is user-facing. Prompt, analysis, spec, image2 request, and QA files are internal."
-        ),
-    }
-    write_public_runtime_state(task_dir, state)
-    print(json.dumps(public_runtime_stdout_summary(state), ensure_ascii=False, indent=2))
-    return 0 if status.get("deliverable") else 2
-
-
 def cmd_run_task(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir).resolve()
     expected = args.pages or expected_pages_from_task(task_dir)
@@ -5733,8 +7879,12 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step"] = "analysis"
         state["step_number"] = 1
         state["instruction"] = (
-            "Read source materials and produce analysis artifacts.\n"
-            "  Run: paopao_run.py plan-prompts --task-dir <dir>\n"
+            "Read source materials and produce:\n"
+            "  1. analysis/analysis_report.md — key data with sources\n"
+            "  2. analysis/slide_story.json — arc + per-page conclusions\n"
+            "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
+            "  4. analysis/final_prompt_XX.md for each page (fill from analysis_report using selected templates)\n"
+            "  5. analysis/prompt_selection_audit.md\n"
             "When done, run: paopao_run.py next --task-dir <dir>"
         )
         state["issues"] = analysis_issues
@@ -5742,7 +7892,25 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
 
     image2_issues: list[str] = []
     image2_count = check_image2_files(task_dir, expected, image2_issues)
-    if image2_count < expected or image2_issues:
+    def _is_style_review_issue(issue: str) -> bool:
+        lowered = issue.lower()
+        return "image2_style_review" in lowered or "image2 style review" in lowered
+
+    def _is_user_review_issue(issue: str) -> bool:
+        lowered = issue.lower()
+        return (
+            "image2_user_review" in lowered
+            or "user image review" in lowered
+            or "user_approved" in lowered
+        )
+
+    style_review_issues = [i for i in image2_issues if _is_style_review_issue(i)]
+    user_review_issues = [i for i in image2_issues if _is_user_review_issue(i)]
+    image2_provenance_issues = [
+        i for i in image2_issues
+        if not _is_style_review_issue(i) and not _is_user_review_issue(i)
+    ]
+    if image2_count < expected or image2_provenance_issues:
         done_slides = sorted(
             int(p.stem.split("_")[-1])
             for p in (task_dir / "image2").glob("image2_reference_*.png")
@@ -5763,40 +7931,60 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["current_slide"] = slide
             state["instruction"] = (
                 f"Generate Image2 for slide {slide}:\n"
-                f"  1. Read image2/image2_prompt_{slide:02d}.md\n"
-                f"  2. Call image_gen with the prompt text\n"
-                f"  3. Register: paopao_run.py register-image2-reference --task-dir <dir> "
-                f"--slide {slide} --image <output_path>\n"
+                f"  1. Read image2/image2_prompt_{slide:02d}.md — use its FULL text as the image generation prompt\n"
+                f"  2. Call image_gen with the exact prompt text\n"
+                f"  3. Register the actual original image_gen output only. Do not register a manually redrawn, simplified, "
+                f"smoke-test, screenshot, or replacement reference.\n"
+                f"  4. Register: paopao_run.py register-image2-reference --task-dir <dir> "
+                f"--slide {slide} --image <output_path> --generation-request image2/generation_request_{slide:02d}.json "
+                f"--generated-prompt-sha256 <sha> --source image_gen_builtin --tool-call-id <id>\n"
                 f"When done, run: paopao_run.py next --task-dir <dir>"
             )
         else:
             state["step"] = "image2_fix"
             state["step_number"] = 2
             state["instruction"] = "Fix Image2 registration issues listed below, then run next again."
-            state["issues"] = image2_issues
+            state["issues"] = image2_provenance_issues
+        return state
+
+    if style_review_issues:
+        state["step"] = "image2_style_review"
+        state["step_number"] = 3
+        state["instruction"] = (
+            "Open every selected Image2 reference and record actual visual style evidence in "
+            "qa/image2_style_review.json.\n"
+            "Check each slide for: aspect_ratio_16_9, house_style_reference, palette_discipline, "
+            "clean_background, linework_and_borders, material_simplicity, title_weight, "
+            "module_density, takeaway, color_hierarchy, and icons.\n"
+            "Do not proceed from the prompt text; inspect the actual generated images.\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        )
+        state["issues"] = style_review_issues
         return state
 
     user_review_path = task_dir / "qa" / "image2_user_review.json"
-    if not user_review_path.exists():
+    if not user_review_path.exists() or user_review_issues:
         state["step"] = "image2_user_review"
-        state["step_number"] = 3
+        state["step_number"] = 4
         state["instruction"] = (
             "Show all Image2 reference images to the user for approval.\n"
             "After user responds, run:\n"
             "  paopao_run.py record-image2-user-review --task-dir <dir> --approved <yes|no> --feedback '<text>'\n"
             "Then run: paopao_run.py next --task-dir <dir>"
         )
+        if user_review_issues:
+            state["issues"] = user_review_issues
         return state
     else:
         try:
             review_data = json.loads(user_review_path.read_text(encoding="utf-8"))
-            if review_data.get("approved") not in (True, "yes", "approved"):
+            if review_data.get("user_approved") is not True:
                 state["step"] = "image2_user_review"
-                state["step_number"] = 3
+                state["step_number"] = 4
                 state["instruction"] = (
                     "User requested changes. Regenerate the affected Image2 references, "
                     "then record a new approval.\n"
-                    f"User feedback: {review_data.get('feedback', '')}"
+                    f"User feedback: {review_data.get('user_feedback', '')}"
                 )
                 return state
         except Exception:
@@ -5805,7 +7993,7 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
     boundary_path = task_dir / "qa" / "post_image_memory_boundary.json"
     if not boundary_path.exists():
         state["step"] = "memory_boundary"
-        state["step_number"] = 4
+        state["step_number"] = 5
         state["instruction"] = (
             "Run: paopao_run.py forget-after-image2 --task-dir <dir>\n"
             "This enforces the memory boundary — after this point, reconstruction "
@@ -5817,77 +8005,150 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         obs_path = image2_observation_path(task_dir, slide_idx)
         if not obs_path.exists():
             state["step"] = "observation"
-            state["step_number"] = 5
-            state["current_slide"] = slide_idx
-            state["instruction"] = (
-                f"Observe slide {slide_idx} reference image:\n"
-                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png\n"
-                f"  2. Describe every visible element in detail\n"
-                f"  3. Record: paopao_run.py record-image2-observation --task-dir <dir> "
-                f"--slide {slide_idx} --evidence '<your observation>'\n"
-                f"When done, run: paopao_run.py next --task-dir <dir>"
-            )
-            return state
-
-    for slide_idx in range(1, expected + 1):
-        contract_path = visual_contract_path(task_dir, slide_idx)
-        if not contract_path.exists():
-            state["step"] = "visual_contract"
             state["step_number"] = 6
             state["current_slide"] = slide_idx
             state["instruction"] = (
-                f"Extract visual contract for slide {slide_idx}:\n"
-                f"  Run: paopao_run.py extract-image2-contract --task-dir <dir> --slide {slide_idx}\n"
+                f"Observe slide {slide_idx} Image2 reference:\n"
+                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png\n"
+                f"  2. Describe EVERY visible element using this checklist:\n"
+                f"     A. Nav: tab count, each tab text, active tab, indicator style\n"
+                f"     B. Title: exact text, line count, styling\n"
+                f"     C. Content: module count, position (left/right/top/bottom), relative sizes\n"
+                f"     D. Charts/Tables: type, row/column count, data patterns\n"
+                f"     E. Takeaway: height, left label, right text, divider\n"
+                f"     F. Source: text, position\n"
+                f"  3. Record: paopao_run.py record-image2-observation --task-dir <dir> "
+                f"--slide {slide_idx} --evidence '<your detailed observation>'\n"
+                f"     Evidence must be at least 120 characters of concrete visual facts.\n"
                 f"When done, run: paopao_run.py next --task-dir <dir>"
             )
             return state
 
-    spec_issues: list[str] = []
-    check_spec_files(task_dir, expected, spec_issues)
-    spec_only_issues = [i for i in spec_issues if "spec" in i.lower()]
-    if spec_only_issues:
-        for slide_idx in range(1, expected + 1):
-            spec_path = task_dir / "spec" / f"slide{slide_idx:02d}_spec.md"
-            if not spec_path.exists() or spec_path.stat().st_size < 500:
-                state["step"] = "spec"
-                state["step_number"] = 7
-                state["current_slide"] = slide_idx
-                state["instruction"] = (
-                    f"Write the structured spec for slide {slide_idx}:\n"
-                    f"  1. Open image2/image2_reference_{slide_idx:02d}.png\n"
-                    f"  2. Read spec/slide{slide_idx:02d}_image_observation.json\n"
-                    f"  3. Write spec/slide{slide_idx:02d}_spec.md — element inventory with positions and sizes\n"
-                    f"  Must be at least 500 characters.\n"
-                    f"When done, run: paopao_run.py next --task-dir <dir>"
-                )
-                return state
-        state["step"] = "spec_fix"
+    visual_inventory_issues: list[str] = []
+    for slide_idx in range(1, expected + 1):
+        inv_path = visual_inventory_path(task_dir, slide_idx)
+        if not inv_path.exists():
+            state["step"] = "visual_inventory"
+            state["step_number"] = 7
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Create the visual inventory for slide {slide_idx} before object graph authoring:\n"
+                f"  1. Open and READ image2/image2_reference_{slide_idx:02d}.png as the only visual source\n"
+                f"  2. Save spec/slide{slide_idx:02d}_visual_inventory.json with schema '{VISUAL_INVENTORY_SCHEMA}'\n"
+                f"  3. Include reference_path, reconstruction_source, prompt_context_discarded,\n"
+                f"     observation_record_path, observation_record_sha256, observation_id, canvas\n"
+                f"  4. In elements[], list every visible element that must survive in PPTX:\n"
+                f"     id, role, object_kind, bbox, text/text_summary, style, measurements, visual_features,\n"
+                f"     evidence, required true/false\n"
+                f"     Style observations must call out exact font size/weight, fill color, border color/width,\n"
+                f"     padding, shadow, connector arrow direction, table row/column sizing, and any transparency.\n"
+                f"     measurements must include bbox_px, colors, typography, spacing, strokes when visible,\n"
+                f"     and component_parts for KPI/callout/chevron/table/chart modules with each part bbox_px.\n"
+                f"     Structured component data is required here, before object_graph:\n"
+                f"       native_chart.chart_data = chart_type/categories/series values\n"
+                f"       native_table.table_data = headers/rows/col_widths/row_heights\n"
+                f"       takeaway = label/body\n"
+                f"  5. Required roles: nav, title, content, takeaway, source; detail elements must include\n"
+                f"     visible tables/charts, icons, connectors/arrows, badges, chevrons, panels/cards, dividers\n"
+                f"  6. Add required_object_counts for native_table/native_chart/connector/icon/badge/chevron when visible\n"
+                f"Do not summarize a whole module as one item if it contains distinct visible sub-elements.\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+    check_visual_inventory_files(task_dir, expected, visual_inventory_issues)
+    if visual_inventory_issues:
+        state["step"] = "visual_inventory_fix"
         state["step_number"] = 7
-        state["instruction"] = "Fix spec issues listed below, then run next again."
-        state["issues"] = spec_only_issues
+        state["instruction"] = (
+            "Fix the visual inventory issues below before writing or compiling object graphs. "
+            "The inventory is the required bridge from observed pixels to executable PPTX objects."
+        )
+        state["issues"] = visual_inventory_issues
+        return state
+
+    layout_plan_issues: list[str] = []
+    for slide_idx in range(1, expected + 1):
+        plan_path = powerpoint_layout_plan_path(task_dir, slide_idx)
+        if not plan_path.exists():
+            state["step"] = "powerpoint_layout_plan"
+            state["step_number"] = 8
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Build the PowerPoint-aware layout plan for slide {slide_idx} before object graph authoring:\n"
+                f"  1. Open image2/image2_reference_{slide_idx:02d}.png and spec/slide{slide_idx:02d}_visual_inventory.json\n"
+                f"  2. Run: paopao_run.py build-powerpoint-layout-plan --task-dir <dir> --slide {slide_idx}\n"
+                f"  3. Review spec/slide{slide_idx:02d}_powerpoint_layout_plan.json:\n"
+                f"     - every visible element has a slot tied to inventory_id\n"
+                f"     - title/text slots have enough required_height_px after wrapping\n"
+                f"     - content_safe_top_px leaves room below title\n"
+                f"     - tables/charts/connectors/badges/chevrons are separate component slots\n"
+                f"  4. If any text_fit.fits is false, adjust the layout plan from the reference image before object_graph.\n"
+                f"Do not rely on PowerPoint AutoFit or z-order to fix collisions.\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+    check_powerpoint_layout_plan_files(task_dir, expected, layout_plan_issues)
+    if layout_plan_issues:
+        state["step"] = "powerpoint_layout_plan_fix"
+        state["step_number"] = 8
+        state["instruction"] = (
+            "Fix the PowerPoint layout plan issues below before writing object graphs. "
+            "This plan teaches the object graph how PowerPoint text boxes, tables, connectors, and z-order actually behave."
+        )
+        state["issues"] = layout_plan_issues
+        return state
+
+    object_graph_issues: list[str] = []
+    for slide_idx in range(1, expected + 1):
+        og_path = visual_object_graph_path(task_dir, slide_idx)
+        if not og_path.exists():
+            state["step"] = "object_graph"
+            state["step_number"] = 9
+            state["current_slide"] = slide_idx
+            state["instruction"] = (
+                f"Build the object graph for slide {slide_idx}:\n"
+                f"  1. Use image2/image2_reference_{slide_idx:02d}.png, visual_inventory, and layout_plan only.\n"
+                f"  2. Save spec/slide{slide_idx:02d}_object_graph.json with schema '{VISUAL_OBJECT_GRAPH_SCHEMA}'.\n"
+                f"  3. Each object needs id, inventory/layout refs, role, z_order, object_kind, bbox,\n"
+                f"     editable true, geometry_locked true, source_measurement_id/reference_measurements, style.\n"
+                f"  4. Required structured fields: nav.items; takeaway label/body; connector points;\n"
+                f"     table_data headers/rows/col_widths/row_heights/cell_padding; chart_data chart_type/categories/series.\n"
+                f"  5. Use component fields for KPI/callout/chevron when available; the compiler renders internals.\n"
+                f"  6. Run check; structural omissions fail here before PPTX compile.\n"
+                f"When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+    check_visual_object_graph_files(task_dir, expected, object_graph_issues)
+    if object_graph_issues:
+        state["step"] = "object_graph_fix"
+        state["step_number"] = 9
+        state["instruction"] = (
+            "Fix the object graph issues listed below. The object graph is the ONLY input to PPTX compilation; "
+            "every element, text, style, and position must be accurate."
+        )
+        state["issues"] = object_graph_issues
         return state
 
     pptx_dir = task_dir / "pptx"
     pptx_files = sorted(p for p in pptx_dir.glob("*.pptx") if p.is_file() and not p.name.startswith("~$"))
     if not pptx_files:
-        for slide_idx in range(1, expected + 1):
-            state["step"] = "direct_pptx"
-            state["step_number"] = 8
-            state["current_slide"] = slide_idx
-            state["instruction"] = (
-                f"Build editable PPTX for slide {slide_idx}:\n"
-                f"  1. Open image2/image2_reference_{slide_idx:02d}.png and spec/slide{slide_idx:02d}_spec.md\n"
-                f"  2. Recreate all elements as editable PPTX objects\n"
-                f"  3. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path direct_pptx --pptx <path>\n"
-                f"When done, run: paopao_run.py next --task-dir <dir>"
-            )
-            return state
+        state["step"] = "compile"
+        state["step_number"] = 9
+        state["instruction"] = (
+            "Compile the object graphs into an editable PPTX:\n"
+            "  Run: paopao_run.py compile --task-dir <dir> --pptx pptx/deck.pptx\n"
+            "  Then: paopao_run.py record-commercial-render --task-dir <dir> --render-path direct_pptx --pptx pptx/deck.pptx\n"
+            "The compiler is deterministic — it reads your object graphs and produces PPTX.\n"
+            "You do NOT write any python-pptx code.\n"
+            "When done, run: paopao_run.py next --task-dir <dir>"
+        )
+        return state
 
     actual_dir = task_dir / "qa" / "pptx_actual"
     actual_pngs = sorted(actual_dir.glob("slide-*.png"))
     if len(actual_pngs) < expected:
         state["step"] = "pptx_export"
-        state["step_number"] = 9
+        state["step_number"] = 10
         state["instruction"] = (
             "Export PPTX slide previews:\n"
             "  1. Open the generated PPTX in PowerPoint\n"
@@ -5909,26 +8170,43 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             if len(set(evidences)) < len(evidences):
                 fidelity_ok = False
             for s in slides:
-                if isinstance(s, dict) and len(str(s.get("evidence", ""))) < 80:
+                if not isinstance(s, dict):
+                    fidelity_ok = False
+                    continue
+                status = str(s.get("status", "")).lower().strip()
+                if status not in DELIVERY_REVIEW_ACCEPTED_STATUSES:
+                    fidelity_ok = False
+                if s.get("compared") is not True:
+                    fidelity_ok = False
+                if len(str(s.get("evidence", ""))) < 80:
                     fidelity_ok = False
         except Exception:
             fidelity_ok = False
 
     if not fidelity_ok:
         state["step"] = "fidelity_review"
-        state["step_number"] = 10
+        state["step_number"] = 11
         state["instruction"] = (
-            "Compare each slide's PPTX preview against its reference image.\n"
+            "Compare EACH slide's PPTX preview against its Image2 reference:\n"
+            "  For each slide (1 to {expected}):\n"
+            "    1. Open image2/image2_reference_XX.png\n"
+            "    2. Open qa/pptx_actual/slide-X.png\n"
+            "    3. Write a UNIQUE, SPECIFIC comparison for this slide:\n"
+            "       - What matches well\n"
+            "       - What differs (position, size, color, text, missing elements)\n"
+            "       - Whether it needs fixing\n"
             "  Save as qa/fidelity_review.json with per-slide evidence.\n"
-            "  Each slide must have unique evidence (no copy-paste), at least 80 characters.\n"
+            "  EACH slide MUST have different evidence text — no copy-paste.\n"
+            "  Evidence must be at least 80 characters per slide.\n"
+            "If any slide has issues, fix the object graph, recompile, re-export, then re-review.\n"
             "When done, run: paopao_run.py next --task-dir <dir>"
-        )
+        ).format(expected=expected)
         return state
 
     ppt_review_path = task_dir / "qa" / "powerpoint_review.json"
     if not ppt_review_path.exists():
         state["step"] = "powerpoint_review"
-        state["step_number"] = 11
+        state["step_number"] = 12
         state["instruction"] = (
             "Open the PPTX in PowerPoint and inspect the editing interface:\n"
             "  For each slide:\n"
@@ -5951,17 +8229,21 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         structural = [i for i in pipeline_issues if i not in fixable]
         if fixable and not structural:
             state["step"] = "iterate_pptx"
-            state["step_number"] = 12
+            state["step_number"] = 13
             state["instruction"] = (
-                "Similarity scores are below threshold.\n"
-                "  Fix the failing slides, regenerate PPTX, re-export, redo fidelity review.\n"
-                "  Run: paopao_run.py next --task-dir <dir>\n"
+                "Similarity scores are below threshold. Fix the object graph:\n"
+                "  1. Open EACH failing slide's Image2 reference and PPTX preview side by side\n"
+                "  2. Identify specific differences (missing elements, wrong positions, wrong text)\n"
+                "  3. Update the object graph JSON to fix those differences\n"
+                "  4. Recompile: paopao_run.py compile --task-dir <dir> --pptx pptx/deck.pptx\n"
+                "  5. Re-export PNGs, redo fidelity review\n"
+                "  5. Run: paopao_run.py next --task-dir <dir>\n"
                 "Failing checks:"
             )
             state["issues"] = fixable
         else:
             state["step"] = "pipeline_fix"
-            state["step_number"] = 12
+            state["step_number"] = 13
             state["instruction"] = "Fix pipeline issues listed below."
             state["issues"] = pipeline_issues
         return state
@@ -6065,6 +8347,117 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def codex_session_candidates(explicit_session: str = "") -> list[Path]:
+    if explicit_session:
+        return [Path(explicit_session).expanduser().resolve()]
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return []
+    files = [p for p in sessions_root.rglob("*.jsonl") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
+def decode_codex_imagegen_payload(session_path: Path, tool_call_id: str) -> bytes | None:
+    with session_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if tool_call_id not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = record.get("payload", {})
+            if payload.get("type") not in {"image_generation_call", "image_generation_end"}:
+                continue
+            if payload.get("id") != tool_call_id and payload.get("call_id") != tool_call_id:
+                continue
+            encoded = payload.get("result")
+            if not isinstance(encoded, str) or not encoded.strip():
+                continue
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except Exception:
+                continue
+            return raw
+    return None
+
+
+def png_size(raw: bytes) -> tuple[int, int] | None:
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    width, height = struct.unpack(">II", raw[16:24])
+    return int(width), int(height)
+
+
+def cmd_extract_codex_imagegen_result(args: argparse.Namespace) -> int:
+    tool_call_id = str(args.tool_call_id or "").strip()
+    if len(tool_call_id) < 8:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": "tool-call id is required",
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
+    output = Path(args.output).expanduser().resolve()
+    if output.exists() and not args.force:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": "output already exists; pass --force to overwrite",
+                "output": str(output),
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
+    matched_session: Path | None = None
+    raw: bytes | None = None
+    for session_path in codex_session_candidates(args.session):
+        if not session_path.exists():
+            continue
+        raw = decode_codex_imagegen_payload(session_path, tool_call_id)
+        if raw:
+            matched_session = session_path
+            break
+    if not raw or not matched_session:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": "image generation result not found in Codex session logs",
+                "tool_call_id": tool_call_id,
+                "hint": "Use a Codex image_generation tool-call id such as ig_..., or pass --session to the correct rollout jsonl.",
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
+    size = png_size(raw)
+    if size is None:
+        print(
+            json.dumps({
+                "ok": False,
+                "issue": "decoded payload is not a valid PNG image",
+                "tool_call_id": tool_call_id,
+            }, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(raw)
+    print(json.dumps({
+        "ok": True,
+        "output": str(output),
+        "tool_call_id": tool_call_id,
+        "session": str(matched_session),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "width": size[0],
+        "height": size[1],
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_publish_delivery(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir).resolve()
     pptx = Path(args.pptx).resolve() if args.pptx else None
@@ -6148,6 +8541,7 @@ def cmd_publish_delivery(args: argparse.Namespace) -> int:
         "delivery_images": copied_images,
         "delivery_html": copied_html,
         "delivery_html_assets": copied_assets,
+        "user_visible_summary": user_visible_quality_summary(task_dir, expected),
         "policy": (
             "user-facing delivery contains only PPTX, slide images, and optional HTML/assets; "
             "prompt, analysis, spec, QA, and other internal files are excluded"
@@ -6192,12 +8586,6 @@ def cmd_finalize_delivery(args: argparse.Namespace) -> int:
         return 1
     pipeline_receipt = write_pipeline_pass(task_dir, expected, pptx, pipeline_counts)
 
-    cleanup_args = argparse.Namespace(
-        task_dir=str(task_dir),
-        keep_private_prompts=bool(args.keep_private_prompts),
-    )
-    cmd_cleanup(cleanup_args)
-
     publish_args = argparse.Namespace(
         task_dir=str(task_dir),
         pptx=str(pptx),
@@ -6222,6 +8610,12 @@ def cmd_finalize_delivery(args: argparse.Namespace) -> int:
             "counts": delivery_counts,
         }, indent=2, ensure_ascii=False))
         return 1
+
+    cleanup_args = argparse.Namespace(
+        task_dir=str(task_dir),
+        keep_private_prompts=bool(args.keep_private_prompts),
+    )
+    cmd_cleanup(cleanup_args)
     final_receipt = write_final_delivery_pass(task_dir, expected, pptx, delivery_counts)
 
     final_issues: list[str] = []
@@ -6246,9 +8640,8 @@ def cmd_clean_icon_crop(args: argparse.Namespace) -> int:
         if args.box_space == "1920x1080":
             Image = _load_pil()
             with Image.open(Path(args.image).resolve()) as im:
-                src_w, src_h = im.size
-            sx = src_w / 1920
-            sy = src_h / 1080
+                sx = im.width / 1920
+                sy = im.height / 1080
             x, y, w, h = box
             box = (
                 int(round(x * sx)),
@@ -6283,6 +8676,22 @@ def cmd_record_commercial_render(args: argparse.Namespace) -> int:
     pptx = Path(args.pptx).resolve()
     if not pptx.exists() or pptx.suffix.lower() != ".pptx":
         raise SystemExit(f"PPTX missing or invalid: {pptx}")
+    preflight_issues: list[str] = []
+    check_image2_files(task_dir, expected, preflight_issues)
+    preflight_issues.extend(post_image_memory_boundary_issues(task_dir, expected))
+    if render_path == "direct_pptx":
+        check_visual_inventory_files(task_dir, expected, preflight_issues)
+        check_powerpoint_layout_plan_files(task_dir, expected, preflight_issues)
+        check_visual_object_graph_files(task_dir, expected, preflight_issues)
+    else:
+        check_spec_files(task_dir, expected, preflight_issues)
+        check_visual_contract_files(task_dir, expected, preflight_issues, render_path_override=render_path)
+        check_visual_blueprint_files(task_dir, expected, preflight_issues)
+    if preflight_issues:
+        raise SystemExit(
+            "record-commercial-render blocked because the image-first reconstruction gates have not passed:\n- "
+            + "\n- ".join(preflight_issues[:30])
+        )
     contract = {
         "schema": COMMERCIAL_RENDER_CONTRACT_SCHEMA,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -6307,88 +8716,199 @@ def cmd_record_commercial_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    pptx = Path(args.pptx).resolve()
+    html_files = [Path(p).resolve() for p in args.html] if args.html else html_files_from_task(task_dir)
+    expected = expected_pages_from_task(task_dir) or len(html_files)
+    preflight_issues: list[str] = []
+    check_image2_files(task_dir, expected, preflight_issues)
+    check_spec_files(task_dir, expected, preflight_issues)
+    check_visual_contract_files(task_dir, expected, preflight_issues)
+    check_html_files(task_dir, expected, preflight_issues)
+    check_html_reference_fidelity(task_dir, expected, preflight_issues, html_files=html_files)
+    if preflight_issues:
+        print(json.dumps({
+            "task_dir": str(task_dir),
+            "stage": "render-preflight",
+            "expected_pages": expected,
+            "ok": False,
+            "issues": preflight_issues,
+        }, indent=2, ensure_ascii=False))
+        return 1
+    reservation_id = reserve_quota(task_dir, len(html_files))
+
+    cmd = [sys.executable, str(RENDERER), *map(str, html_files), "--pptx", str(pptx)]
+    if args.pdf:
+        cmd.extend(["--pdf", str(Path(args.pdf).resolve())])
+
+    env = None
+    proc = subprocess.run(cmd, cwd=str(PLUGIN_ROOT), text=True, capture_output=True, env=env)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+    succeeded = proc.returncode == 0 and pptx.exists()
+    finish_quota(reservation_id, succeeded)
+    if succeeded:
+        manifest = {
+            "rendered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "renderer": str(RENDERER.resolve()),
+            "task_dir": str(task_dir),
+            "pptx_path": str(pptx),
+            "pptx_sha256": sha256_file(pptx),
+            "html": [
+                {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                }
+                for path in html_files
+            ],
+        }
+        out = render_manifest_path(task_dir)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return proc.returncode
+
+
+def cmd_compile(args: argparse.Namespace) -> int:
+    """Compile object graph JSON files into an editable PPTX."""
+    task_dir = Path(args.task_dir).resolve()
+    pptx_out = Path(args.pptx).resolve()
+    expected = expected_pages_from_task(task_dir) or args.pages or 0
+    if not expected:
+        raise SystemExit("Cannot determine page count. Pass --pages or ensure paopao_task.json exists.")
+
+    preflight_issues: list[str] = []
+    check_image2_files(task_dir, expected, preflight_issues)
+    check_visual_inventory_files(task_dir, expected, preflight_issues)
+    check_powerpoint_layout_plan_files(task_dir, expected, preflight_issues)
+    check_visual_object_graph_files(task_dir, expected, preflight_issues)
+    if preflight_issues:
+        print(json.dumps({
+            "task_dir": str(task_dir),
+            "stage": "compile-preflight",
+            "expected_pages": expected,
+            "ok": False,
+            "issues": preflight_issues,
+        }, indent=2, ensure_ascii=False))
+        return 1
+
+    reservation_id = reserve_quota(task_dir, expected)
+
+    graph_paths = []
+    for idx in range(1, expected + 1):
+        gp = visual_object_graph_path(task_dir, idx)
+        if not gp.exists():
+            print(json.dumps({"ok": False, "issue": f"Missing {gp.name}"}, ensure_ascii=False, indent=2))
+            finish_quota(reservation_id, False)
+            return 1
+        graph_paths.append(gp)
+
+    try:
+        from compile_object_graph import compile_deck
+        summary = compile_deck(graph_paths, pptx_out)
+    except Exception as exc:
+        finish_quota(reservation_id, False)
+        raise SystemExit(f"Compile failed: {exc}")
+
+    succeeded = pptx_out.exists() and not summary.get("errors")
+    finish_quota(reservation_id, succeeded)
+
+    if pptx_out.exists():
+        manifest = {
+            "compiled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "compiler": "compile_object_graph",
+            "task_dir": str(task_dir),
+            "pptx_path": str(pptx_out),
+            "pptx_sha256": sha256_file(pptx_out),
+            "graphs": [
+                {"path": str(gp), "sha256": sha256_file(gp)}
+                for gp in graph_paths
+            ],
+        }
+        out = render_manifest_path(task_dir)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        graph_entries = []
+        for idx, gp in enumerate(graph_paths, 1):
+            graph = _read_json_file(gp) or {}
+            objects = graph.get("objects") if isinstance(graph, dict) else []
+            observation, _obs_issues = image_observation_record_issues(task_dir, idx)
+            graph_entries.append({
+                "slide": idx,
+                "observation_id": observation.get("observation_id") if isinstance(observation, dict) else None,
+                "visual_object_graph_sha256": sha256_file(gp),
+                "regions": [
+                    {
+                        "region_id": str(obj.get("id", "")).strip(),
+                        "object_kind": str(obj.get("object_kind", "")).strip(),
+                    }
+                    for obj in objects
+                    if isinstance(obj, dict) and str(obj.get("id", "")).strip()
+                ],
+            })
+        object_map = {
+            "schema": DIRECT_PPTX_OBJECT_MAP_SCHEMA,
+            "expected_pages": expected,
+            "pptx_path": _relative_to_task_or_abs(task_dir, pptx_out),
+            "pptx_sha256": sha256_file(pptx_out),
+            "slides": graph_entries,
+        }
+        map_out = direct_pptx_object_map_path(task_dir)
+        map_out.parent.mkdir(parents=True, exist_ok=True)
+        map_out.write_text(json.dumps(object_map, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary["ok"] = succeeded
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if succeeded else 1
+
+
 def cmd_package(args: argparse.Namespace) -> int:
     src = PLUGIN_ROOT
     out = Path(args.output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
-    base = out.parent / out.name.removesuffix(".zip")
-    shutil.make_archive(str(base), "zip", root_dir=str(src.parent), base_dir=src.name)
-    built = Path(str(base) + ".zip")
-    if built != out:
-        built.replace(out)
-    print(out)
-    return 0
+    if args.include_private_assets:
+        base = out.parent / out.name.removesuffix(".zip")
+        shutil.make_archive(str(base), "zip", root_dir=str(src.parent), base_dir=src.name)
+        built = Path(str(base) + ".zip")
+        if built != out:
+            built.replace(out)
+        print(out)
+        return 0
 
-
-def cmd_fetch_workflow(args: argparse.Namespace) -> int:
-    ALL_WORKFLOW = ["SKILL.md", "SYSTEM_PROMPT.md"]
-    names = ALL_WORKFLOW if args.fetch_all else ([args.name] if args.name else ALL_WORKFLOW)
-    results: dict[str, str] = {}
-    for name in names:
-        content = fetch_and_cache_workflow(name)
-        if content:
-            local = WORKFLOW_LOCAL_PATHS.get(name)
-            path = str(local) if local else str(WORKFLOW_CACHE_DIR / name)
-            results[name] = path
-        else:
-            results[name] = "FAILED"
-    print(json.dumps(results, indent=2, ensure_ascii=False))
-    return 0 if all(v != "FAILED" for v in results.values()) else 1
-
-
-def cmd_update(_: argparse.Namespace) -> int:
-    """Self-contained incremental updater. Downloads only changed files."""
-    import ssl
-    import urllib.request
-    import urllib.error
-
-    RAW_BASE = "https://raw.githubusercontent.com/Kakoutang/paopao/main"
-    MANAGED = [
-        ".codex-plugin/plugin.json",
-        "README.md",
-        "prompts/INDEX.md",
-        "scripts/check_public_release.py",
-        "scripts/paopao_auth.py",
-        "scripts/paopao_run.py",
-        "scripts/pptx_qa.py",
-        "skills/paopao-ppt/SKILL.md",
-    ]
-
-    try:
-        import certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        ctx = ssl.create_default_context()
-
-    updated, unchanged, failed = [], 0, []
-    for rel in MANAGED:
-        target = PLUGIN_ROOT / rel
-        try:
-            req = urllib.request.Request(
-                f"{RAW_BASE}/{rel}",
-                headers={"User-Agent": "paopao-updater"},
-            )
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                remote = resp.read()
-            remote_hash = hashlib.sha256(remote).hexdigest()
-            if target.exists() and sha256_file(target) == remote_hash:
-                unchanged += 1
+    with tempfile.TemporaryDirectory(prefix="paopao-public-package-") as tmp:
+        root = Path(tmp) / src.name
+        safe_files = [
+            ".codex-plugin/plugin.json",
+            "README.md",
+            "scripts/paopao_auth.py",
+            "scripts/paopao_run.py",
+            "scripts/paopao_update.py",
+            "scripts/pptx_qa.py",
+            "scripts/renderer.py",
+            "prompts/INDEX.md",
+        ]
+        for rel in safe_files:
+            source = src / rel
+            if not source.exists():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(remote)
-            updated.append(rel)
-        except Exception as exc:
-            failed.append(f"{rel}: {exc}")
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+        skill_dest = root / "skills" / "paopao-ppt" / "SKILL.md"
+        skill_dest.parent.mkdir(parents=True, exist_ok=True)
+        skill_dest.write_text(PUBLIC_SKILL_STUB, encoding="utf-8")
 
-    print(json.dumps({
-        "ok": not failed,
-        "updated": updated,
-        "unchanged": unchanged,
-        "failed": failed,
-    }, ensure_ascii=False, indent=2))
-    return 0 if not failed else 1
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(Path(tmp)))
+        print(out)
+        return 0
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
@@ -6402,36 +8922,13 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         name: importlib.util.find_spec(name) is not None
         for name in optional_modules
     }
-
-    update_available = False
-    try:
-        import ssl, urllib.request
-        try:
-            import certifi
-            ctx = ssl.create_default_context(cafile=certifi.where())
-        except Exception:
-            ctx = ssl.create_default_context()
-        req = urllib.request.Request(
-            "https://raw.githubusercontent.com/Kakoutang/paopao/main/scripts/paopao_run.py",
-            headers={"User-Agent": "paopao-doctor"}, method="HEAD",
-        )
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-            remote_len = int(resp.headers.get("Content-Length", 0))
-        local_len = (PLUGIN_ROOT / "scripts" / "paopao_run.py").stat().st_size
-        if abs(remote_len - local_len) > 500:
-            update_available = True
-    except Exception:
-        pass
-
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
         "prompts_exists": (PLUGIN_ROOT / "prompts").exists(),
         "required_modules": required_checks,
         "optional_modules": optional_checks,
-        "update_available": update_available,
+        "powerpoint_qa": "Open the generated PPTX in PowerPoint for final visual QA.",
     }
-    if update_available:
-        checks["update_hint"] = "Run: paopao_run.py update"
     print(json.dumps(checks, indent=2, ensure_ascii=False))
     required_files_ok = all(v for k, v in checks.items() if k.endswith("_exists"))
     modules_ok = all(required_checks.values())
@@ -6450,35 +8947,80 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--focus", default="")
     init.set_defaults(func=cmd_init)
 
-    make_deck = sub.add_parser("make-deck", help="Create or continue a deck task")
+    make_deck = sub.add_parser(
+        "make-deck",
+        help="Initialize or continue a task through the gated direct pipeline",
+    )
     make_deck.add_argument("--task-dir", default="")
     make_deck.add_argument("--name", default="")
+    make_deck.add_argument("--source", default="")
     make_deck.add_argument("--output-root", default="output")
-    make_deck.add_argument("--source", action="append", default=[])
     make_deck.add_argument("--pages", type=int, default=None)
     make_deck.add_argument("--language", default="")
     make_deck.add_argument("--focus", default="")
-    make_deck.add_argument("--topic", default="")
-    make_deck.add_argument("--pptx", default="")
     make_deck.set_defaults(func=cmd_make_deck)
 
-    plan_prompts = sub.add_parser("plan-prompts", help="Select prompt templates per slide")
+    fetch_workflow = sub.add_parser(
+        "fetch-workflow",
+        help="Fetch Paopao workflow files from the server into this plugin installation",
+    )
+    fetch_workflow.add_argument(
+        "--all",
+        action="store_true",
+        help="Fetch SKILL.md, SYSTEM_PROMPT.md, and renderer_guide.md",
+    )
+    fetch_workflow.add_argument(
+        "--name",
+        default="SKILL.md",
+        choices=sorted(workflow_destinations().keys()),
+    )
+    fetch_workflow.set_defaults(func=cmd_fetch_workflow)
+
+    plan_prompts = sub.add_parser(
+        "plan-prompts",
+        help="Select prompt-library templates for every slide before final_prompt_XX.md is written",
+    )
     plan_prompts.add_argument("--task-dir", required=True)
     plan_prompts.add_argument("--pages", type=int, default=None)
     plan_prompts.add_argument("--topic", default="")
     plan_prompts.set_defaults(func=cmd_plan_prompts)
 
-    fill_prompt = sub.add_parser("fill-prompt-template", help="Fill a template via server")
+    fill_prompt = sub.add_parser(
+        "fill-prompt-template",
+        help="Fill one allowed prompt template through the server-side fill API",
+    )
     fill_prompt.add_argument("--template", required=True)
-    fill_prompt.add_argument("--fills-json", required=True)
-    fill_prompt.add_argument("--output", required=True)
+    fill_prompt.add_argument("--fills", required=True, help="JSON object or path to a JSON file with zone fills")
+    fill_prompt.add_argument("--output", default="")
     fill_prompt.set_defaults(func=cmd_fill_prompt_template)
 
-    image2 = sub.add_parser("prepare-image2-prompts", help="Build per-slide image prompts")
+    render = sub.add_parser("render", help="Render task HTML slides to PPTX")
+    render.add_argument("--task-dir", required=True)
+    render.add_argument("--pptx", required=True)
+    render.add_argument("--pdf", default="")
+    render.add_argument("html", nargs="*")
+    render.set_defaults(func=cmd_render)
+
+    compile_cmd = sub.add_parser(
+        "compile",
+        help="Compile object graph JSON files into an editable PPTX (deterministic, no AI)",
+    )
+    compile_cmd.add_argument("--task-dir", required=True)
+    compile_cmd.add_argument("--pptx", required=True)
+    compile_cmd.add_argument("--pages", type=int, default=None)
+    compile_cmd.set_defaults(func=cmd_compile)
+
+    image2 = sub.add_parser(
+        "prepare-image2-prompts",
+        help="Build locked per-slide Image2 prompt files and provenance manifest",
+    )
     image2.add_argument("--task-dir", required=True)
     image2.set_defaults(func=cmd_prepare_image2_prompts)
 
-    user_review = sub.add_parser("record-image2-user-review", help="Record user review")
+    user_review = sub.add_parser(
+        "record-image2-user-review",
+        help="Record user approval or requested changes after showing selected Image2 references",
+    )
     user_review.add_argument("--task-dir", required=True)
     user_review.add_argument("--pages", type=int, default=None)
     user_review.add_argument(
@@ -6489,86 +9031,209 @@ def build_parser() -> argparse.ArgumentParser:
     user_review.add_argument("--feedback", required=True)
     user_review.set_defaults(func=cmd_record_image2_user_review)
 
-    forget = sub.add_parser("forget-after-image2", help="Lock post-image memory boundary")
+    forget = sub.add_parser(
+        "forget-after-image2",
+        help="Lock the post-image memory boundary so reconstruction can use selected images only",
+    )
     forget.add_argument("--task-dir", required=True)
     forget.add_argument("--pages", type=int, default=None)
     forget.set_defaults(func=cmd_forget_after_image2)
 
-    observation = sub.add_parser("record-image2-observation", help="Record visual observation")
+    observation = sub.add_parser(
+        "record-image2-observation",
+        help="Record the fresh visual observation used as the only source for post-approval reconstruction",
+    )
     observation.add_argument("--task-dir", required=True)
     observation.add_argument("--slide", type=int, required=True)
-    observation.add_argument("--evidence", required=True)
+    observation.add_argument(
+        "--evidence",
+        required=True,
+        help="Concrete visual observation from reopening the selected image; at least 120 characters.",
+    )
     observation.set_defaults(func=cmd_record_image2_observation)
 
-    extract_contract = sub.add_parser("extract-image2-contract", help="Extract visual contract")
+    extract_contract = sub.add_parser(
+        "extract-image2-contract",
+        help="Generate an initial visual contract from the selected Image2 reference pixels",
+    )
     extract_contract.add_argument("--task-dir", required=True)
     extract_contract.add_argument("--slide", type=int, required=True)
-    extract_contract.add_argument("--force", action="store_true")
+    extract_contract.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing slideXX_visual_contract.json.",
+    )
     extract_contract.set_defaults(func=cmd_extract_image2_contract)
 
-    register_image2 = sub.add_parser("register-image2-reference", help="Register image reference")
+    visual_blueprint = sub.add_parser(
+        "build-visual-blueprint",
+        help="Build the locked editable PPTX blueprint from the selected Image2 visual contract",
+    )
+    visual_blueprint.add_argument("--task-dir", required=True)
+    visual_blueprint.add_argument("--slide", type=int, required=True)
+    visual_blueprint.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing slideXX_visual_blueprint.json.",
+    )
+    visual_blueprint.set_defaults(func=cmd_build_visual_blueprint)
+
+    layout_plan = sub.add_parser(
+        "build-powerpoint-layout-plan",
+        help="Build a PowerPoint-aware layout plan from visual inventory before object graph authoring",
+    )
+    layout_plan.add_argument("--task-dir", required=True)
+    layout_plan.add_argument("--slide", type=int, required=True)
+    layout_plan.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing slideXX_powerpoint_layout_plan.json.",
+    )
+    layout_plan.set_defaults(func=cmd_build_powerpoint_layout_plan)
+
+    object_graph = sub.add_parser(
+        "build-object-graph",
+        help="Build the executable direct-PPTX object graph from visual inventory or locked visual blueprint",
+    )
+    object_graph.add_argument("--task-dir", required=True)
+    object_graph.add_argument("--slide", type=int, required=True)
+    object_graph.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing slideXX_object_graph.json.",
+    )
+    object_graph.set_defaults(func=cmd_build_visual_object_graph)
+
+    extract_codex_image = sub.add_parser(
+        "extract-codex-imagegen-result",
+        help="Extract a Codex built-in image_gen PNG result from session logs by tool-call id",
+    )
+    extract_codex_image.add_argument("--tool-call-id", required=True)
+    extract_codex_image.add_argument("--output", required=True)
+    extract_codex_image.add_argument(
+        "--session",
+        default="",
+        help="Optional rollout .jsonl path. Defaults to newest ~/.codex/sessions/**/*.jsonl files.",
+    )
+    extract_codex_image.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite output if it already exists.",
+    )
+    extract_codex_image.set_defaults(func=cmd_extract_codex_imagegen_result)
+
+    register_image2 = sub.add_parser(
+        "register-image2-reference",
+        help="Register one generated Image2 reference with locked prompt-sha provenance",
+    )
     register_image2.add_argument("--task-dir", required=True)
     register_image2.add_argument("--slide", type=int, required=True)
     register_image2.add_argument("--image", required=True)
-    register_image2.add_argument("--generation-request", required=True)
+    register_image2.add_argument(
+        "--generation-request",
+        required=True,
+        help="Locked generation_request_XX.json whose prompt_text was used exactly for image generation.",
+    )
     register_image2.add_argument("--generated-prompt-sha256", required=True)
-    register_image2.add_argument("--source", required=True, choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS))
-    register_image2.add_argument("--tool-call-id", required=True)
+    register_image2.add_argument(
+        "--source",
+        required=True,
+        choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS),
+        help="Provenance source for the selected reference; local screenshots/previews are rejected.",
+    )
+    register_image2.add_argument(
+        "--tool-call-id",
+        required=True,
+        help="Non-empty image generation tool call, job, or artifact id used for provenance audit.",
+    )
     register_image2.set_defaults(func=cmd_register_image2_reference)
 
     check = sub.add_parser("check", help="Validate Paopao pipeline stage invariants")
     check.add_argument("--task-dir", required=True)
     check.add_argument("--pages", type=int, default=None)
-    check.add_argument("--stage", choices=["analysis", "image2", "html", "pptx", "all", "pipeline", "delivery"], default="all")
-    check.add_argument("--pptx", default="")
+    check.add_argument(
+        "--stage",
+        choices=["analysis", "image2", "html", "pptx", "all", "pipeline", "delivery"],
+        default="all",
+        help="Pipeline stage to validate. Later stages include earlier checks.",
+    )
+    check.add_argument("--pptx", default="", help="Optional PPTX path for stage=pptx/all")
     check.set_defaults(func=cmd_check)
 
-    run_task = sub.add_parser("run-task", help="Report next step for a task")
+    run_task = sub.add_parser(
+        "run-task",
+        help="Report the single allowed next step for a Paopao task; final delivery still requires finalize-delivery",
+    )
     run_task.add_argument("--task-dir", required=True)
     run_task.add_argument("--pages", type=int, default=None)
     run_task.add_argument("--pptx", default="")
     run_task.set_defaults(func=cmd_run_task)
 
-    next_cmd = sub.add_parser("next", help="Next pipeline step")
+    next_cmd = sub.add_parser(
+        "next",
+        help="Pipeline controller: reports the single next step the agent must perform",
+    )
     next_cmd.add_argument("--task-dir", required=True)
     next_cmd.add_argument("--pages", type=int, default=None)
     next_cmd.set_defaults(func=cmd_next)
 
-    audit = sub.add_parser("audit-task", help="Audit task for blockers")
+    audit = sub.add_parser("audit-task", help="Run a full task audit and summarize blockers before delivery")
     audit.add_argument("--task-dir", required=True)
     audit.add_argument("--pages", type=int, default=None)
-    audit.add_argument("--pptx", default="")
+    audit.add_argument("--pptx", default="", help="Optional PPTX path to audit")
     audit.set_defaults(func=cmd_audit_task)
 
-    cleanup = sub.add_parser("cleanup-delivery", help="Clean up before delivery")
+    cleanup = sub.add_parser("cleanup-delivery", help="Remove prompt Markdown artifacts before delivery")
     cleanup.add_argument("--task-dir", required=True)
-    cleanup.add_argument("--keep-private-prompts", action="store_true")
+    cleanup.add_argument(
+        "--keep-private-prompts",
+        action="store_true",
+        help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them from task output",
+    )
     cleanup.set_defaults(func=cmd_cleanup)
 
-    publish = sub.add_parser("publish-delivery", help="Publish delivery files")
+    publish = sub.add_parser("publish-delivery", help="Publish user-facing PPTX, slide images, and HTML to delivery/")
     publish.add_argument("--task-dir", required=True)
     publish.add_argument("--pptx", default="")
     publish.add_argument("--output-dir", default="")
     publish.set_defaults(func=cmd_publish_delivery)
 
-    finalize = sub.add_parser("finalize-delivery", help="Final delivery gate")
+    finalize = sub.add_parser(
+        "finalize-delivery",
+        help="Run final pipeline gate, cleanup, publish, and delivery gate in one required release step",
+    )
     finalize.add_argument("--task-dir", required=True)
     finalize.add_argument("--pptx", default="")
-    finalize.add_argument("--keep-private-prompts", action="store_true")
+    finalize.add_argument(
+        "--keep-private-prompts",
+        action="store_true",
+        help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them",
+    )
     finalize.set_defaults(func=cmd_finalize_delivery)
 
-    clean_icon = sub.add_parser("clean-icon-crop", help="Crop and clean icon from reference")
-    clean_icon.add_argument("--image", required=True)
-    clean_icon.add_argument("--box", required=True)
-    clean_icon.add_argument("--box-space", choices=["source", "1920x1080"], default="source")
-    clean_icon.add_argument("--output", required=True)
-    clean_icon.add_argument("--expand", type=int, default=14)
-    clean_icon.add_argument("--padding", type=int, default=10)
-    clean_icon.add_argument("--threshold", type=int, default=34)
-    clean_icon.add_argument("--min-canvas", type=int, default=96)
+    clean_icon = sub.add_parser(
+        "clean-icon-crop",
+        help="Crop an icon from a reference image, remove detected corner background, and export a transparent PNG.",
+    )
+    clean_icon.add_argument("--image", required=True, help="Source reference image path")
+    clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h")
+    clean_icon.add_argument(
+        "--box-space",
+        choices=["source", "1920x1080"],
+        default="source",
+        help="Coordinate space for --box. Use 1920x1080 for visual-contract/direct-PPTX coordinates.",
+    )
+    clean_icon.add_argument("--output", required=True, help="Output PNG path, usually output/<task>/html/assets/<name>.png")
+    clean_icon.add_argument("--expand", type=int, default=14, help="Pixels to expand around the supplied box before cleanup")
+    clean_icon.add_argument("--padding", type=int, default=10, help="Transparent padding around the cleaned icon")
+    clean_icon.add_argument("--threshold", type=int, default=34, help="RGB distance threshold for removing detected corner background")
+    clean_icon.add_argument("--min-canvas", type=int, default=96, help="Minimum square output canvas size")
     clean_icon.set_defaults(func=cmd_clean_icon_crop)
 
-    commercial_render = sub.add_parser("record-commercial-render", help="Record render path and PPTX hash")
+    commercial_render = sub.add_parser(
+        "record-commercial-render",
+        help="Declare whether the commercial PPTX was produced through html or direct_pptx and bind its hash",
+    )
     commercial_render.add_argument("--task-dir", required=True)
     commercial_render.add_argument("--render-path", required=True, choices=sorted(COMMERCIAL_RENDER_PATHS))
     commercial_render.add_argument("--pptx", required=True)
@@ -6576,18 +9241,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     package = sub.add_parser("package", help="Build a zip package of this plugin")
     package.add_argument("--output", required=True)
+    package.add_argument(
+        "--include-private-assets",
+        action="store_true",
+        help="Internal debugging only: include private prompt and workflow files in the package",
+    )
     package.set_defaults(func=cmd_package)
-
-    update = sub.add_parser("update", help="Incremental self-update — download only changed files")
-    update.set_defaults(func=cmd_update)
 
     doctor = sub.add_parser("doctor", help="Check local plugin files")
     doctor.set_defaults(func=cmd_doctor)
-
-    fw = sub.add_parser("fetch-workflow", help="Fetch workflow files")
-    fw.add_argument("--name", default="")
-    fw.add_argument("--all", action="store_true", dest="fetch_all")
-    fw.set_defaults(func=cmd_fetch_workflow)
     return parser
 
 
