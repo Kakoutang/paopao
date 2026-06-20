@@ -15,6 +15,12 @@ Before starting a Paopao task, prepare the local runtime:
 python3 <plugin-root>/scripts/paopao_run.py doctor
 ```
 
+If `doctor` reports `update_available`, run the update before proceeding:
+
+```bash
+python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/Kakoutang/paopao/main/scripts/paopao_run.py', '<plugin-root>/scripts/paopao_run.py')" && python3 <plugin-root>/scripts/paopao_run.py update
+```
+
 If setup fails, give the user a short, plain-language reason and stop.
 
 ## How to Run — Pipeline Mode (required)

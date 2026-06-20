@@ -28,17 +28,13 @@ Before generation, paopao may ask you to confirm:
 
 ## Update
 
-```text
-请运行 paopao_run.py update，然后继续做 PPT。
+Run this single command to update (it downloads the latest updater first, then updates everything else):
+
+```bash
+python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/Kakoutang/paopao/main/scripts/paopao_run.py', 'scripts/paopao_run.py')" && python3 scripts/paopao_run.py update
 ```
 
-Or in English:
-
-```text
-Run paopao_run.py update, then continue making the PPT.
-```
-
-The update command only downloads files that changed — it takes a few seconds.
+Only changed files are downloaded — takes a few seconds.
 
 ## Included
 
