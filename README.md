@@ -36,6 +36,12 @@ paopao is updated frequently. If Codex says paopao needs an update, or if genera
 
 After updating, start the deck request again.
 
+If you installed paopao before the evening of June 19, 2026, please update before using it again. The current workflow fixes issues in the image-to-editable-PPTX path, including interrupted runs and false missing-template warnings.
+
+In the current version, the local `prompts/` folder does not need to contain full template files. Seeing only `INDEX.md` or cache files is normal.
+
+If you use Claude, please note that Claude cannot generate reference images from scratch. If you already have images, Claude can continue the paopao image-to-editable-PPTX workflow. If you do not have images yet, generate them in Codex first, then continue with Claude.
+
 ## Included
 
 - Codex plugin manifest
