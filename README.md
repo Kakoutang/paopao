@@ -38,9 +38,24 @@ After updating, start the deck request again.
 
 If you installed paopao before the evening of June 19, 2026, please update before using it again. The current workflow fixes issues in the image-to-editable-PPTX path, including interrupted runs and false missing-template warnings.
 
-In the current version, the local `prompts/` folder does not need to contain full template files. Seeing only `INDEX.md` or cache files is normal.
+In the current version, the local `prompts/` folder does not need to contain full template files. Seeing only `INDEX.md` or cache files is normal. Please do not check whether local template `.md` files are complete.
 
-If you use Claude, please note that Claude cannot generate reference images from scratch. If you already have images, Claude can continue the paopao image-to-editable-PPTX workflow. If you do not have images yet, generate them in Codex first, then continue with Claude.
+Older workflows are no longer maintained. Continuing with an old version may cause:
+
+- Missing-template warnings
+- Unnecessary access or activation prompts
+- Interrupted generation
+- Failure to call the current template filling workflow
+
+If you use Codex, tell it:
+
+```text
+Please reinstall the latest paopao plugin, then restart PPT generation. The new paopao does not require full template files in the local prompts/ folder; please do not check whether local template md files are complete.
+```
+
+If you use Claude, please note that paopao does not currently have a separate Claude plugin. Claude cannot generate reference images from scratch, but it can continue the downstream paopao workflow if you already have reference images. Please download the latest paopao files/instructions and provide them to Claude together with your reference images.
+
+Thank you for supporting paopao. We are continuing to fix issues and improve the product, and we hope to become your most useful AI PPT assistant.
 
 ## Included
 
