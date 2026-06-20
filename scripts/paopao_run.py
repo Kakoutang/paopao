@@ -27,7 +27,6 @@ import paopao_auth
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-RENDERER = PLUGIN_ROOT / "scripts" / "renderer.py"
 SYSTEM_PROMPT = PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md"
 PROMPT_LIBRARY_DIR = PLUGIN_ROOT / "prompts"
 WORKFLOW_CACHE_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao")) / "workflow"
@@ -402,23 +401,6 @@ ICON_CLASS_EDGE_HINTS = (
 )
 
 
-def auth_should_run() -> bool:
-    if os.getenv("PAOPAO_LOCAL_DEV") == "1":
-        return True
-    if os.getenv("PAOPAO_AUTH_REQUIRED") == "1":
-        return True
-    if open_preview_enabled() and not has_local_license():
-        return False
-    return (
-        bool(os.getenv("PAOPAO_AUTH_URL"))
-        or paopao_auth.LICENSE_PATH.exists()
-    )
-
-
-def open_preview_enabled() -> bool:
-    return os.getenv("PAOPAO_OPEN_PREVIEW", "1") != "0"
-
-
 def free_max_slides() -> int:
     raw = os.getenv("PAOPAO_FREE_MAX_SLIDES", "10").strip()
     try:
@@ -426,58 +408,6 @@ def free_max_slides() -> int:
     except ValueError:
         return 10
 
-
-def has_local_license() -> bool:
-    try:
-        data = paopao_auth.read_license()
-    except Exception:
-        return False
-    return bool(data.get("token") and data.get("server_url"))
-
-
-def reserve_quota(task_dir: Path, pages: int) -> str:
-    if os.getenv("PAOPAO_LOCAL_DEV") == "1":
-        result = paopao_auth.reserve(job_id=f"{task_dir.name}-{int(time.time())}", pages=pages)
-        return str(result.get("reservation_id", ""))
-    free_limit = free_max_slides()
-    if free_limit and pages > free_limit:
-        raise SystemExit(
-            f"当前体验额度支持最多 {free_limit} 页。"
-            "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
-            f"Your current access supports up to {free_limit} slides. "
-            "To continue with more pages, contact WeChat: sugarong_"
-        )
-    if not has_local_license():
-        if open_preview_enabled() and free_limit == 0:
-            return ""
-        if free_limit and pages <= free_limit:
-            return ""
-        if auth_should_run() or free_limit:
-            if free_limit == 0:
-                raise SystemExit(
-                    "当前访问状态需要先开通后才能继续生成。"
-                    "如果你需要帮助，可以联系微信 sugarong_。\n"
-                    "Current access needs activation before generation can continue. "
-                    "For help, contact WeChat: sugarong_."
-                )
-            raise SystemExit(
-                f"当前体验额度支持最多 {free_limit} 页。"
-                "如果你需要继续制作更多页面，可以联系微信 sugarong_ 开通更高额度。\n"
-                f"Your current access supports up to {free_limit} slides. "
-                "To continue with more pages, contact WeChat: sugarong_"
-            )
-    if not auth_should_run():
-        return ""
-    job_id = f"{task_dir.name}-{int(time.time())}"
-    result = paopao_auth.reserve(job_id=job_id, pages=pages)
-    return str(result.get("reservation_id", ""))
-
-
-def finish_quota(reservation_id: str, succeeded: bool) -> None:
-    if not reservation_id:
-        return
-    command = "commit" if succeeded else "cancel"
-    paopao_auth.finish_reservation(command, reservation_id)
 
 
 def slugify(name: str) -> str:
@@ -551,14 +481,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     )
     print(root)
     return 0
-
-
-def html_files_from_task(task_dir: Path) -> list[Path]:
-    html_dir = task_dir / "html"
-    files = sorted(html_dir.glob("slide*.html"))
-    if not files:
-        raise SystemExit(f"No slide*.html files found in {html_dir}")
-    return files
 
 
 def expected_pages_from_task(task_dir: Path) -> int | None:
@@ -1004,10 +926,6 @@ def get_system_prompt_sha() -> str:
     if SYSTEM_PROMPT.exists():
         return sha256_file(SYSTEM_PROMPT)
     return ""
-
-
-def prompt_template_path(name: str) -> Path:
-    return PROMPT_LIBRARY_DIR / name
 
 
 def read_prompt_template(name: str) -> str:
@@ -6389,61 +6307,6 @@ def cmd_record_commercial_render(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_render(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    pptx = Path(args.pptx).resolve()
-    html_files = [Path(p).resolve() for p in args.html] if args.html else html_files_from_task(task_dir)
-    expected = expected_pages_from_task(task_dir) or len(html_files)
-    preflight_issues: list[str] = []
-    check_image2_files(task_dir, expected, preflight_issues)
-    check_spec_files(task_dir, expected, preflight_issues)
-    check_visual_contract_files(task_dir, expected, preflight_issues)
-    check_html_files(task_dir, expected, preflight_issues)
-    check_html_reference_fidelity(task_dir, expected, preflight_issues, html_files=html_files)
-    if preflight_issues:
-        print(json.dumps({
-            "task_dir": str(task_dir),
-            "stage": "render-preflight",
-            "expected_pages": expected,
-            "ok": False,
-            "issues": preflight_issues,
-        }, indent=2, ensure_ascii=False))
-        return 1
-    reservation_id = reserve_quota(task_dir, len(html_files))
-
-    cmd = [sys.executable, str(RENDERER), *map(str, html_files), "--pptx", str(pptx)]
-    if args.pdf:
-        cmd.extend(["--pdf", str(Path(args.pdf).resolve())])
-
-    env = None
-    proc = subprocess.run(cmd, cwd=str(PLUGIN_ROOT), text=True, capture_output=True, env=env)
-    if proc.stdout:
-        print(proc.stdout)
-    if proc.stderr:
-        print(proc.stderr, file=sys.stderr)
-    succeeded = proc.returncode == 0 and pptx.exists()
-    finish_quota(reservation_id, succeeded)
-    if succeeded:
-        manifest = {
-            "rendered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "renderer": str(RENDERER.resolve()),
-            "task_dir": str(task_dir),
-            "pptx_path": str(pptx),
-            "pptx_sha256": sha256_file(pptx),
-            "html": [
-                {
-                    "path": str(path),
-                    "sha256": sha256_file(path),
-                }
-                for path in html_files
-            ],
-        }
-        out = render_manifest_path(task_dir)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return proc.returncode
-
-
 def cmd_package(args: argparse.Namespace) -> int:
     src = PLUGIN_ROOT
     out = Path(args.output).resolve()
@@ -6489,7 +6352,6 @@ def cmd_update(_: argparse.Namespace) -> int:
         "scripts/check_public_release.py",
         "scripts/paopao_auth.py",
         "scripts/paopao_run.py",
-        "scripts/paopao_update.py",
         "scripts/pptx_qa.py",
         "skills/paopao-ppt/SKILL.md",
     ]
@@ -6588,61 +6450,35 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--focus", default="")
     init.set_defaults(func=cmd_init)
 
-    make_deck = sub.add_parser(
-        "make-deck",
-        help="Public runtime controller: create or continue a deck task without skipping required gates",
-    )
-    make_deck.add_argument("--task-dir", default="", help="Existing task directory to continue")
-    make_deck.add_argument("--name", default="", help="Task name when creating a new task")
+    make_deck = sub.add_parser("make-deck", help="Create or continue a deck task")
+    make_deck.add_argument("--task-dir", default="")
+    make_deck.add_argument("--name", default="")
     make_deck.add_argument("--output-root", default="output")
-    make_deck.add_argument("--source", action="append", default=[], help="Source file or folder to copy into task/source")
+    make_deck.add_argument("--source", action="append", default=[])
     make_deck.add_argument("--pages", type=int, default=None)
     make_deck.add_argument("--language", default="")
     make_deck.add_argument("--focus", default="")
-    make_deck.add_argument("--topic", default="", help="Deck topic for deterministic prompt-template planning")
-    make_deck.add_argument("--pptx", default="", help="Final PPTX path when continuing late-stage QA/finalization")
+    make_deck.add_argument("--topic", default="")
+    make_deck.add_argument("--pptx", default="")
     make_deck.set_defaults(func=cmd_make_deck)
 
-    plan_prompts = sub.add_parser(
-        "plan-prompts",
-        help="Select prompt-library templates for every slide before final_prompt_XX.md is written",
-    )
+    plan_prompts = sub.add_parser("plan-prompts", help="Select prompt templates per slide")
     plan_prompts.add_argument("--task-dir", required=True)
     plan_prompts.add_argument("--pages", type=int, default=None)
     plan_prompts.add_argument("--topic", default="")
     plan_prompts.set_defaults(func=cmd_plan_prompts)
 
-    fill_prompt = sub.add_parser(
-        "fill-prompt-template",
-        help="Fill a selected template through the paopao design server without downloading raw template text",
-    )
+    fill_prompt = sub.add_parser("fill-prompt-template", help="Fill a template via server")
     fill_prompt.add_argument("--template", required=True)
-    fill_prompt.add_argument(
-        "--fills-json",
-        required=True,
-        help="JSON object or path to a JSON object mapping fill zone names to slide content.",
-    )
+    fill_prompt.add_argument("--fills-json", required=True)
     fill_prompt.add_argument("--output", required=True)
     fill_prompt.set_defaults(func=cmd_fill_prompt_template)
 
-    render = sub.add_parser("render", help="Render task HTML slides to PPTX")
-    render.add_argument("--task-dir", required=True)
-    render.add_argument("--pptx", required=True)
-    render.add_argument("--pdf", default="")
-    render.add_argument("html", nargs="*")
-    render.set_defaults(func=cmd_render)
-
-    image2 = sub.add_parser(
-        "prepare-image2-prompts",
-        help="Build locked per-slide Image2 prompt files and provenance manifest",
-    )
+    image2 = sub.add_parser("prepare-image2-prompts", help="Build per-slide image prompts")
     image2.add_argument("--task-dir", required=True)
     image2.set_defaults(func=cmd_prepare_image2_prompts)
 
-    user_review = sub.add_parser(
-        "record-image2-user-review",
-        help="Record user approval or requested changes after showing selected Image2 references",
-    )
+    user_review = sub.add_parser("record-image2-user-review", help="Record user review")
     user_review.add_argument("--task-dir", required=True)
     user_review.add_argument("--pages", type=int, default=None)
     user_review.add_argument(
@@ -6653,152 +6489,86 @@ def build_parser() -> argparse.ArgumentParser:
     user_review.add_argument("--feedback", required=True)
     user_review.set_defaults(func=cmd_record_image2_user_review)
 
-    forget = sub.add_parser(
-        "forget-after-image2",
-        help="Lock the post-image memory boundary so reconstruction can use selected images only",
-    )
+    forget = sub.add_parser("forget-after-image2", help="Lock post-image memory boundary")
     forget.add_argument("--task-dir", required=True)
     forget.add_argument("--pages", type=int, default=None)
     forget.set_defaults(func=cmd_forget_after_image2)
 
-    observation = sub.add_parser(
-        "record-image2-observation",
-        help="Record the fresh visual observation used as the only source for post-approval reconstruction",
-    )
+    observation = sub.add_parser("record-image2-observation", help="Record visual observation")
     observation.add_argument("--task-dir", required=True)
     observation.add_argument("--slide", type=int, required=True)
-    observation.add_argument(
-        "--evidence",
-        required=True,
-        help="Concrete visual observation from reopening the selected image; at least 120 characters.",
-    )
+    observation.add_argument("--evidence", required=True)
     observation.set_defaults(func=cmd_record_image2_observation)
 
-    extract_contract = sub.add_parser(
-        "extract-image2-contract",
-        help="Generate an initial visual contract from the selected Image2 reference pixels",
-    )
+    extract_contract = sub.add_parser("extract-image2-contract", help="Extract visual contract")
     extract_contract.add_argument("--task-dir", required=True)
     extract_contract.add_argument("--slide", type=int, required=True)
-    extract_contract.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing slideXX_visual_contract.json.",
-    )
+    extract_contract.add_argument("--force", action="store_true")
     extract_contract.set_defaults(func=cmd_extract_image2_contract)
 
-    register_image2 = sub.add_parser(
-        "register-image2-reference",
-        help="Register one generated Image2 reference with locked prompt-sha provenance",
-    )
+    register_image2 = sub.add_parser("register-image2-reference", help="Register image reference")
     register_image2.add_argument("--task-dir", required=True)
     register_image2.add_argument("--slide", type=int, required=True)
     register_image2.add_argument("--image", required=True)
-    register_image2.add_argument(
-        "--generation-request",
-        required=True,
-        help="Locked generation_request_XX.json whose prompt_text was used exactly for image generation.",
-    )
+    register_image2.add_argument("--generation-request", required=True)
     register_image2.add_argument("--generated-prompt-sha256", required=True)
-    register_image2.add_argument(
-        "--source",
-        required=True,
-        choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS),
-        help="Provenance source for the selected reference; local screenshots/previews are rejected.",
-    )
-    register_image2.add_argument(
-        "--tool-call-id",
-        required=True,
-        help="Non-empty image generation tool call, job, or artifact id used for provenance audit.",
-    )
+    register_image2.add_argument("--source", required=True, choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS))
+    register_image2.add_argument("--tool-call-id", required=True)
     register_image2.set_defaults(func=cmd_register_image2_reference)
 
     check = sub.add_parser("check", help="Validate Paopao pipeline stage invariants")
     check.add_argument("--task-dir", required=True)
     check.add_argument("--pages", type=int, default=None)
-    check.add_argument(
-        "--stage",
-        choices=["analysis", "image2", "html", "pptx", "all", "pipeline", "delivery"],
-        default="all",
-        help="Pipeline stage to validate. Later stages include earlier checks.",
-    )
-    check.add_argument("--pptx", default="", help="Optional PPTX path for stage=pptx/all")
+    check.add_argument("--stage", choices=["analysis", "image2", "html", "pptx", "all", "pipeline", "delivery"], default="all")
+    check.add_argument("--pptx", default="")
     check.set_defaults(func=cmd_check)
 
-    run_task = sub.add_parser(
-        "run-task",
-        help="Report the single allowed next step for a Paopao task; final delivery still requires finalize-delivery",
-    )
+    run_task = sub.add_parser("run-task", help="Report next step for a task")
     run_task.add_argument("--task-dir", required=True)
     run_task.add_argument("--pages", type=int, default=None)
     run_task.add_argument("--pptx", default="")
     run_task.set_defaults(func=cmd_run_task)
 
-    next_cmd = sub.add_parser(
-        "next",
-        help="Pipeline controller: reports the single next step the agent must perform",
-    )
+    next_cmd = sub.add_parser("next", help="Next pipeline step")
     next_cmd.add_argument("--task-dir", required=True)
     next_cmd.add_argument("--pages", type=int, default=None)
     next_cmd.set_defaults(func=cmd_next)
 
-    audit = sub.add_parser("audit-task", help="Run a full task audit and summarize blockers before delivery")
+    audit = sub.add_parser("audit-task", help="Audit task for blockers")
     audit.add_argument("--task-dir", required=True)
     audit.add_argument("--pages", type=int, default=None)
-    audit.add_argument("--pptx", default="", help="Optional PPTX path to audit")
+    audit.add_argument("--pptx", default="")
     audit.set_defaults(func=cmd_audit_task)
 
-    cleanup = sub.add_parser("cleanup-delivery", help="Remove prompt Markdown artifacts before delivery")
+    cleanup = sub.add_parser("cleanup-delivery", help="Clean up before delivery")
     cleanup.add_argument("--task-dir", required=True)
-    cleanup.add_argument(
-        "--keep-private-prompts",
-        action="store_true",
-        help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them from task output",
-    )
+    cleanup.add_argument("--keep-private-prompts", action="store_true")
     cleanup.set_defaults(func=cmd_cleanup)
 
-    publish = sub.add_parser("publish-delivery", help="Publish user-facing PPTX, slide images, and HTML to delivery/")
+    publish = sub.add_parser("publish-delivery", help="Publish delivery files")
     publish.add_argument("--task-dir", required=True)
     publish.add_argument("--pptx", default="")
     publish.add_argument("--output-dir", default="")
     publish.set_defaults(func=cmd_publish_delivery)
 
-    finalize = sub.add_parser(
-        "finalize-delivery",
-        help="Run final pipeline gate, cleanup, publish, and delivery gate in one required release step",
-    )
+    finalize = sub.add_parser("finalize-delivery", help="Final delivery gate")
     finalize.add_argument("--task-dir", required=True)
     finalize.add_argument("--pptx", default="")
-    finalize.add_argument(
-        "--keep-private-prompts",
-        action="store_true",
-        help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them",
-    )
+    finalize.add_argument("--keep-private-prompts", action="store_true")
     finalize.set_defaults(func=cmd_finalize_delivery)
 
-    clean_icon = sub.add_parser(
-        "clean-icon-crop",
-        help="Crop an icon from a reference image, remove detected corner background, and export a transparent PNG.",
-    )
-    clean_icon.add_argument("--image", required=True, help="Source reference image path")
-    clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h")
-    clean_icon.add_argument(
-        "--box-space",
-        choices=["source", "1920x1080"],
-        default="source",
-        help="Coordinate space for --box. Use 1920x1080 for visual-reference coordinates.",
-    )
-    clean_icon.add_argument("--output", required=True, help="Output PNG path, usually output/<task>/html/assets/<name>.png")
-    clean_icon.add_argument("--expand", type=int, default=14, help="Pixels to expand around the supplied box before cleanup")
-    clean_icon.add_argument("--padding", type=int, default=10, help="Transparent padding around the cleaned icon")
-    clean_icon.add_argument("--threshold", type=int, default=34, help="RGB distance threshold for removing detected corner background")
-    clean_icon.add_argument("--min-canvas", type=int, default=96, help="Minimum square output canvas size")
+    clean_icon = sub.add_parser("clean-icon-crop", help="Crop and clean icon from reference")
+    clean_icon.add_argument("--image", required=True)
+    clean_icon.add_argument("--box", required=True)
+    clean_icon.add_argument("--box-space", choices=["source", "1920x1080"], default="source")
+    clean_icon.add_argument("--output", required=True)
+    clean_icon.add_argument("--expand", type=int, default=14)
+    clean_icon.add_argument("--padding", type=int, default=10)
+    clean_icon.add_argument("--threshold", type=int, default=34)
+    clean_icon.add_argument("--min-canvas", type=int, default=96)
     clean_icon.set_defaults(func=cmd_clean_icon_crop)
 
-    commercial_render = sub.add_parser(
-        "record-commercial-render",
-        help="Declare whether the commercial PPTX was produced through html or direct_pptx and bind its hash",
-    )
+    commercial_render = sub.add_parser("record-commercial-render", help="Record render path and PPTX hash")
     commercial_render.add_argument("--task-dir", required=True)
     commercial_render.add_argument("--render-path", required=True, choices=sorted(COMMERCIAL_RENDER_PATHS))
     commercial_render.add_argument("--pptx", required=True)
@@ -6814,9 +6584,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check local plugin files")
     doctor.set_defaults(func=cmd_doctor)
 
-    fw = sub.add_parser("fetch-workflow", help="Fetch workflow files from server")
-    fw.add_argument("--name", default="", help="Single file name (SKILL.md or SYSTEM_PROMPT.md)")
-    fw.add_argument("--all", action="store_true", dest="fetch_all", help="Fetch all workflow files")
+    fw = sub.add_parser("fetch-workflow", help="Fetch workflow files")
+    fw.add_argument("--name", default="")
+    fw.add_argument("--all", action="store_true", dest="fetch_all")
     fw.set_defaults(func=cmd_fetch_workflow)
     return parser
 
