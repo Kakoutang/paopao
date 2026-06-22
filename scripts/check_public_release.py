@@ -20,7 +20,6 @@ ALLOWED_TRACKED = {
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
     "scripts/pptx_qa.py",
-    "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
     ".github/workflows/public-release-guard.yml",
@@ -95,7 +94,6 @@ def text_issues(path: str) -> list[str]:
     if path in {
         "scripts/paopao_run.py",
         "scripts/pptx_qa.py",
-        "scripts/renderer.py",
         "prompts/SYSTEM_PROMPT.md",
         "skills/paopao-ppt/SKILL.md",
         "CLAUDE.md",
