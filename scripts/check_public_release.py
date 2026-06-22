@@ -20,6 +20,7 @@ ALLOWED_TRACKED = {
     "scripts/paopao_auth.py",
     "scripts/paopao_run.py",
     "scripts/pptx_qa.py",
+    "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
     "prompts/INDEX.md",
     ".github/workflows/public-release-guard.yml",
@@ -133,6 +134,13 @@ def main() -> int:
         if pattern:
             issues.append(f"tracked forbidden file {path} matched {pattern}")
         issues.extend(text_issues(path))
+
+    renderer = ROOT / "scripts" / "renderer.py"
+    if renderer.exists() and renderer.stat().st_size > 5000:
+        issues.append(
+            f"scripts/renderer.py is {renderer.stat().st_size} bytes — looks like the full engine, not the bootstrap stub. "
+            "Only the thin bootstrap (<5KB) is allowed in the public repo."
+        )
 
     for path in all_worktree_files():
         pattern = matches_forbidden(path)
