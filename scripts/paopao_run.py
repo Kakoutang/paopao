@@ -1340,7 +1340,7 @@ def load_prompt_catalog() -> list[dict[str, object]]:
     if os.getenv("PAOPAO_LOCAL_DEV") != "1":
         try:
             remote = paopao_auth.fetch_prompt_catalog()
-            prompts = remote.get("prompts", [])
+            prompts = remote if isinstance(remote, list) else remote.get("prompts", [])
             if isinstance(prompts, list):
                 catalog: list[dict[str, object]] = []
                 for item in prompts:
@@ -1634,7 +1634,7 @@ def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
         result = paopao_auth.fill_prompt_template(args.template, fills)
     except paopao_auth.AuthError as exc:
         raise SystemExit(str(exc)) from exc
-    content = str(result.get("filled_content", "")).strip()
+    content = str(result.get("filled_content", "") if isinstance(result, dict) else result).strip()
     if not content:
         raise SystemExit("Prompt fill returned empty content.")
     if not PROMPT_TEMPLATE_RE.search(content):
@@ -8685,11 +8685,21 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["issues"] = contract_issues
             return state
 
+        delivery_dir = task_dir / "delivery"
+        delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
+        if delivery_pptx:
+            state["step"] = "finalize"
+            state["step_number"] = 5
+            state["instruction"] = "All checks passed. Delivery is ready."
+            return state
+
         state["step"] = "review"
         state["step_number"] = 4
         state["instruction"] = (
             "Open the browser HTML preview and the actual PPTX preview. If PPTX differs from the browser render, "
-            "fix renderer behavior or rerender from HTML; do not switch to Image2."
+            "fix renderer behavior or rerender from HTML; do not switch to Image2.\n"
+            "When review is complete, run:\n"
+            "  paopao_run.py finalize-delivery --task-dir <dir> --pptx pptx/deck.pptx"
         )
         return state
 

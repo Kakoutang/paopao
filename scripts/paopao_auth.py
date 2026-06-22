@@ -74,6 +74,10 @@ def write_license(data: dict[str, Any]) -> None:
         pass
 
 
+def auth_token() -> str:
+    return str(read_license().get("token", "") or "")
+
+
 def server_url(value: str = "") -> str:
     url = value or os.getenv("PAOPAO_AUTH_URL") or read_license().get("server_url", "") or DEFAULT_SERVER_URL
     return str(url).rstrip("/")
@@ -236,6 +240,10 @@ def fill_prompt_template(name: str, fills: dict[str, str]) -> str:
         token=token,
     )
     return result.get("filled_content", "")
+
+
+def fetch_workflow_file(name: str) -> dict[str, Any]:
+    return request_json("GET", f"{server_url()}/workflow/{name}", token=auth_token())
 
 
 def fetch_workflow_content(name: str) -> str:
