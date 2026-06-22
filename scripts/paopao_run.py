@@ -1279,6 +1279,19 @@ DECK NAVIGATION CONTRACT:
 """.rstrip()
 
 
+def compact_deck_navigation_contract(task_dir: Path, idx: int, expected: int) -> dict[str, object]:
+    labels = deck_navigation_labels(task_dir, expected) if expected else []
+    return {
+        "style": "slim #305496 top nav, white text, active label underlined/accented, right page number",
+        "active": f"{idx:02d} / {expected}",
+        "labels": [
+            {"idx": pos, "label": label, "active": pos == idx}
+            for pos, label in enumerate(labels, 1)
+        ],
+        "html": "semantic nav with data-ref-id=\"nav\"",
+    }
+
+
 def image_dimensions(path: Path) -> tuple[int, int] | None:
     try:
         with path.open("rb") as f:
@@ -2115,6 +2128,10 @@ def html_generation_request_path(task_dir: Path, idx: int) -> Path:
 
 def html_compact_packet_path(task_dir: Path, idx: int) -> Path:
     return task_dir / "qa" / "html_generation_requests" / f"html_compact_packet_{idx:02d}.md"
+
+
+def html_compact_provenance_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "qa" / "html_generation_requests" / f"html_compact_provenance_{idx:02d}.json"
 
 
 def html_compact_renderer_guide_path(task_dir: Path) -> Path:
@@ -6244,6 +6261,20 @@ def check_html_generation_manifest(task_dir: Path, expected: int, issues: list[s
             issues.append(f"html generation manifest slide {idx}: locked HTML prompt packet missing")
         elif entry.get("prompt_packet_sha256") != sha256_file(prompt_packet):
             issues.append(f"html generation manifest slide {idx}: prompt_packet_sha256 does not match locked HTML prompt packet")
+        compact_packet = html_compact_packet_path(task_dir, idx)
+        if entry.get("compact_packet_path") != str(compact_packet.relative_to(task_dir)):
+            issues.append(f"html generation manifest slide {idx}: compact_packet_path must point to qa/html_generation_requests/html_compact_packet_{idx:02d}.md")
+        if not compact_packet.exists():
+            issues.append(f"html generation manifest slide {idx}: compact HTML packet missing")
+        elif entry.get("compact_packet_sha256") != sha256_file(compact_packet):
+            issues.append(f"html generation manifest slide {idx}: compact_packet_sha256 does not match compact HTML packet")
+        compact_provenance = html_compact_provenance_path(task_dir, idx)
+        if entry.get("compact_provenance_path") != str(compact_provenance.relative_to(task_dir)):
+            issues.append(f"html generation manifest slide {idx}: compact_provenance_path must point to qa/html_generation_requests/html_compact_provenance_{idx:02d}.json")
+        if not compact_provenance.exists():
+            issues.append(f"html generation manifest slide {idx}: compact provenance missing")
+        elif entry.get("compact_provenance_sha256") != sha256_file(compact_provenance):
+            issues.append(f"html generation manifest slide {idx}: compact_provenance_sha256 does not match compact provenance")
         packet_id = str(entry.get("prompt_packet_id", "") or "")
         if not packet_id:
             issues.append(f"html generation manifest slide {idx}: prompt_packet_id missing")
@@ -9490,12 +9521,15 @@ def cmd_register_html(args: argparse.Namespace) -> int:
         html_path = task_dir / "html" / f"slide{idx:02d}.html"
         prompt_packet = html_generation_request_path(task_dir, idx)
         compact_packet = html_compact_packet_path(task_dir, idx)
+        compact_provenance = html_compact_provenance_path(task_dir, idx)
         if not final_prompt.exists() or not read_text(final_prompt).strip():
             raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
         if not prompt_packet.exists():
             raise SystemExit(f"html_prompt_packet_{idx:02d}.md missing; run generate-html first")
         if not compact_packet.exists():
             raise SystemExit(f"html_compact_packet_{idx:02d}.md missing; run generate-html or compact-html-packet first")
+        if not compact_provenance.exists():
+            raise SystemExit(f"html_compact_provenance_{idx:02d}.json missing; run generate-html first")
         if not html_path.exists() or not read_text(html_path).strip():
             raise SystemExit(f"html/slide{idx:02d}.html missing or empty")
         prompt_packet_id = sha256_text("|".join([
@@ -9538,6 +9572,8 @@ def cmd_register_html(args: argparse.Namespace) -> int:
             "prompt_packet_sha256": sha256_file(prompt_packet),
             "compact_packet_path": str(compact_packet.relative_to(task_dir)),
             "compact_packet_sha256": sha256_file(compact_packet),
+            "compact_provenance_path": str(compact_provenance.relative_to(task_dir)),
+            "compact_provenance_sha256": sha256_file(compact_provenance),
             "generator": "codex_host_model_compact_packet",
             "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
@@ -9624,6 +9660,182 @@ def _extract_prompt_header(final_prompt_text: str) -> dict[str, str]:
     return fields
 
 
+def _match_zone_label(line: str, zone_names: list[str]) -> str | None:
+    label = line.strip()
+    if not label or ":" not in label:
+        return None
+    left = label.split(":", 1)[0].strip()
+    left_upper = left.upper()
+    for zone in zone_names:
+        zone_upper = zone.upper()
+        if left_upper == zone_upper or left_upper.startswith(zone_upper + " "):
+            return zone
+    return None
+
+
+def _split_compact_items(text: str) -> list[str]:
+    parts = []
+    for part in re.split(r"\s*[;|]\s*", text or ""):
+        cleaned = part.strip()
+        if cleaned.startswith("- ") or cleaned.startswith("• "):
+            cleaned = cleaned[2:].strip()
+        parts.append(cleaned)
+    return [part for part in parts if part]
+
+
+def _number_lead(text: str) -> tuple[str, str]:
+    match = re.match(r"^([+-]?\d[\d,.]*(?:\.\d+)?%?|[+-]?\d[\d,.]*(?:\.\d+)?)\s*(.*)$", text.strip())
+    if not match:
+        return "", text.strip()
+    return match.group(1).strip(), match.group(2).strip(" :-")
+
+
+def _chart_specs_from_text(text: str) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    for raw in re.split(r"\bChart\s+\d+\s*:", text or "", flags=re.IGNORECASE):
+        chunk = raw.strip(" .")
+        if not chunk:
+            continue
+        years = re.findall(r"\b(20\d{2})\b", chunk)
+        numbers = re.findall(r"[+-]?\d[\d,]*(?:\.\d+)?%?", chunk)
+        values = [n for n in numbers if n not in years]
+        specs.append({
+            "chart_type": "bar",
+            "description": chunk,
+            "categories": years[:4],
+            "values": values[:6],
+            "html_hint": "Use visible bars/lines with labels; do not replace this chart with plain text only.",
+        })
+    return specs
+
+
+def _detail_rows_from_text(text: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    row_markers = [
+        ("Key metrics", r"Key Metrics:\s*(.*?)(?=\s*Key Activities:|\s*Status/Risk:|$)"),
+        ("Key activities", r"Key Activities:\s*(.*?)(?=\s*Status/Risk:|$)"),
+        ("Status / risk", r"Status/Risk:\s*(.*)$"),
+    ]
+    for label, pattern in row_markers:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            rows.append({"label": label, "cells": _split_compact_items(match.group(1))})
+    return rows
+
+
+def _zone_render_hint(zone: str, content: str, layout_name: str) -> dict[str, object]:
+    zone_upper = zone.upper()
+    hint: dict[str, object] = {"role": "text"}
+    if "METRIC" in zone_upper and "CARD" in zone_upper:
+        cards = []
+        for item in _split_compact_items(content):
+            metric, label = _number_lead(item)
+            cards.append({"metric": metric, "label": label or item})
+        hint.update({
+            "role": "metric_cards",
+            "cards": cards,
+            "html_hint": "Render as equal-width metric cards with large metric, concise label, and a small badge only when useful.",
+        })
+    elif "CHART" in zone_upper:
+        hint.update({
+            "role": "charts",
+            "charts": _chart_specs_from_text(content),
+            "html_hint": "Build visible chart geometry from the extracted categories/values; avoid blank chart panels.",
+        })
+    elif "STAGE HEADER" in zone_upper:
+        hint.update({
+            "role": "process_stages",
+            "stages": _split_compact_items(content),
+            "html_hint": "Render as connected chevrons or a clear horizontal process row.",
+        })
+    elif "DETAIL GRID" in zone_upper:
+        hint.update({
+            "role": "detail_grid",
+            "rows": _detail_rows_from_text(content),
+            "html_hint": "Render as an aligned table/grid; keep row labels fixed and columns aligned to stages.",
+        })
+    elif "COMMENTARY" in zone_upper:
+        hint.update({
+            "role": "commentary",
+            "html_hint": "Render as a compact commentary band or cards, not a large empty panel.",
+        })
+    elif zone_upper in {"TITLE", "BOTTOM", "SOURCE"}:
+        hint["role"] = zone_upper.lower()
+    if layout_name:
+        hint["layout_name"] = layout_name
+    return hint
+
+
+def _extract_final_prompt_execution_zones(
+    final_prompt_text: str,
+    zone_contract: dict[str, object],
+    header: dict[str, str],
+) -> list[dict[str, object]]:
+    zones = zone_contract.get("zones")
+    if not isinstance(zones, list):
+        zones = []
+    zone_names = [str(item.get("zone", "")).strip() for item in zones if isinstance(item, dict) and item.get("zone")]
+    filled: dict[str, str] = {}
+    current_zone: str | None = None
+    capturing_zone: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal capturing_zone, buffer
+        if capturing_zone:
+            content = "\n".join(buffer).strip()
+            if content:
+                filled[capturing_zone] = content
+        capturing_zone = None
+        buffer = []
+
+    hard_stop_prefixes = (
+        "DESIGN:",
+        "VISUAL STYLE:",
+        "LAYOUT_NAME:",
+        "WHEN_TO_USE:",
+        "DATA_REQUIRES:",
+        "PROMPT_TEMPLATE:",
+        "FILL_ORIGIN:",
+    )
+    for raw_line in final_prompt_text.splitlines():
+        stripped = raw_line.strip()
+        matched_zone = _match_zone_label(stripped, zone_names)
+        if matched_zone:
+            flush()
+            current_zone = matched_zone
+            continue
+        if stripped.upper() == "FILLED_CONTENT:":
+            flush()
+            capturing_zone = current_zone
+            buffer = []
+            continue
+        if capturing_zone and stripped.upper().startswith(hard_stop_prefixes):
+            flush()
+            current_zone = None
+            continue
+        if capturing_zone:
+            buffer.append(raw_line)
+    flush()
+
+    fallback = {
+        "TITLE": header.get("title", ""),
+        "BOTTOM": header.get("bottom", ""),
+        "Source": header.get("source", ""),
+        "SOURCE": header.get("source", ""),
+    }
+    layout_name = str(zone_contract.get("layout_name") or header.get("layout_name") or "")
+    execution_zones: list[dict[str, object]] = []
+    for zone in zone_names:
+        content = filled.get(zone) or fallback.get(zone) or ""
+        execution_zones.append({
+            "zone": zone,
+            "content": content,
+            "render_hint": _zone_render_hint(zone, content, layout_name),
+        })
+    return execution_zones
+
+
 def write_compact_renderer_guide(task_dir: Path) -> Path:
     path = html_compact_renderer_guide_path(task_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -9648,43 +9860,56 @@ def write_html_compact_packet(
     final_prompt_text = read_text(final_prompt)
     header = _extract_prompt_header(final_prompt_text)
     guide_path = write_compact_renderer_guide(task_dir)
-    compact = {
-        "schema": "paopao.html_compact_packet.v1",
-        "purpose": "Token-saving work order for the HTML composer. The full locked packet remains the provenance source.",
+    zone_contract = prompt_zone_contract_for_slide(task_dir, idx)
+    execution_zones = _extract_final_prompt_execution_zones(final_prompt_text, zone_contract, header)
+    provenance = {
+        "schema": "paopao.html_compact_provenance.v1",
         "task_name": task_dir.name,
         "slide": idx,
-        "expected_pages": expected,
-        "language": str(task_manifest.get("language", "") or ""),
-        "focus": str(task_manifest.get("focus", "") or ""),
-        "output_html_path": str(html_path.relative_to(task_dir)),
         "full_prompt_packet_path": str(prompt_packet.relative_to(task_dir)),
         "full_prompt_packet_sha256": sha256_file(prompt_packet) if prompt_packet.exists() else "",
         "prompt_packet_id": prompt_packet_id,
-        "required_html_marker": required_marker,
         "renderer_compact_guide": str(guide_path.relative_to(task_dir)),
         "renderer_compact_guide_sha256": sha256_file(guide_path),
         "final_prompt_path": str(final_prompt.relative_to(task_dir)),
         "final_prompt_sha256": sha256_file(final_prompt),
-        "prompt_header": header,
-        "navigation_contract": build_deck_navigation_contract(task_dir, idx),
-        "zone_execution_contract": prompt_zone_contract_for_slide(task_dir, idx),
+        "prompt_meta": {
+            "fill_origin": header.get("fill_origin", ""),
+            "prompt_template": header.get("prompt_template", ""),
+            "layout_name": header.get("layout_name", ""),
+        },
+    }
+    provenance_path = html_compact_provenance_path(task_dir, idx)
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance_text = json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True)
+    if not provenance_path.exists() or read_text(provenance_path) != provenance_text:
+        provenance_path.write_text(provenance_text, encoding="utf-8")
+    compact = {
+        "schema": "paopao.html_compact_packet.v1",
+        "purpose": "Executable HTML work order for the agent. Provenance/hash fields are intentionally kept out of this file.",
+        "slide": idx,
+        "expected_pages": expected,
+        "language": str(task_manifest.get("language", "") or ""),
+        "output_html_path": str(html_path.relative_to(task_dir)),
+        "required_html_marker": required_marker,
+        "renderer_compact_guide": str(guide_path.relative_to(task_dir)),
+        "layout_name": header.get("layout_name", "") or str(zone_contract.get("layout_name") or ""),
+        "navigation": compact_deck_navigation_contract(task_dir, idx, expected),
+        "execution_zones": execution_zones,
         "composer_rules": [
-            "Generate one complete HTML slide only.",
-            "Use the exact required_html_marker in <head>.",
-            "Use only the final_prompt below plus this compact packet; do not consult analysis, PDF/source, old drafts, or memory.",
+            "Generate one complete HTML slide.",
+            "Use required_html_marker in <head>.",
+            "Use execution_zones only; do not reopen final_prompt, analysis, PDF/source, old drafts, or memory.",
+            "Charts must use render_hint.charts and visible marks; no blank chart panels.",
+            "Metric/process/grid zones must use render_hint.cards/stages/rows directly.",
             f"Every required zone must appear as an element with {HTML_ZONE_ATTR}.",
-            "Use compact renderer guide rules; do not open the full renderer guide unless blocked.",
+            "Use compact renderer guide only unless blocked.",
         ],
-        "final_prompt": final_prompt_text,
     }
     text = "\n".join([
         "# Paopao Compact HTML Packet",
-        "",
-        "Read this file instead of the full locked HTML prompt packet when composing HTML.",
-        "The full packet is still recorded for provenance and registration.",
-        "",
         "```json",
-        json.dumps(compact, ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         "```",
         "",
     ])
