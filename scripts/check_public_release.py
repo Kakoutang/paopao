@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_TRACKED = {
     ".codex-plugin/plugin.json",
     ".gitignore",
+    "CLAUDE.md",
     "README.md",
     "scripts/check_public_release.py",
     "scripts/compile_object_graph.py",
@@ -93,11 +94,11 @@ def text_issues(path: str) -> list[str]:
     if path == "scripts/check_public_release.py":
         return []
     if path in {
+        "CLAUDE.md",
         "scripts/paopao_run.py",
         "scripts/pptx_qa.py",
         "prompts/SYSTEM_PROMPT.md",
         "skills/paopao-ppt/SKILL.md",
-        "CLAUDE.md",
     }:
         text_forbidden = [
             "paopao-internal",
