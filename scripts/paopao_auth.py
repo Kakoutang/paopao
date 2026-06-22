@@ -74,13 +74,13 @@ def write_license(data: dict[str, Any]) -> None:
         pass
 
 
-def auth_token() -> str:
-    return str(read_license().get("token", "") or "")
-
-
 def server_url(value: str = "") -> str:
     url = value or os.getenv("PAOPAO_AUTH_URL") or read_license().get("server_url", "") or DEFAULT_SERVER_URL
     return str(url).rstrip("/")
+
+
+def auth_token() -> str:
+    return str(read_license().get("token", "") or "")
 
 
 def request_json(method: str, url: str, payload: dict[str, Any] | None = None, token: str = "") -> dict[str, Any]:
@@ -198,6 +198,23 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
     return result
 
 
+def fetch_prompt_catalog() -> dict[str, Any]:
+    return request_json("GET", f"{server_url()}/prompts/catalog", token=auth_token())
+
+
+def fill_prompt_template(template: str, fills: dict[str, str]) -> dict[str, Any]:
+    return request_json(
+        "POST",
+        f"{server_url()}/prompts/fill",
+        {"template": template, "fills": fills},
+        token=auth_token(),
+    )
+
+
+def fetch_workflow_file(name: str) -> dict[str, Any]:
+    return request_json("GET", f"{server_url()}/workflow/{name}", token=auth_token())
+
+
 def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     if reservation_id == "local-dev":
         return {"ok": True, "license": {"remaining_pages": 999999}}
@@ -215,43 +232,6 @@ def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     data["license"] = result.get("license", data.get("license", {}))
     write_license(data)
     return result
-
-
-def fetch_prompt_catalog() -> list[dict[str, Any]]:
-    data = read_license()
-    token = data.get("token", "")
-    base = server_url()
-    if not base:
-        return []
-    result = request_json("GET", f"{base}/prompts/catalog", token=token)
-    return result.get("prompts", [])
-
-
-def fill_prompt_template(name: str, fills: dict[str, str]) -> str:
-    data = read_license()
-    token = data.get("token", "")
-    base = server_url()
-    if not base:
-        raise AuthError("no server URL configured")
-    result = request_json(
-        "POST",
-        f"{base}/prompts/fill",
-        payload={"template": name, "fills": fills},
-        token=token,
-    )
-    return result.get("filled_content", "")
-
-
-def fetch_workflow_file(name: str) -> dict[str, Any]:
-    return request_json("GET", f"{server_url()}/workflow/{name}", token=auth_token())
-
-
-def fetch_workflow_content(name: str) -> str:
-    base = server_url()
-    if not base:
-        return ""
-    result = request_json("GET", f"{base}/workflow/{name}")
-    return result.get("content", "")
 
 
 def logout() -> None:

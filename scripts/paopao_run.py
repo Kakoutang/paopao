@@ -1337,40 +1337,39 @@ def parse_data_requires(text: str) -> list[str]:
 
 
 def load_prompt_catalog() -> list[dict[str, object]]:
-    if os.getenv("PAOPAO_LOCAL_DEV") != "1":
-        try:
-            remote = paopao_auth.fetch_prompt_catalog()
-            prompts = remote if isinstance(remote, list) else remote.get("prompts", [])
-            if isinstance(prompts, list):
-                catalog: list[dict[str, object]] = []
-                for item in prompts:
-                    if not isinstance(item, dict):
-                        continue
-                    template = str(item.get("template", ""))
-                    data_requires_raw = item.get("data_requires", "")
-                    data_requires = (
-                        parse_data_requires(f"DATA_REQUIRES: {data_requires_raw}")
-                        if isinstance(data_requires_raw, str)
-                        else []
-                    )
-                    catalog.append({
-                        "template": template,
-                        "layout_name": str(item.get("layout_name", "") or Path(template).stem),
-                        "family": prompt_scaffold_family(template),
-                        "when_to_use": str(item.get("when_to_use", ""))[:320],
-                        "data_requires": data_requires,
-                        "free": bool(item.get("free")),
-                        "fill_zones": item.get("fill_zones", []),
-                        "layout_description": item.get("layout_description", ""),
-                    })
-                if catalog:
-                    return catalog
-        except paopao_auth.AuthError as exc:
-            if not any(
-                p.name not in {"SYSTEM_PROMPT.md", "INDEX.md"}
-                for p in PROMPT_LIBRARY_DIR.glob("*.md")
-            ):
-                raise SystemExit(str(exc)) from exc
+    try:
+        remote = paopao_auth.fetch_prompt_catalog()
+        prompts = remote if isinstance(remote, list) else remote.get("prompts", [])
+        if isinstance(prompts, list):
+            catalog: list[dict[str, object]] = []
+            for item in prompts:
+                if not isinstance(item, dict):
+                    continue
+                template = str(item.get("template", ""))
+                data_requires_raw = item.get("data_requires", "")
+                data_requires = (
+                    parse_data_requires(f"DATA_REQUIRES: {data_requires_raw}")
+                    if isinstance(data_requires_raw, str)
+                    else []
+                )
+                catalog.append({
+                    "template": template,
+                    "layout_name": str(item.get("layout_name", "") or Path(template).stem),
+                    "family": prompt_scaffold_family(template),
+                    "when_to_use": str(item.get("when_to_use", ""))[:320],
+                    "data_requires": data_requires,
+                    "free": bool(item.get("free")),
+                    "fill_zones": item.get("fill_zones", []),
+                    "layout_description": item.get("layout_description", ""),
+                })
+            if catalog:
+                return catalog
+    except paopao_auth.AuthError as exc:
+        if not any(
+            p.name not in {"SYSTEM_PROMPT.md", "INDEX.md"}
+            for p in PROMPT_LIBRARY_DIR.glob("*.md")
+        ):
+            raise SystemExit(str(exc)) from exc
 
     catalog: list[dict[str, object]] = []
     for path in sorted(PROMPT_LIBRARY_DIR.glob("*.md")):
@@ -10135,9 +10134,10 @@ def cmd_render(args: argparse.Namespace) -> int:
         print(proc.stdout)
     if proc.stderr:
         print(proc.stderr, file=sys.stderr)
-    succeeded = proc.returncode == 0 and pptx.exists()
+    pptx_generated = pptx.exists()
+    succeeded = proc.returncode == 0 and pptx_generated
     finish_quota(reservation_id, succeeded)
-    if succeeded:
+    if pptx_generated:
         html_manifest: list[dict[str, object]] = []
         for idx, path in enumerate(html_files, 1):
             entry: dict[str, object] = {
