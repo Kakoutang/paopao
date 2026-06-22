@@ -32,7 +32,8 @@ import paopao_auth
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-RENDERER = PLUGIN_ROOT / "scripts" / "renderer.py"
+_PAOPAO_CACHE = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao")) / "cache"
+RENDERER = _PAOPAO_CACHE / "renderer.py"
 SYSTEM_PROMPT = PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md"
 PROMPT_LIBRARY_DIR = PLUGIN_ROOT / "prompts"
 
@@ -672,6 +673,7 @@ def workflow_destinations() -> dict[str, Path]:
         "SKILL.md": PLUGIN_ROOT / "skills" / "paopao-ppt" / "SKILL.md",
         "SYSTEM_PROMPT.md": PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md",
         "renderer_guide.md": PLUGIN_ROOT / "reference" / "renderer_guide.md",
+        "renderer.py": RENDERER,
     }
 
 
@@ -10124,7 +10126,8 @@ def cmd_render(args: argparse.Namespace) -> int:
         return 1
     reservation_id = reserve_quota(task_dir, len(html_files))
 
-    cmd = [sys.executable, str(RENDERER), *map(str, html_files), "--pptx", str(pptx)]
+    renderer_path = ensure_workflow_file("renderer.py")
+    cmd = [sys.executable, str(renderer_path), *map(str, html_files), "--pptx", str(pptx)]
     if args.pdf:
         cmd.extend(["--pdf", str(Path(args.pdf).resolve())])
 
