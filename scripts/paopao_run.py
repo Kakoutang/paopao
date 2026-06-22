@@ -951,6 +951,10 @@ def commercial_render_contract_path(task_dir: Path) -> Path:
     return task_dir / "qa" / "commercial_render_contract.json"
 
 
+def evidence_pool_path(task_dir: Path) -> Path:
+    return task_dir / "analysis" / "evidence_pool.json"
+
+
 def _relative_to_task_or_abs(task_dir: Path, path: Path) -> str:
     try:
         return str(path.resolve().relative_to(task_dir.resolve()))
@@ -984,6 +988,165 @@ def read_task_manifest(task_dir: Path) -> dict[str, object]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def task_source_files(task_dir: Path) -> list[Path]:
+    manifest = read_task_manifest(task_dir)
+    files: list[Path] = []
+    raw_sources = manifest.get("source_files")
+    if isinstance(raw_sources, list):
+        for item in raw_sources:
+            path = _resolve_task_path(task_dir, item)
+            if path and path.exists() and path.is_file():
+                files.append(path)
+    source_dir = task_dir / "source"
+    if source_dir.exists():
+        for path in sorted(source_dir.iterdir()):
+            if path.is_file() and path not in files:
+                files.append(path)
+    return files
+
+
+def _extract_pdf_pages(path: Path) -> list[tuple[int | None, str]]:
+    pages: list[tuple[int | None, str]] = []
+    try:
+        import pypdf  # type: ignore
+
+        reader = pypdf.PdfReader(str(path))
+        for pos, page in enumerate(reader.pages, 1):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                pages.append((pos, text))
+        return pages
+    except Exception:
+        pass
+    try:
+        import PyPDF2  # type: ignore
+
+        reader = PyPDF2.PdfReader(str(path))
+        for pos, page in enumerate(reader.pages, 1):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                pages.append((pos, text))
+    except Exception:
+        return []
+    return pages
+
+
+def _extract_plain_document_pages(path: Path) -> list[tuple[int | None, str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_pdf_pages(path)
+    if suffix in {".txt", ".md", ".csv", ".tsv", ".json"}:
+        text = read_text(path)
+        return [(None, text)] if text.strip() else []
+    return []
+
+
+def _split_fact_candidates(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    parts = re.split(r"(?<=[.!?。！？])\s+", normalized)
+    candidates: list[str] = []
+    for part in parts:
+        item = part.strip(" \t\r\n-•")
+        if 35 <= len(item) <= 320 and re.search(r"\d|%|\$|€|£|¥|million|billion|bn|mn|tons?|teu|co2|emissions?", item, re.I):
+            candidates.append(item)
+    return candidates
+
+
+def _fact_value(text: str) -> str:
+    match = re.search(
+        r"([$€£¥]?\s?\d+(?:[.,]\d+)?\s?(?:%|bn|billion|mn|million|k|thousand|tons?|teu|CO2|tCO2e|weeks?|years?|days?)?)",
+        text,
+        re.I,
+    )
+    return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
+
+def build_evidence_pool(task_dir: Path, *, max_facts: int = 160) -> dict[str, object]:
+    facts: list[dict[str, object]] = []
+    source_files = task_source_files(task_dir)
+    seen: set[str] = set()
+    for source in source_files:
+        for page, text in _extract_plain_document_pages(source):
+            for claim in _split_fact_candidates(text):
+                key = re.sub(r"\W+", " ", claim.lower()).strip()[:180]
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                facts.append({
+                    "claim": claim,
+                    "value": _fact_value(claim),
+                    "source": source.name,
+                    "page": page,
+                })
+                if len(facts) >= max_facts:
+                    break
+            if len(facts) >= max_facts:
+                break
+        if len(facts) >= max_facts:
+            break
+    return {
+        "schema": "paopao.evidence_pool.v1",
+        "task_name": task_dir.name,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source_files": [_relative_to_task_or_abs(task_dir, p) for p in source_files],
+        "fact_count": len(facts),
+        "facts": facts,
+    }
+
+
+def evidence_pool_issues(task_dir: Path) -> list[str]:
+    path = evidence_pool_path(task_dir)
+    if not path.exists():
+        return ["analysis/evidence_pool.json missing; run extract-evidence-pool before analysis handoff"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"analysis/evidence_pool.json cannot be parsed: {exc}"]
+    if not isinstance(data, dict) or data.get("schema") != "paopao.evidence_pool.v1":
+        return ["analysis/evidence_pool.json schema must be paopao.evidence_pool.v1"]
+    facts = data.get("facts")
+    if not isinstance(facts, list) or not facts:
+        return ["analysis/evidence_pool.json has no facts; source extraction failed or source files are missing"]
+    valid = 0
+    for item in facts:
+        if (
+            isinstance(item, dict)
+            and str(item.get("claim", "")).strip()
+            and str(item.get("source", "")).strip()
+            and ("page" in item)
+        ):
+            valid += 1
+    if valid < min(8, len(facts)):
+        return ["analysis/evidence_pool.json facts must include claim, source, and page fields"]
+    return []
+
+
+def cmd_extract_evidence_pool(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    if not task_dir.exists():
+        raise SystemExit(f"Task directory missing: {task_dir}")
+    data = build_evidence_pool(task_dir, max_facts=max(1, int(args.max_facts)))
+    out = evidence_pool_path(task_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": bool(data.get("facts")),
+        "evidence_pool": str(out),
+        "fact_count": data.get("fact_count", 0),
+        "source_files": data.get("source_files", []),
+        "next_action": "Analysis employee may read PDF/source and evidence_pool; downstream employees should use evidence_pool and compact work orders instead of reopening source files.",
+    }, ensure_ascii=False, indent=2))
+    return 0 if data.get("facts") else 1
 
 
 def requested_language_family(task_dir: Path) -> str:
@@ -1948,6 +2111,14 @@ def html_generation_manifest_path(task_dir: Path) -> Path:
 
 def html_generation_request_path(task_dir: Path, idx: int) -> Path:
     return task_dir / "qa" / "html_generation_requests" / f"html_prompt_packet_{idx:02d}.md"
+
+
+def html_compact_packet_path(task_dir: Path, idx: int) -> Path:
+    return task_dir / "qa" / "html_generation_requests" / f"html_compact_packet_{idx:02d}.md"
+
+
+def html_compact_renderer_guide_path(task_dir: Path) -> Path:
+    return task_dir / "qa" / "html_generation_requests" / "renderer_compact_guide.md"
 
 
 def image2_reference_path(task_dir: Path, idx: int) -> Path:
@@ -3533,6 +3704,7 @@ def check_analysis_files(task_dir: Path, expected: int, issues: list[str]) -> No
 
 
 def check_html_source_analysis_files(task_dir: Path, expected: int, issues: list[str]) -> None:
+    issues.extend(evidence_pool_issues(task_dir))
     check_analysis_files(task_dir, expected, issues)
     custom_html_prompts = sorted((task_dir / "analysis").glob("html_prompt_*.md"))
     if custom_html_prompts:
@@ -4807,32 +4979,6 @@ def _visual_region_ids(data: dict[str, object]) -> list[str]:
     return ids
 
 
-def _infer_blueprint_object_kind(region: dict[str, object]) -> str:
-    rid = str(region.get("id", "")).strip().lower()
-    role = str(region.get("role", "")).strip().lower()
-    rtype = str(region.get("type", "")).strip().lower()
-    text_items = region.get("text", [])
-    if not isinstance(text_items, list):
-        text_items = []
-    text = " ".join(str(v) for v in text_items).lower()
-    haystack = " ".join([rid, role, rtype, text])
-    if rid == "nav" or role == "nav":
-        return "nav"
-    if rid == "title" or role == "title":
-        return "title"
-    if rid == "takeaway" or role == "takeaway":
-        return "takeaway"
-    if rid == "source" or role == "source":
-        return "source"
-    if any(keyword.lower() in haystack for keyword in VISUAL_CHART_KEYWORDS):
-        return "native_chart"
-    if any(keyword.lower() in haystack for keyword in VISUAL_TABLE_KEYWORDS):
-        return "native_table"
-    if "callout" in haystack:
-        return "callout"
-    return "shape_group"
-
-
 def _blueprint_regions(data: dict[str, object]) -> list[dict[str, object]]:
     regions = data.get("regions")
     if not isinstance(regions, list):
@@ -4851,94 +4997,6 @@ def _is_visual_blueprint_root_region(region: dict[str, object]) -> bool:
         or kind in {"nav", "title", "takeaway", "source"}
         or any(token in haystack for token in ["navigation", "header", "footer"])
     )
-
-
-def build_visual_blueprint_data(task_dir: Path, idx: int) -> dict[str, object]:
-    contract_path = visual_contract_path(task_dir, idx)
-    measurement_path = visual_measurement_path(task_dir, idx)
-    observation_path = image2_observation_path(task_dir, idx)
-    contract = _read_json_file(contract_path)
-    measurement = _read_json_file(measurement_path)
-    observation = _read_json_file(observation_path)
-    if not isinstance(contract, dict):
-        raise SystemExit(f"Missing or invalid visual contract: {contract_path}")
-    if not isinstance(measurement, dict):
-        raise SystemExit(f"Missing or invalid visual measurement: {measurement_path}")
-    if not isinstance(observation, dict):
-        raise SystemExit(f"Missing or invalid image observation: {observation_path}")
-    blueprint_regions: list[dict[str, object]] = []
-    for region in _blueprint_regions(contract):
-        rid = str(region.get("id", "")).strip()
-        if not rid:
-            continue
-        kind = _infer_blueprint_object_kind(region)
-        bbox = region.get("bbox")
-        blueprint_regions.append({
-            "id": rid,
-            "role": str(region.get("role", "")).strip(),
-            "bbox": bbox,
-            "pptx_object_kind": kind,
-            "editable_required": True,
-            "geometry_locked": True,
-            "overflow_policy": "fit_text_or_fail",
-            "text": region.get("text", []),
-            "style": {
-                "fill": region.get("fill", "#FFFFFF"),
-                "border_style": region.get("border_style", "none"),
-            },
-            "source_region_id": rid,
-        })
-    counts = {
-        "native_chart_regions": len([r for r in blueprint_regions if r.get("pptx_object_kind") == "native_chart"]),
-        "native_table_regions": len([r for r in blueprint_regions if r.get("pptx_object_kind") == "native_table"]),
-        "editable_regions": len([r for r in blueprint_regions if r.get("editable_required") is True]),
-    }
-    return {
-        "schema": VISUAL_BLUEPRINT_SCHEMA,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "slide": idx,
-        "reference_path": f"image2/image2_reference_{idx:02d}.png",
-        "reconstruction_source": IMAGE_ONLY_RECONSTRUCTION_SOURCE,
-        "prompt_context_discarded": True,
-        "observed_as_fresh_image": True,
-        "derivation_method": POST_IMAGE_DERIVATION_METHOD,
-        "observation_record_path": str(observation_path.relative_to(task_dir)),
-        "observation_record_sha256": sha256_file(observation_path),
-        "observation_id": observation.get("observation_id"),
-        "visual_contract_path": str(contract_path.relative_to(task_dir)),
-        "visual_contract_sha256": sha256_file(contract_path),
-        "visual_measurement_path": str(measurement_path.relative_to(task_dir)),
-        "visual_measurement_sha256": sha256_file(measurement_path),
-        "canvas": {"width": 1920, "height": 1080},
-        "regions": blueprint_regions,
-        "required_object_counts": counts,
-        "policy": (
-            "Direct PPTX must be generated from this blueprint. Each region is geometry-locked; "
-            "pptx_object_kind selects the only allowed editable PowerPoint object family."
-        ),
-    }
-
-
-def cmd_build_visual_blueprint(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    idx = int(args.slide)
-    out = visual_blueprint_path(task_dir, idx)
-    if out.exists() and not args.force:
-        print(json.dumps({
-            "ok": False,
-            "issue": f"{out.relative_to(task_dir)} already exists; pass --force to overwrite",
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    data = build_visual_blueprint_data(task_dir, idx)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({
-        "ok": True,
-        "blueprint": str(out),
-        "regions": len(data.get("regions", [])),
-        "required_object_counts": data.get("required_object_counts", {}),
-    }, ensure_ascii=False, indent=2))
-    return 0
 
 
 def _object_graph_executable_style(kind: str, style: object) -> dict[str, object]:
@@ -4979,719 +5037,6 @@ def _object_graph_executable_style(kind: str, style: object) -> dict[str, object
         resolved.setdefault("auto_fit", False)
         resolved.setdefault("padding", 5)
     return resolved
-
-
-def _chart_data_from_text(text: object) -> dict[str, object]:
-    raw = str(text or "")
-    pairs: list[tuple[str, float]] = []
-    for chunk in re.split(r"[,;]\s*", raw):
-        match = re.search(r"([A-Za-z][A-Za-z0-9 /&+\-]{1,42}?)\s+(\d+(?:\.\d+)?)\b", chunk)
-        if match:
-            label = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
-            value = float(match.group(2))
-            if label:
-                pairs.append((label, value))
-    if not pairs:
-        pairs = [("Observed", 1.0)]
-    return {
-        "chart_type": "column",
-        "title": raw.split(";", 1)[0].strip() if raw.strip() else "",
-        "categories": [label for label, _ in pairs[:8]],
-        "series": [{"name": "Number of actions", "values": [value for _, value in pairs[:8]]}],
-        "data_labels": True,
-        "plot_area": {"x": 0.08, "y": 0.15, "w": 0.84, "h": 0.72},
-        "plot_area_px": [],
-        "bar_gap_width": 80,
-        "major_gridlines": True,
-        "font_size": 8.5,
-        "category_font_size": 7.5,
-        "value_font_size": 7.5,
-        "data_label_font_size": 8,
-        "title_font_size": 10,
-    }
-
-
-def _chart_data_from_element(element: dict[str, object], text: object) -> dict[str, object]:
-    base = _chart_data_from_text(text)
-    chart_data = element.get("chart_data")
-    if isinstance(chart_data, dict):
-        merged = {**base, **chart_data}
-        if isinstance(base.get("plot_area"), dict) and isinstance(chart_data.get("plot_area"), dict):
-            merged["plot_area"] = {**base["plot_area"], **chart_data["plot_area"]}  # type: ignore[index]
-    else:
-        merged = base
-    bbox = element.get("bbox")
-    plot_bbox = _chart_part_bbox(element, "plot_area")
-    title_bbox = _chart_part_bbox(element, "chart_title")
-    if isinstance(bbox, list) and len(bbox) >= 4 and all(isinstance(v, (int, float)) for v in bbox[:4]) and plot_bbox:
-        bx, by, bw, bh = [float(v) for v in bbox[:4]]
-        if bw > 0 and bh > 0:
-            merged["plot_area"] = {
-                "x": round(max(0.0, min(1.0, (plot_bbox[0] - bx) / bw)), 4),
-                "y": round(max(0.0, min(1.0, (plot_bbox[1] - by) / bh)), 4),
-                "w": round(max(0.01, min(1.0, plot_bbox[2] / bw)), 4),
-                "h": round(max(0.01, min(1.0, plot_bbox[3] / bh)), 4),
-            }
-            merged["plot_area_px"] = [round(v, 2) for v in plot_bbox]
-            merged["chart_bbox_px"] = [round(float(v), 2) for v in bbox[:4]]
-            if title_bbox:
-                merged["title_bbox_px"] = [round(v, 2) for v in title_bbox]
-    categories = merged.get("categories")
-    if "bar_gap_width" not in merged or not isinstance(merged.get("bar_gap_width"), (int, float)):
-        merged["bar_gap_width"] = 70 if isinstance(categories, list) and len(categories) <= 3 else 90
-    return merged
-
-
-def _table_data_from_text(text: object) -> dict[str, object]:
-    raw = str(text or "").strip()
-    headers = ["", "Stage 1", "Stage 2", "Stage 3", "Stage 4", "Stage 5"]
-    rows = [
-        ["Evidence", raw or "Observed detail grid", "", "", "", ""],
-        ["Mechanism", "", "", "", "", ""],
-        ["Risk / caveat", "", "", "", "", ""],
-    ]
-    return {
-        "headers": headers,
-        "rows": rows,
-        "col_widths": [140, 253, 253, 253, 253, 253],
-        "row_heights": [58, 122, 122, 123],
-        "cell_padding": 6,
-        "header_background": "#305496",
-        "header_color": "#FFFFFF",
-        "border_color": "#5B9BD5",
-        "border_width": 0.8,
-        "header_font_size": 8,
-        "row_header_background": "#EAF2FB",
-        "row_header_color": "#305496",
-        "row_header_font_size": 9,
-        "font_size": 9.5,
-    }
-
-
-def _table_data_from_element(element: dict[str, object], text: object) -> dict[str, object]:
-    base = _table_data_from_text(text)
-    table_data = element.get("table_data")
-    if isinstance(table_data, dict) and (
-        isinstance(table_data.get("rows"), list) or isinstance(table_data.get("headers"), list)
-    ):
-        return {**base, **table_data}
-    return base
-
-
-def _connector_segments_from_bbox(
-    eid: str,
-    element: dict[str, object],
-    slot: dict[str, object],
-    count: int,
-    pos: int,
-) -> list[dict[str, object]]:
-    bbox = slot.get("bbox", element.get("bbox"))
-    vals = _bbox_values(bbox)
-    if not vals or count <= 1:
-        vals = vals or (0.0, 0.0, 100.0, 0.0)
-        x, y, w, h = vals
-        return [{
-            "id": eid,
-            "inventory_id": eid,
-            "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
-            "source_measurement_id": eid,
-            "reference_measurements": element.get("measurements", {}),
-            "role": str(element.get("role", "")).strip(),
-            "z_order": slot.get("z_order", pos),
-            "object_kind": "connector",
-            "bbox": [x, y, w, h],
-            "text": "",
-            "points": [[x, y], [x + w, y + h]],
-            "style": _object_graph_executable_style("connector", element.get("style", {})),
-            "editable": True,
-            "geometry_locked": True,
-            "implementation_notes": slot.get("powerpoint_mechanics", []),
-        }]
-    x, y, w, h = vals
-    step = w / max(1, count - 1)
-    seg_w = min(70.0, max(36.0, step * 0.28))
-    segments: list[dict[str, object]] = []
-    for i in range(count):
-        sx = x + step * i
-        segments.append({
-            "id": f"{eid}_{i + 1}",
-            "inventory_id": eid,
-            "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
-            "source_measurement_id": eid,
-            "reference_measurements": element.get("measurements", {}),
-            "measurement_part": f"segment_{i + 1}",
-            "role": str(element.get("role", "")).strip(),
-            "z_order": _float_or_default(slot.get("z_order"), pos) + i * 0.01,
-            "object_kind": "connector",
-            "bbox": [sx, y, seg_w, h],
-            "text": "",
-            "points": [[sx, y], [sx + seg_w, y + h]],
-            "style": _object_graph_executable_style("connector", element.get("style", {})),
-            "editable": True,
-            "geometry_locked": True,
-            "implementation_notes": slot.get("powerpoint_mechanics", []),
-        })
-    return segments
-
-
-def build_visual_object_graph_data(task_dir: Path, idx: int) -> dict[str, object]:
-    blueprint_path = visual_blueprint_path(task_dir, idx)
-    blueprint = _read_json_file(blueprint_path)
-    inventory_path = visual_inventory_path(task_dir, idx)
-    inventory = _read_json_file(inventory_path)
-    layout_plan_path = powerpoint_layout_plan_path(task_dir, idx)
-    layout_plan = _read_json_file(layout_plan_path)
-    slot_by_inventory: dict[str, dict[str, object]] = {}
-    if isinstance(layout_plan, dict) and layout_plan.get("schema") == POWERPOINT_LAYOUT_PLAN_SCHEMA:
-        for slot in _layout_plan_slots(layout_plan):
-            inv_id = str(slot.get("inventory_id", "")).strip()
-            if inv_id:
-                slot_by_inventory[inv_id] = slot
-    objects: list[dict[str, object]] = []
-    graph: dict[str, object] = {
-        "schema": VISUAL_OBJECT_GRAPH_SCHEMA,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "slide": idx,
-        "reference_path": f"image2/image2_reference_{idx:02d}.png",
-        "reconstruction_source": IMAGE_ONLY_RECONSTRUCTION_SOURCE,
-        "prompt_context_discarded": True,
-        "canvas": {"width": 1920, "height": 1080},
-        "policy": (
-            "Direct PPTX generation must execute this object graph. Do not create a new layout; "
-            "only enrich missing text/icon implementation details when they are visible in the reference image."
-        ),
-    }
-    if isinstance(inventory, dict) and inventory.get("schema") == VISUAL_INVENTORY_SCHEMA:
-        graph["visual_inventory_path"] = str(inventory_path.relative_to(task_dir))
-        graph["visual_inventory_sha256"] = sha256_file(inventory_path)
-        if not isinstance(layout_plan, dict) or layout_plan.get("schema") != POWERPOINT_LAYOUT_PLAN_SCHEMA:
-            raise SystemExit(f"Missing valid PowerPoint layout plan for slide {idx}")
-        graph["powerpoint_layout_plan_path"] = str(layout_plan_path.relative_to(task_dir))
-        graph["powerpoint_layout_plan_sha256"] = sha256_file(layout_plan_path)
-        graph["canvas"] = inventory.get("canvas", graph["canvas"])
-        required_counts = inventory.get("required_object_counts") if isinstance(inventory, dict) else {}
-        for pos, element in enumerate(_inventory_elements(inventory), 1):
-            eid = str(element.get("id", "")).strip()
-            if not eid:
-                continue
-            slot = slot_by_inventory.get(eid, {})
-            kind = str(element.get("object_kind", "")).strip()
-            if kind == "connector":
-                expected_count = 1
-                if isinstance(required_counts, dict) and isinstance(required_counts.get("connector"), int):
-                    expected_count = int(required_counts.get("connector") or 1)
-                objects.extend(_connector_segments_from_bbox(eid, element, slot, expected_count, pos))
-                continue
-            text_value = element.get("text", element.get("text_summary", ""))
-            graph_object: dict[str, object] = {
-                "id": eid,
-                "inventory_id": eid,
-                "layout_slot_id": str(slot.get("id", "")).strip() or f"slot_{eid}",
-                "source_measurement_id": eid,
-                "reference_measurements": element.get("measurements", {}),
-                "role": str(element.get("role", "")).strip(),
-                "z_order": slot.get("z_order", pos),
-                "object_kind": kind,
-                "bbox": slot.get("bbox", element.get("bbox")),
-                "text": text_value,
-                "style": _object_graph_executable_style(kind, element.get("style", {})),
-                "authoring_guide": slot.get("authoring_guide", _component_authoring_guide(kind)),
-                "editable": True,
-                "geometry_locked": True,
-                "implementation_notes": slot.get("powerpoint_mechanics", []),
-            }
-            if kind in {"native_chart", "chart"}:
-                graph_object["chart_data"] = _chart_data_from_element(element, text_value)
-            if kind in {"native_table", "table"}:
-                graph_object["table_data"] = _table_data_from_element(element, text_value)
-            if kind == "takeaway" and isinstance(text_value, str) and ":" in text_value:
-                label, body = text_value.split(":", 1)
-                if label.strip() and body.strip():
-                    graph_object["label"] = f"{label.strip()}:"
-                    graph_object["body"] = body.strip()
-                    graph_object["text"] = ""
-            objects.append(graph_object)
-    else:
-        if not isinstance(blueprint, dict) or blueprint.get("schema") != VISUAL_BLUEPRINT_SCHEMA:
-            raise SystemExit(f"Missing visual inventory or valid visual blueprint for slide {idx}")
-        graph["visual_blueprint_path"] = str(blueprint_path.relative_to(task_dir))
-        graph["visual_blueprint_sha256"] = sha256_file(blueprint_path)
-        graph["canvas"] = blueprint.get("canvas", graph["canvas"])
-        for pos, region in enumerate(_blueprint_regions(blueprint), 1):
-            rid = str(region.get("id", "")).strip()
-            if not rid:
-                continue
-            objects.append({
-                "id": rid,
-                "source_region_id": rid,
-                "role": str(region.get("role", "")).strip(),
-                "z_order": pos,
-                "object_kind": str(region.get("pptx_object_kind", "")).strip(),
-                "bbox": region.get("bbox"),
-                "text": region.get("text", []),
-                "style": region.get("style", {}),
-                "editable": True,
-                "geometry_locked": True,
-                "implementation_notes": [],
-            })
-    if isinstance(blueprint, dict) and blueprint.get("schema") == VISUAL_BLUEPRINT_SCHEMA:
-        graph.setdefault("visual_blueprint_path", str(blueprint_path.relative_to(task_dir)))
-        graph.setdefault("visual_blueprint_sha256", sha256_file(blueprint_path))
-    graph["objects"] = objects
-    return graph
-
-
-def cmd_build_visual_object_graph(args: argparse.Namespace) -> int:
-    if os.getenv("PAOPAO_ALLOW_LEGACY_OBJECT_COMPILER") != "1":
-        print(json.dumps({
-            "ok": False,
-            "issue": (
-                "Object graph authoring is disabled for production. "
-                "Use the custom direct painter path instead."
-            ),
-            "legacy_override": "Set PAOPAO_ALLOW_LEGACY_OBJECT_COMPILER=1 only for local experiments.",
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 2
-    task_dir = Path(args.task_dir).resolve()
-    idx = int(args.slide)
-    out = visual_object_graph_path(task_dir, idx)
-    if out.exists() and not args.force:
-        print(json.dumps({
-            "ok": False,
-            "issue": f"{out.relative_to(task_dir)} already exists; pass --force to overwrite",
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    data = build_visual_object_graph_data(task_dir, idx)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({
-        "ok": True,
-        "object_graph": str(out),
-        "objects": len(data.get("objects", [])),
-    }, ensure_ascii=False, indent=2))
-    return 0
-
-
-def _nonempty_cells(rows: object) -> int:
-    if not isinstance(rows, list):
-        return 0
-    total = 0
-    for row in rows:
-        if isinstance(row, list):
-            total += sum(1 for cell in row if str(cell).strip())
-    return total
-
-
-def _object_graph_structural_issues(slide_idx: int, obj: dict[str, object], pos: int) -> list[str]:
-    issues: list[str] = []
-    oid = str(obj.get("id", "")).strip() or str(pos)
-    kind = str(obj.get("object_kind", "")).strip()
-    if kind in {"native_chart", "chart"}:
-        chart_data = obj.get("chart_data")
-        if not isinstance(chart_data, dict):
-            return [f"slide{slide_idx:02d}_object_graph.json chart {oid} missing chart_data"]
-        categories = chart_data.get("categories")
-        series = chart_data.get("series")
-        if not isinstance(categories, list) or not any(str(item).strip() for item in categories):
-            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing categories")
-        if not isinstance(series, list) or not series:
-            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing series")
-        else:
-            has_values = any(
-                isinstance(item, dict)
-                and isinstance(item.get("values"), list)
-                and any(isinstance(v, (int, float)) for v in item.get("values", []))
-                for item in series
-            )
-            if not has_values:
-                issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing numeric values")
-        if not str(chart_data.get("chart_type", "")).strip():
-            issues.append(f"slide{slide_idx:02d}_object_graph.json chart {oid} missing chart_type")
-    if kind in {"native_table", "table"}:
-        table_data = obj.get("table_data")
-        if not isinstance(table_data, dict):
-            return [f"slide{slide_idx:02d}_object_graph.json table {oid} missing table_data"]
-        rows = table_data.get("rows")
-        headers = table_data.get("headers")
-        if not isinstance(rows, list) or not rows:
-            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} missing rows")
-        if _nonempty_cells(rows) < 6:
-            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} rows too sparse")
-        if headers is not None and not isinstance(headers, list):
-            issues.append(f"slide{slide_idx:02d}_object_graph.json table {oid} headers must be a list")
-    if kind == "takeaway":
-        if not str(obj.get("label", "")).strip() or not str(obj.get("body", "")).strip():
-            issues.append(f"slide{slide_idx:02d}_object_graph.json takeaway {oid} missing label/body")
-    return issues
-
-
-def check_visual_object_graph_files(task_dir: Path, expected: int, issues: list[str]) -> int:
-    graphs = sorted((task_dir / "spec").glob("slide*_object_graph.json"))
-    if len(graphs) != expected:
-        issues.append(f"visual object graphs: expected {expected}, found {len(graphs)}")
-
-    for idx in range(1, expected + 1):
-        path = visual_object_graph_path(task_dir, idx)
-        if not path.exists():
-            issues.append(
-                f"slide{idx:02d}_object_graph.json missing; direct PPTX must execute a structured object graph, "
-                "not a freeform prose spec"
-            )
-            continue
-        try:
-            raw_text = path.read_text(encoding="utf-8")
-            data = json.loads(raw_text)
-        except Exception as exc:
-            issues.append(f"slide{idx:02d}_object_graph.json cannot be parsed: {exc}")
-            continue
-        if data.get("schema") != VISUAL_OBJECT_GRAPH_SCHEMA:
-            issues.append(f"slide{idx:02d}_object_graph.json schema must be {VISUAL_OBJECT_GRAPH_SCHEMA}")
-        if data.get("reference_path") != f"image2/image2_reference_{idx:02d}.png":
-            issues.append(f"slide{idx:02d}_object_graph.json reference_path mismatch")
-        if data.get("reconstruction_source") != IMAGE_ONLY_RECONSTRUCTION_SOURCE:
-            issues.append(f"slide{idx:02d}_object_graph.json reconstruction_source must be {IMAGE_ONLY_RECONSTRUCTION_SOURCE}")
-        if data.get("prompt_context_discarded") is not True:
-            issues.append(f"slide{idx:02d}_object_graph.json prompt_context_discarded must be true")
-        if not file_is_after_reference(task_dir, idx, path):
-            issues.append(
-                f"slide{idx:02d}_object_graph.json is older than image2_reference_{idx:02d}.png; "
-                "rebuild it after observing the selected reference"
-            )
-        if not file_is_after_memory_boundary(task_dir, path):
-            issues.append(
-                f"slide{idx:02d}_object_graph.json is older than qa/post_image_memory_boundary.json; "
-                "rebuild it after the forced post-image memory reset"
-            )
-        forbidden = post_image_memory_markers(raw_text)
-        if forbidden:
-            issues.append(
-                f"slide{idx:02d}_object_graph.json contains upstream prompt/analysis memory markers after Image2 approval: "
-                + ", ".join(forbidden)
-            )
-        blueprint_path = visual_blueprint_path(task_dir, idx)
-        blueprint = _read_json_file(blueprint_path)
-        if isinstance(blueprint, dict):
-            if data.get("visual_blueprint_path") != str(blueprint_path.relative_to(task_dir)):
-                issues.append(f"slide{idx:02d}_object_graph.json visual_blueprint_path mismatch")
-            if blueprint_path.exists() and data.get("visual_blueprint_sha256") != sha256_file(blueprint_path):
-                issues.append(f"slide{idx:02d}_object_graph.json visual_blueprint_sha256 mismatch; rebuild from current blueprint")
-        inventory_path = visual_inventory_path(task_dir, idx)
-        inventory = _read_json_file(inventory_path)
-        required_inventory_ids: set[str] = set()
-        inventory_by_id: dict[str, dict[str, object]] = {}
-        if isinstance(inventory, dict) and inventory.get("schema") == VISUAL_INVENTORY_SCHEMA:
-            if data.get("visual_inventory_path") != str(inventory_path.relative_to(task_dir)):
-                issues.append(f"slide{idx:02d}_object_graph.json visual_inventory_path mismatch")
-            if inventory_path.exists() and data.get("visual_inventory_sha256") != sha256_file(inventory_path):
-                issues.append(f"slide{idx:02d}_object_graph.json visual_inventory_sha256 mismatch; rebuild from current inventory")
-            for element in _inventory_elements(inventory):
-                eid = str(element.get("id", "")).strip()
-                if not eid:
-                    continue
-                inventory_by_id[eid] = element
-                if element.get("required", True) is not False:
-                    required_inventory_ids.add(eid)
-        else:
-            issues.append(
-                f"slide{idx:02d}_object_graph.json cannot be accepted without "
-                f"slide{idx:02d}_visual_inventory.json"
-            )
-        layout_plan_path = powerpoint_layout_plan_path(task_dir, idx)
-        layout_plan = _read_json_file(layout_plan_path)
-        layout_slot_ids: set[str] = set()
-        if isinstance(layout_plan, dict) and layout_plan.get("schema") == POWERPOINT_LAYOUT_PLAN_SCHEMA:
-            if data.get("powerpoint_layout_plan_path") != str(layout_plan_path.relative_to(task_dir)):
-                issues.append(f"slide{idx:02d}_object_graph.json powerpoint_layout_plan_path mismatch")
-            if layout_plan_path.exists() and data.get("powerpoint_layout_plan_sha256") != sha256_file(layout_plan_path):
-                issues.append(f"slide{idx:02d}_object_graph.json powerpoint_layout_plan_sha256 mismatch; rebuild from current layout plan")
-            layout_slot_ids = _layout_slot_ids(layout_plan)
-        else:
-            issues.append(
-                f"slide{idx:02d}_object_graph.json cannot be accepted without "
-                f"slide{idx:02d}_powerpoint_layout_plan.json"
-            )
-        objects = data.get("objects")
-        if not isinstance(objects, list) or len(objects) < MIN_VISUAL_CONTRACT_REGIONS:
-            found = len(objects) if isinstance(objects, list) else 0
-            issues.append(
-                f"slide{idx:02d}_object_graph.json is too coarse: expected at least "
-                f"{MIN_VISUAL_CONTRACT_REGIONS} executable objects, found {found}"
-            )
-            continue
-        objects_by_inventory, graph_kind_counts = _count_objects_by_inventory(objects)
-        text_refs_by_inventory: set[str] = set()
-        for candidate in objects:
-            if not isinstance(candidate, dict):
-                continue
-            if _object_has_visible_text(candidate):
-                text_refs_by_inventory.update(_object_inventory_refs(candidate))
-        if required_inventory_ids:
-            missing_inventory = sorted(required_inventory_ids - set(objects_by_inventory))
-            if missing_inventory:
-                issues.append(
-                    f"slide{idx:02d}_object_graph.json does not cover required visual inventory element(s): "
-                    + ", ".join(missing_inventory[:20])
-                )
-            unknown_inventory_refs = sorted(set(objects_by_inventory) - set(inventory_by_id))
-            if unknown_inventory_refs:
-                issues.append(
-                    f"slide{idx:02d}_object_graph.json references unknown visual inventory id(s): "
-                    + ", ".join(unknown_inventory_refs[:20])
-                )
-            if len(objects) < len(required_inventory_ids):
-                issues.append(
-                    f"slide{idx:02d}_object_graph.json is too compressed: "
-                    f"{len(required_inventory_ids)} required inventory elements are represented by only {len(objects)} object(s)"
-                )
-            for inv_id in sorted(required_inventory_ids):
-                element = inventory_by_id.get(inv_id, {})
-                required_kind = str(element.get("object_kind", "")).strip()
-                allowed_kinds = VISUAL_INVENTORY_NATIVE_KIND_MATCH.get(required_kind)
-                covering_objects = [
-                    obj for obj in objects_by_inventory.get(inv_id, [])
-                    if isinstance(obj, dict)
-                ]
-                if isinstance(element.get("measurements"), dict) and covering_objects:
-                    measurement_bound = any(
-                        isinstance(obj.get("reference_measurements"), dict)
-                        or str(obj.get("source_measurement_id", "")).strip() == inv_id
-                        or str(obj.get("measurement_part", "")).strip()
-                        for obj in covering_objects
-                    )
-                    if not measurement_bound:
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json inventory element {inv_id} has measurements, "
-                            "but no covering object carries reference_measurements/source_measurement_id/measurement_part"
-                        )
-                if not allowed_kinds:
-                    continue
-                covering_kinds = {
-                    str(obj.get("object_kind", "")).strip()
-                    for obj in covering_objects
-                }
-                required_count_for_kind = 0
-                if isinstance(inventory, dict) and isinstance(inventory.get("required_object_counts"), dict):
-                    raw_count = inventory["required_object_counts"].get(required_kind)  # type: ignore[index]
-                    required_count_for_kind = raw_count if isinstance(raw_count, int) else 0
-                if (
-                    required_kind in VISUAL_OBJECT_GRAPH_COMPLEX_DETAIL_KINDS
-                    and required_count_for_kind <= 1
-                    and len(objects_by_inventory.get(inv_id, [])) != 1
-                ):
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json inventory element {inv_id} ({required_kind}) "
-                        "must map to exactly one dedicated executable object, not be merged or duplicated"
-                    )
-                if covering_kinds and covering_kinds.isdisjoint(allowed_kinds):
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json inventory element {inv_id} "
-                        f"requires {required_kind}, covered by {', '.join(sorted(covering_kinds))}"
-                    )
-        if isinstance(inventory, dict):
-            required_counts = inventory.get("required_object_counts")
-            if isinstance(required_counts, dict):
-                for kind, expected_count in required_counts.items():
-                    if not isinstance(expected_count, int) or expected_count <= 0:
-                        continue
-                    actual_count = graph_kind_counts.get(str(kind), 0)
-                    if actual_count < expected_count:
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json needs at least {expected_count} {kind} object(s) "
-                            f"from visual inventory, found {actual_count}"
-                        )
-        graph_ids: set[str] = set()
-        for pos, obj in enumerate(objects, 1):
-            if not isinstance(obj, dict):
-                issues.append(f"slide{idx:02d}_object_graph.json object {pos} must be an object")
-                continue
-            oid = str(obj.get("id", "")).strip()
-            kind = str(obj.get("object_kind", "")).strip()
-            issues.extend(_object_graph_structural_issues(idx, obj, pos))
-            if not oid:
-                issues.append(f"slide{idx:02d}_object_graph.json object {pos} missing id")
-            elif oid in graph_ids:
-                issues.append(f"slide{idx:02d}_object_graph.json duplicate object id: {oid}")
-            else:
-                graph_ids.add(oid)
-            if kind not in VISUAL_BLUEPRINT_ALLOWED_OBJECT_KINDS:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} invalid object_kind: {kind or '<missing>'}")
-            if "editable" in obj and obj.get("editable") is not True:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} editable must be true")
-            if "geometry_locked" in obj and obj.get("geometry_locked") is not True:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} geometry_locked must be true")
-            if not _bbox_is_numeric(obj.get("bbox")):
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include numeric bbox [x,y,w,h]")
-            role = str(obj.get("role", "")).strip()
-            if not role:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include role")
-            z_order = obj.get("z_order")
-            if not isinstance(z_order, (int, float)):
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must include numeric z_order")
-            refs = _object_inventory_refs(obj)
-            if not refs:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must reference visual inventory id(s)")
-            layout_refs = _object_layout_refs(obj)
-            if not layout_refs:
-                issues.append(f"slide{idx:02d}_object_graph.json object {oid or pos} must reference PowerPoint layout slot id(s)")
-            elif layout_slot_ids:
-                unknown_layout_refs = sorted(layout_refs - layout_slot_ids)
-                if unknown_layout_refs:
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json object {oid or pos} references unknown layout slot id(s): "
-                        + ", ".join(unknown_layout_refs[:8])
-                    )
-            if kind in VISUAL_OBJECT_GRAPH_TEXT_BEARING_KINDS:
-                obj_text = obj.get("text")
-                has_text = False
-                if isinstance(obj_text, str) and obj_text.strip():
-                    has_text = True
-                elif isinstance(obj_text, list) and any(
-                    isinstance(t, str) and t.strip() for t in obj_text
-                ):
-                    has_text = True
-                if _text_runs_have_text(obj.get("text_runs")):
-                    has_text = True
-                if kind == "nav":
-                    items = obj.get("items")
-                    if isinstance(items, list) and any(
-                        isinstance(item, dict) and str(item.get("text", "")).strip()
-                        for item in items
-                    ):
-                        has_text = True
-                if kind == "takeaway" and (
-                    str(obj.get("label", "")).strip() or str(obj.get("body", "")).strip()
-                ):
-                    has_text = True
-                composite_text_covered = (
-                    kind in {"kpi", "callout", "card", "panel"}
-                    and bool(refs)
-                    and not refs.isdisjoint(text_refs_by_inventory)
-                )
-                if not has_text and not composite_text_covered:
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must contain "
-                        "non-empty text from the reference image"
-                    )
-            issues.extend(_object_text_overflow_issues(idx, obj, pos))
-            if kind in VISUAL_OBJECT_GRAPH_STYLED_KINDS:
-                style = obj.get("style")
-                if not isinstance(style, dict) or not style:
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include "
-                        "style with at least background or font color from the reference image"
-                    )
-                elif kind in VISUAL_OBJECT_GRAPH_TEXT_LIKE_KINDS and _object_has_visible_text(obj):
-                    if "font_size" not in style or not isinstance(style.get("font_size"), (int, float)):
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include numeric style.font_size"
-                        )
-                    if "font_family" not in style:
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include style.font_family"
-                        )
-                    if "auto_fit" not in style:
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must explicitly set style.auto_fit"
-                        )
-                    if kind in {"card", "callout", "kpi", "chevron", "badge", "takeaway"} and (
-                        "padding" not in style
-                        and not any(f"padding_{side}" in style for side in ("left", "right", "top", "bottom"))
-                    ):
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} ({kind}) must include padding "
-                            "so PowerPoint text placement is deterministic"
-                        )
-                if isinstance(style, dict) and kind in {"shape", "panel", "card", "callout", "kpi", "chevron", "badge"}:
-                    border = style.get("border")
-                    if isinstance(border, dict) and "width" in border and not isinstance(border.get("width"), (int, float)):
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} border.width must be numeric"
-                        )
-            if _text_runs_have_text(obj.get("text_runs")):
-                for run_pos, run in enumerate(obj.get("text_runs", []), 1):
-                    if not isinstance(run, dict):
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} text_runs[{run_pos}] must be an object"
-                        )
-                        continue
-                    if "font_size" in run and not isinstance(run.get("font_size"), (int, float)):
-                        issues.append(
-                            f"slide{idx:02d}_object_graph.json object {oid or pos} text_runs[{run_pos}].font_size must be numeric"
-                        )
-            if kind == "connector":
-                points = obj.get("points")
-                if not isinstance(points, list) or len(points) < 2:
-                    issues.append(f"slide{idx:02d}_object_graph.json connector {oid or pos} must include at least two points")
-                style = obj.get("style")
-                if not isinstance(style, dict) or "line_width" not in style:
-                    issues.append(f"slide{idx:02d}_object_graph.json connector {oid or pos} must include style.line_width")
-            if kind in {"native_table", "table"}:
-                table_data = obj.get("table_data")
-                if not isinstance(table_data, dict):
-                    issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data")
-                else:
-                    if not isinstance(table_data.get("rows"), list) or _nonempty_cells(table_data.get("rows")) < 6:
-                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include non-empty table_data.rows")
-                    if "col_widths" not in table_data:
-                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.col_widths")
-                    if "row_heights" not in table_data:
-                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.row_heights")
-                    elif not any(isinstance(value, (int, float)) and value > 0 for value in table_data.get("row_heights", [])):
-                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include positive table_data.row_heights")
-                    if "cell_padding" not in table_data:
-                        issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include table_data.cell_padding")
-                bbox = obj.get("bbox")
-                if not (
-                    isinstance(bbox, list)
-                    and len(bbox) >= 4
-                    and isinstance(bbox[3], (int, float))
-                    and bbox[3] > 0
-                ):
-                    issues.append(f"slide{idx:02d}_object_graph.json table {oid or pos} must include explicit bbox height")
-            if kind in {"native_chart", "chart"}:
-                chart_data = obj.get("chart_data")
-                if not isinstance(chart_data, dict):
-                    issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data")
-                else:
-                    if not isinstance(chart_data.get("categories"), list) or not chart_data.get("categories"):
-                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.categories")
-                    if not isinstance(chart_data.get("series"), list) or not chart_data.get("series"):
-                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.series")
-                    plot_area = chart_data.get("plot_area")
-                    if not (
-                        isinstance(plot_area, dict)
-                        and all(isinstance(plot_area.get(key), (int, float)) for key in ("x", "y", "w", "h"))
-                        and plot_area.get("h", 0) > 0
-                    ):
-                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include measured chart_data.plot_area")
-                    plot_area_px = chart_data.get("plot_area_px")
-                    if not (
-                        isinstance(plot_area_px, list)
-                        and len(plot_area_px) >= 4
-                        and all(isinstance(value, (int, float)) for value in plot_area_px[:4])
-                    ):
-                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include measured chart_data.plot_area_px")
-                    if not isinstance(chart_data.get("bar_gap_width"), (int, float)):
-                        issues.append(f"slide{idx:02d}_object_graph.json chart {oid or pos} must include chart_data.bar_gap_width")
-
-        issues.extend(_object_graph_geometry_issues(idx, objects, inventory_by_id))
-        if isinstance(blueprint, dict):
-            blueprint_ids = set(_visual_region_ids(blueprint))
-            if blueprint_ids:
-                source_region_ids = {
-                    str(obj.get("source_region_id", "")).strip()
-                    for obj in objects
-                    if isinstance(obj, dict) and str(obj.get("source_region_id", "")).strip()
-                }
-                graph_region_ids = graph_ids | source_region_ids
-                missing = sorted(blueprint_ids - graph_region_ids)
-                if missing:
-                    issues.append(
-                        f"slide{idx:02d}_object_graph.json missing blueprint region ids: {', '.join(missing[:12])}"
-                    )
-
-    return len(graphs)
-
 
 
 def _visual_measurement_quality_issues(label: str, data: dict[str, object]) -> list[str]:
@@ -8484,22 +7829,22 @@ def task_controller_status(
             {
                 "id": "analysis",
                 "label": "Analysis and locked Paopao prompts",
-                "next_action": "Complete analysis_report.md, slide_story.json, prompt_selection_plan.json, prompt_selection_audit.md, and final_prompt_XX.md from the Paopao prompt library; then run check --stage analysis.",
+                "next_action": "Analysis employee may read PDF/source plus analysis/evidence_pool.json. First run extract-evidence-pool, then complete analysis_report.md, slide_story.json, prompt_selection_plan.json, prompt_selection_audit.md, and final_prompt_XX.md from the Paopao prompt library; then run check --stage analysis.",
             },
             {
                 "id": "html",
                 "label": "Signed HTML source pages",
-                "next_action": "Run generate-html for each slide to create/register the locked Paopao prompt packet; do not use any prompt outside that packet. The browser-rendered HTML is the only visual source.",
+                "next_action": "HTML employee reads only html_compact_packet_XX.md and renderer_compact_guide.md. Do not read PDF/source, analysis_report, final_prompt directly, full SKILL, full renderer_guide, prior drafts, or other pipeline materials. Run generate-html, compose HTML from compact_packet, then run register-html.",
             },
             {
                 "id": "pptx",
                 "label": "HTML-source-only PPTX render",
-                "next_action": "Run render --html-source-only, then record-commercial-render --source-of-truth html_browser_render.",
+                "next_action": "Render/QA employee reads only HTML/PPTX previews and command check results. Do not read PDF/source, analysis, final_prompt, compact/full packets, prior drafts, or other pipeline materials. Run render --html-source-only, then record-commercial-render --source-of-truth html_browser_render.",
             },
             {
                 "id": "delivery",
                 "label": "Final delivery",
-                "next_action": "Run finalize-delivery after real PPTX review passes.",
+                "next_action": "Delivery employee uses only delivery gates, HTML/PPTX previews, and check results; do not reopen PDF/source, analysis, final_prompt, prior drafts, or other pipeline materials. Run finalize-delivery after review passes.",
             },
         ]
     else:
@@ -8603,8 +7948,11 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step"] = "analysis"
             state["step_number"] = 1
             state["instruction"] = (
-                "Read source materials and produce Paopao prompt-library artifacts:\n"
-                "  1. analysis/analysis_report.md — synthesized report and source-backed conclusions\n"
+                "Analysis employee context boundary: you may read PDF/source files and analysis/evidence_pool.json. "
+                "Downstream employees must not reopen PDF/source.\n"
+                "Produce Paopao prompt-library artifacts:\n"
+                "  0. Run: paopao_run.py extract-evidence-pool --task-dir <dir>\n"
+                "  1. analysis/analysis_report.md — synthesized report and source-backed conclusions; cite evidence_pool facts where possible\n"
                 "  2. analysis/slide_story.json — one role/brief per slide\n"
                 "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
                 "     This selects a prompt template for each page and outputs fill_zones for each.\n"
@@ -8644,9 +7992,13 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["instruction"] = (
                 f"Prepare/register the locked Paopao HTML prompt packet for slide {slide_idx}:\n"
                 f"  paopao_run.py generate-html --task-dir <dir> --slide {slide_idx}\n"
-                "If the command returns prompt_packet_ready, generate html/slideXX.html from that packet only, "
-                "including the required meta marker, then rerun generate-html to register it.\n"
-                "Do not use a self-written prompt. Do not generate Image2. Do not switch to direct_pptx/object_graph.\n"
+                "HTML employee context boundary: read only the returned compact_packet and "
+                "qa/html_generation_requests/renderer_compact_guide.md.\n"
+                "Do not read PDF/source, analysis_report, final_prompt directly, full SKILL, full renderer_guide, "
+                "prior drafts, or other pipeline materials.\n"
+                "If the command returns prompt_packet_ready, generate html/slideXX.html from compact_packet only, "
+                "including the required meta marker, then run:\n"
+                f"  paopao_run.py register-html --task-dir <dir> --slide {slide_idx}\n"
                 "When done, run: paopao_run.py next --task-dir <dir>"
             )
             if html_issues:
@@ -8663,6 +8015,8 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step"] = "render"
             state["step_number"] = 3
             state["instruction"] = (
+                "Render/QA employee context boundary: inspect only HTML/PPTX previews and command check results. "
+                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
                 "Convert HTML to editable PPTX through the HTML-source-only renderer:\n"
                 "  1. Run: paopao_run.py render --task-dir <dir> --pptx pptx/deck.pptx --html-source-only\n"
                 "  2. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html "
@@ -8679,6 +8033,8 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step"] = "record_render"
             state["step_number"] = 3
             state["instruction"] = (
+                "Render/QA employee context boundary: inspect only HTML/PPTX previews and command check results. "
+                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
                 "Record the HTML-source-only commercial render contract:\n"
                 "  Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html "
                 "--source-of-truth html_browser_render --pptx pptx/deck.pptx"
@@ -8697,8 +8053,10 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step"] = "review"
         state["step_number"] = 4
         state["instruction"] = (
+            "QA employee context boundary: inspect only browser HTML preview, actual PPTX preview, and check results. "
+            "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
             "Open the browser HTML preview and the actual PPTX preview. If PPTX differs from the browser render, "
-            "fix renderer behavior or rerender from HTML; do not switch to Image2.\n"
+            "fix renderer behavior or rerender from HTML; stay on the current HTML-source-only path.\n"
             "When review is complete, run:\n"
             "  paopao_run.py finalize-delivery --task-dir <dir> --pptx pptx/deck.pptx"
         )
@@ -8760,7 +8118,7 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["step"] = "image2_prepare"
             state["step_number"] = 2
             state["instruction"] = (
-                "Run: paopao_run.py prepare-image2-prompts --task-dir <dir>\n"
+                "Run: paopao_lab.py prepare-image2-prompts --task-dir <dir>\n"
                 "This locks the per-slide prompts for image generation."
             )
         elif missing:
@@ -8770,16 +8128,16 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["current_slide"] = slide
             state["instruction"] = (
                 f"Generate Image2 for slide {slide}:\n"
-                f"  1. Run: paopao_run.py start-image2-generation --task-dir <dir> --slide {slide}\n"
+                f"  1. Run: paopao_lab.py start-image2-generation --task-dir <dir> --slide {slide}\n"
                 f"  2. Use a controlled generator that reads image2/generation_request_{slide:02d}.json prompt_text exactly. "
                 f"Do not paste, summarize, compress, translate, or rewrite the prompt in chat.\n"
                 f"  3. Register the actual original image-generation output only. Do not register a manually redrawn, simplified, "
                 f"smoke-test, screenshot, or replacement reference.\n"
-                f"  4. Register: paopao_run.py register-image2-reference --task-dir <dir> "
+                f"  4. Register: paopao_lab.py register-image2-reference --task-dir <dir> "
                 f"--slide {slide} --image <output_path> --generation-request image2/generation_request_{slide:02d}.json "
                 f"--generated-prompt-sha256 <sha> --source image_gen_builtin --tool-call-id <id> "
                 f"--controlled-generation image2/controlled_generation_{slide:02d}.json\n"
-                f"When done, run: paopao_run.py next --task-dir <dir>"
+                f"When done, run: paopao_lab.py next --task-dir <dir>"
             )
         else:
             state["step"] = "image2_fix"
@@ -8798,7 +8156,7 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             "clean_background, linework_and_borders, material_simplicity, title_weight, "
             "module_density, takeaway, color_hierarchy, and icons.\n"
             "Do not proceed from the prompt text; inspect the actual generated images.\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
+            "When done, run: paopao_lab.py next --task-dir <dir>"
         )
         state["issues"] = style_review_issues
         return state
@@ -8810,8 +8168,8 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["instruction"] = (
             "Show all Image2 reference images to the user for approval.\n"
             "After user responds, run:\n"
-            "  paopao_run.py record-image2-user-review --task-dir <dir> --approved <yes|no> --feedback '<text>'\n"
-            "Then run: paopao_run.py next --task-dir <dir>"
+            "  paopao_lab.py record-image2-user-review --task-dir <dir> --approved <yes|no> --feedback '<text>'\n"
+            "Then run: paopao_lab.py next --task-dir <dir>"
         )
         if user_review_issues:
             state["issues"] = user_review_issues
@@ -8836,7 +8194,7 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step"] = "memory_boundary"
         state["step_number"] = 5
         state["instruction"] = (
-            "Run: paopao_run.py forget-after-image2 --task-dir <dir>\n"
+            "Run: paopao_lab.py forget-after-image2 --task-dir <dir>\n"
             "This enforces the memory boundary — after this point, reconstruction "
             "must be based solely on the selected Image2 reference images."
         )
@@ -8864,7 +8222,7 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             f"and marked small image/icon assets when needed. Never use a whole-slide screenshot.\n"
             f"  4. Do not write python-pptx. Do not use compile_object_graph, object_graph, observation, visual_inventory, "
             f"or layout_plan as the production path.\n"
-            f"When done, run: paopao_run.py next --task-dir <dir>"
+            f"When done, run: paopao_lab.py next --task-dir <dir>"
         )
         return state
     if html_issues:
@@ -8889,11 +8247,11 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         state["step_number"] = 7
         state["instruction"] = (
             "Convert the hand-authored HTML/CSS into editable PPTX through the production renderer:\n"
-            "  1. Run: paopao_run.py render --task-dir <dir> --pptx pptx/deck.pptx\n"
-            "  2. Then run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html --pptx pptx/deck.pptx\n"
+            "  1. Run: paopao_lab.py render --task-dir <dir> --pptx pptx/deck.pptx\n"
+            "  2. Then run: paopao_lab.py record-commercial-render --task-dir <dir> --render-path html --pptx pptx/deck.pptx\n"
             "renderer.py is the format converter for this production path. Do not replace it with python-pptx or "
             "compile_object_graph.\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
+            "When done, run: paopao_lab.py next --task-dir <dir>"
         )
         if render_issues:
             state["issues"] = render_issues
@@ -9329,8 +8687,8 @@ def _stage_from_text(text: str) -> str:
     ]):
         return "qa_review"
     if any(token in lower for token in [
-        "build-object-graph", "build-powerpoint-layout-plan", "compile-object", "compile --task-dir",
-        "direct_pptx", "object_graph", "compile_object_graph", "native_chart", "native_table",
+        "build-powerpoint-layout-plan",
+        "direct_pptx", "native_chart", "native_table",
     ]):
         return "direct_reconstruction"
     if any(token in lower for token in [
@@ -9973,7 +9331,6 @@ def cmd_generate_html(args: argparse.Namespace) -> int:
         raise SystemExit(f"--slide must be between 1 and {expected}")
 
     ensure_workflow_file("SYSTEM_PROMPT.md")
-    ensure_workflow_file("renderer_guide.md")
     system_prompt_sha = sha256_file(SYSTEM_PROMPT)
     manifest_path = html_generation_manifest_path(task_dir)
     manifest = _read_json_file(manifest_path) or {
@@ -10045,22 +9402,128 @@ def cmd_generate_html(args: argparse.Namespace) -> int:
         ])
         if not prompt_packet.exists() or read_text(prompt_packet) != packet_text:
             prompt_packet.write_text(packet_text, encoding="utf-8")
-        if (
-            not html_path.exists()
-            or not read_text(html_path).strip()
-            or html_path.stat().st_mtime < prompt_packet.stat().st_mtime
-            or required_marker not in read_text(html_path)
-        ):
-            written.append({
-                "slide": idx,
-                "status": "prompt_packet_ready",
-                "prompt_packet": str(prompt_packet.relative_to(task_dir)),
-                "prompt_packet_id": prompt_packet_id,
-                "required_html_marker": required_marker,
-                "html_path": str(html_path.relative_to(task_dir)),
-                "next_action": "Use only this locked prompt packet to generate html/slideXX.html, then rerun generate-html to register it.",
-            })
-            continue
+        compact_packet = write_html_compact_packet(
+            task_dir,
+            idx,
+            expected,
+            prompt_packet_id=prompt_packet_id,
+            required_marker=required_marker,
+            prompt_packet=prompt_packet,
+            final_prompt=final_prompt,
+            html_path=html_path,
+            task_manifest=task_manifest,
+        )
+        html_ready = (
+            html_path.exists()
+            and read_text(html_path).strip()
+            and html_path.stat().st_mtime >= prompt_packet.stat().st_mtime
+            and required_marker in read_text(html_path)
+        )
+        written.append({
+            "slide": idx,
+            "status": "html_ready_for_register" if html_ready else "prompt_packet_ready",
+            "prompt_packet": str(prompt_packet.relative_to(task_dir)),
+            "compact_packet": str(compact_packet.relative_to(task_dir)),
+            "prompt_packet_id": prompt_packet_id,
+            "required_html_marker": required_marker,
+            "html_path": str(html_path.relative_to(task_dir)),
+            "next_action": "Use compact_packet plus compact_renderer_guide as the only agent-facing HTML inputs. Do not read PDF, analysis, full SKILL, or full renderer_guide. Generate or update html/slideXX.html, then run register-html for this slide.",
+        })
+
+    manifest.update({
+        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
+        "generation_source": HTML_GENERATION_SOURCE,
+        "expected_pages": expected,
+        "system_prompt_sha256": system_prompt_sha,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "slides": [existing.get(i, {"slide": i, "status": "missing"}) for i in range(1, expected + 1)],
+    })
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending = list(written)
+    print(json.dumps({
+        "ok": False,
+        "task_dir": str(task_dir),
+        "registered_slides": [],
+        "pending_slides": pending,
+        "manifest": str(manifest_path),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _html_manifest_existing(manifest: dict[str, object]) -> dict[int, dict[str, object]]:
+    existing: dict[int, dict[str, object]] = {}
+    raw_slides = manifest.get("slides")
+    if isinstance(raw_slides, list):
+        for item in raw_slides:
+            if isinstance(item, dict) and isinstance(item.get("slide"), int):
+                existing[int(item["slide"])] = item
+    return existing
+
+
+def cmd_register_html(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    expected = expected_pages_from_task(task_dir)
+    if not expected:
+        raise SystemExit("Missing expected page count. Initialize task with --pages before registering HTML.")
+    if not is_html_source_only_task(task_dir):
+        raise SystemExit("register-html is only valid for html_source_only tasks.")
+    slides = list(range(1, expected + 1)) if args.all else [int(args.slide)]
+    if any(idx < 1 or idx > expected for idx in slides):
+        raise SystemExit(f"--slide must be between 1 and {expected}")
+
+    ensure_workflow_file("SYSTEM_PROMPT.md")
+    system_prompt_sha = sha256_file(SYSTEM_PROMPT)
+    manifest_path = html_generation_manifest_path(task_dir)
+    manifest = _read_json_file(manifest_path) or {
+        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
+        "generation_source": HTML_GENERATION_SOURCE,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "expected_pages": expected,
+        "system_prompt_sha256": system_prompt_sha,
+        "slides": [],
+    }
+    existing = _html_manifest_existing(manifest)
+    registered: list[dict[str, object]] = []
+    for idx in slides:
+        final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
+        html_path = task_dir / "html" / f"slide{idx:02d}.html"
+        prompt_packet = html_generation_request_path(task_dir, idx)
+        compact_packet = html_compact_packet_path(task_dir, idx)
+        if not final_prompt.exists() or not read_text(final_prompt).strip():
+            raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
+        if not prompt_packet.exists():
+            raise SystemExit(f"html_prompt_packet_{idx:02d}.md missing; run generate-html first")
+        if not compact_packet.exists():
+            raise SystemExit(f"html_compact_packet_{idx:02d}.md missing; run generate-html or compact-html-packet first")
+        if not html_path.exists() or not read_text(html_path).strip():
+            raise SystemExit(f"html/slide{idx:02d}.html missing or empty")
+        prompt_packet_id = sha256_text("|".join([
+            task_dir.name,
+            str(idx),
+            str(expected),
+            system_prompt_sha,
+            sha256_file(final_prompt),
+            HTML_GENERATION_SOURCE,
+        ]))
+        required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
+        html_text = read_text(html_path)
+        if required_marker not in html_text:
+            raise SystemExit(f"html/slide{idx:02d}.html missing required prompt packet marker: {required_marker}")
+        issues: list[str] = []
+        check_html_files(
+            task_dir,
+            expected,
+            issues,
+            source_of_truth=HTML_BROWSER_SOURCE_OF_TRUTH,
+        )
+        slide_issue_prefixes = (f"slide{idx:02d}.html", f"html/slide{idx:02d}.html", f"slide {idx}")
+        slide_issues = [
+            issue for issue in issues
+            if any(prefix.lower() in issue.lower() for prefix in slide_issue_prefixes)
+        ]
+        if slide_issues:
+            raise SystemExit("register-html blocked by HTML issues:\n- " + "\n- ".join(slide_issues[:20]))
         entry = {
             "slide": idx,
             "html_path": str(html_path.relative_to(task_dir)),
@@ -10073,12 +9536,13 @@ def cmd_generate_html(args: argparse.Namespace) -> int:
             "prompt_packet_id": prompt_packet_id,
             "prompt_packet_path": str(prompt_packet.relative_to(task_dir)),
             "prompt_packet_sha256": sha256_file(prompt_packet),
-            "generator": "codex_host_model_locked_prompt_packet",
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "compact_packet_path": str(compact_packet.relative_to(task_dir)),
+            "compact_packet_sha256": sha256_file(compact_packet),
+            "generator": "codex_host_model_compact_packet",
+            "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         existing[idx] = entry
-        written.append(entry)
-
+        registered.append(entry)
     manifest.update({
         "schema": HTML_GENERATION_MANIFEST_SCHEMA,
         "generation_source": HTML_GENERATION_SOURCE,
@@ -10089,15 +9553,219 @@ def cmd_generate_html(args: argparse.Namespace) -> int:
     })
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    pending = [item for item in written if item.get("status") == "prompt_packet_ready"]
-    registered = [item for item in written if item.get("status") != "prompt_packet_ready"]
     print(json.dumps({
-        "ok": not pending,
+        "ok": True,
         "task_dir": str(task_dir),
         "registered_slides": [item["slide"] for item in registered],
-        "pending_slides": pending,
         "manifest": str(manifest_path),
     }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def compact_renderer_guide_text() -> str:
+    """Short, agent-facing HTML rules for the html_source_only path.
+
+    This compact guide is the default production guide for the HTML composer.
+    Open the full renderer guide only when debugging a renderer failure.
+    """
+    return "\n".join([
+        "# Paopao Compact Renderer Guide",
+        "",
+        "Use this short guide when writing html_source_only slides. Do not open the full renderer guide unless debugging a renderer failure.",
+        "",
+        "1. Canvas is 1920x1080; root slide must be one overflow:hidden flex column.",
+        "2. Structure order: visible nav, title, content, takeaway, source.",
+        "3. Content wrapper uses flex:1 1 auto; min-height:0; fill at least 90% of available height.",
+        "4. Use only #305496, #4472C4, #5B9BD5, #D9EAF7, #EAF1F8, #B4C7E7, #FFFFFF, #1C1917, #666666.",
+        "5. White is dominant; deep blue only for narrow nav/header/takeaway/accent elements.",
+        "6. English font is Arial; Chinese font is Microsoft YaHei or PingFang SC with Arial fallback.",
+        "7. Minimum sizes on 1920x1080: title >=36px, body/table >=16px, card title >=20px, source 12-14px.",
+        "8. Use semantic <nav> or .nav; tab items must use .tab or equivalent and stay vertically centered.",
+        "9. Every required prompt zone must appear with data-paopao-zone=\"<exact zone name>\".",
+        "10. Charts and metric/chart zones should use data-chart with data-categories and data-series for editable PPT charts.",
+        "11. Do not use inline SVG, canvas, CSS background-image, or unmarked <img>.",
+        "12. Never use a whole-slide image or screenshot background.",
+        "13. Small preserved image assets are allowed only with data-pptx-image, data-pptx-preserve, and a specific reason.",
+        "14. Use standard <table> for tables; pale-blue header, thin #B4C7E7 borders.",
+        "15. Cards/tables/charts use thin borders, radius <=8px, no decorative shadows/gradients/textures.",
+        "16. Takeaway is a slim deep-blue text strip, normally 36-48px high, with readable 1-2 line synthesis.",
+        "17. Source line is small grey text at the bottom, not inside the content area.",
+        "18. Keep icons sparse and semantic; do not use letter placeholders as icons.",
+        "19. Do not let content overlap takeaway/source; reserve bottom safe area.",
+        "20. Before registering, visually check nav, title, module geometry, charts/tables, takeaway, and source.",
+        "",
+    ])
+
+
+def _extract_prompt_header(final_prompt_text: str) -> dict[str, str]:
+    fields = {
+        "fill_origin": "",
+        "prompt_template": "",
+        "layout_name": "",
+        "title": "",
+        "bottom": "",
+        "source": "",
+    }
+    for raw_line in final_prompt_text.splitlines():
+        line = raw_line.strip()
+        upper = line.upper()
+        if upper.startswith("FILL_ORIGIN:"):
+            fields["fill_origin"] = line.split(":", 1)[1].strip()
+        elif upper.startswith("PROMPT_TEMPLATE:"):
+            fields["prompt_template"] = line.split(":", 1)[1].strip().strip('"')
+        elif upper.startswith("LAYOUT_NAME:"):
+            fields["layout_name"] = line.split(":", 1)[1].strip().strip('"')
+        elif upper.startswith("TITLE:") and not fields["title"]:
+            fields["title"] = line.split(":", 1)[1].strip().strip('"')
+        elif upper.startswith("BOTTOM:") and not fields["bottom"]:
+            fields["bottom"] = line.split(":", 1)[1].strip().strip('"')
+        elif upper.startswith("SOURCE:") and not fields["source"]:
+            fields["source"] = line.split(":", 1)[1].strip()
+    return fields
+
+
+def write_compact_renderer_guide(task_dir: Path) -> Path:
+    path = html_compact_renderer_guide_path(task_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = compact_renderer_guide_text()
+    if not path.exists() or read_text(path) != text:
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def write_html_compact_packet(
+    task_dir: Path,
+    idx: int,
+    expected: int,
+    *,
+    prompt_packet_id: str,
+    required_marker: str,
+    prompt_packet: Path,
+    final_prompt: Path,
+    html_path: Path,
+    task_manifest: dict[str, object],
+) -> Path:
+    final_prompt_text = read_text(final_prompt)
+    header = _extract_prompt_header(final_prompt_text)
+    guide_path = write_compact_renderer_guide(task_dir)
+    compact = {
+        "schema": "paopao.html_compact_packet.v1",
+        "purpose": "Token-saving work order for the HTML composer. The full locked packet remains the provenance source.",
+        "task_name": task_dir.name,
+        "slide": idx,
+        "expected_pages": expected,
+        "language": str(task_manifest.get("language", "") or ""),
+        "focus": str(task_manifest.get("focus", "") or ""),
+        "output_html_path": str(html_path.relative_to(task_dir)),
+        "full_prompt_packet_path": str(prompt_packet.relative_to(task_dir)),
+        "full_prompt_packet_sha256": sha256_file(prompt_packet) if prompt_packet.exists() else "",
+        "prompt_packet_id": prompt_packet_id,
+        "required_html_marker": required_marker,
+        "renderer_compact_guide": str(guide_path.relative_to(task_dir)),
+        "renderer_compact_guide_sha256": sha256_file(guide_path),
+        "final_prompt_path": str(final_prompt.relative_to(task_dir)),
+        "final_prompt_sha256": sha256_file(final_prompt),
+        "prompt_header": header,
+        "navigation_contract": build_deck_navigation_contract(task_dir, idx),
+        "zone_execution_contract": prompt_zone_contract_for_slide(task_dir, idx),
+        "composer_rules": [
+            "Generate one complete HTML slide only.",
+            "Use the exact required_html_marker in <head>.",
+            "Use only the final_prompt below plus this compact packet; do not consult analysis, PDF/source, old drafts, or memory.",
+            f"Every required zone must appear as an element with {HTML_ZONE_ATTR}.",
+            "Use compact renderer guide rules; do not open the full renderer guide unless blocked.",
+        ],
+        "final_prompt": final_prompt_text,
+    }
+    text = "\n".join([
+        "# Paopao Compact HTML Packet",
+        "",
+        "Read this file instead of the full locked HTML prompt packet when composing HTML.",
+        "The full packet is still recorded for provenance and registration.",
+        "",
+        "```json",
+        json.dumps(compact, ensure_ascii=False, indent=2, sort_keys=True),
+        "```",
+        "",
+    ])
+    path = html_compact_packet_path(task_dir, idx)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or read_text(path) != text:
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def cmd_compact_html_packet(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve()
+    expected = expected_pages_from_task(task_dir)
+    if not expected:
+        raise SystemExit("Missing expected page count. Initialize task with --pages first.")
+    if not is_html_source_only_task(task_dir):
+        raise SystemExit("compact-html-packet is only valid for html_source_only tasks.")
+    slides = list(range(1, expected + 1)) if args.all else [int(args.slide)]
+    task_manifest = read_task_manifest(task_dir)
+    system_prompt = ensure_workflow_file("SYSTEM_PROMPT.md")
+    system_prompt_sha = sha256_file(system_prompt)
+    written = []
+    for idx in slides:
+        if idx < 1 or idx > expected:
+            raise SystemExit(f"--slide must be between 1 and {expected}")
+        final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
+        if not final_prompt.exists() or not read_text(final_prompt).strip():
+            raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
+        html_path = task_dir / "html" / f"slide{idx:02d}.html"
+        prompt_packet = html_generation_request_path(task_dir, idx)
+        if not prompt_packet.exists():
+            raise SystemExit(
+                f"Full locked packet missing for slide {idx}. Run generate-html first: "
+                f"paopao_run.py generate-html --task-dir {task_dir} --slide {idx}"
+            )
+        prompt_packet_id = sha256_text("|".join([
+            task_dir.name,
+            str(idx),
+            str(expected),
+            system_prompt_sha,
+            sha256_file(final_prompt),
+            HTML_GENERATION_SOURCE,
+        ]))
+        required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
+        compact_path = write_html_compact_packet(
+            task_dir,
+            idx,
+            expected,
+            prompt_packet_id=prompt_packet_id,
+            required_marker=required_marker,
+            prompt_packet=prompt_packet,
+            final_prompt=final_prompt,
+            html_path=html_path,
+            task_manifest=task_manifest,
+        )
+        written.append({
+            "slide": idx,
+            "compact_packet": str(compact_path.relative_to(task_dir)),
+            "compact_packet_sha256": sha256_file(compact_path),
+        })
+    print(json.dumps({
+        "ok": True,
+        "task_dir": str(task_dir),
+        "compact_renderer_guide": str(write_compact_renderer_guide(task_dir).relative_to(task_dir)),
+        "slides": written,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_compact_renderer_guide(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir).resolve() if args.task_dir else Path.cwd()
+    text = compact_renderer_guide_text()
+    if args.output:
+        out = Path(args.output)
+        if not out.is_absolute():
+            out = task_dir / out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(json.dumps({"ok": True, "output": str(out), "sha256": sha256_file(out)}, ensure_ascii=False, indent=2))
+    else:
+        print(text)
     return 0
 
 
@@ -10172,15 +9840,6 @@ def cmd_render(args: argparse.Namespace) -> int:
     return proc.returncode
 
 
-def cmd_compile(args: argparse.Namespace) -> int:
-    """REMOVED — generic object-graph compiler has been deleted from the codebase."""
-    print(json.dumps({
-        "ok": False,
-        "issue": "The compile command has been permanently removed. Use the HTML renderer path: paopao_run.py render.",
-    }, ensure_ascii=False, indent=2), file=sys.stderr)
-    return 2
-
-
 def cmd_package(args: argparse.Namespace) -> int:
     src = PLUGIN_ROOT
     out = Path(args.output).resolve()
@@ -10202,6 +9861,7 @@ def cmd_package(args: argparse.Namespace) -> int:
             ".codex-plugin/plugin.json",
             "README.md",
             "scripts/paopao_auth.py",
+            "scripts/paopao_lab.py",
             "scripts/paopao_run.py",
             "scripts/paopao_update.py",
             "scripts/pptx_qa.py",
@@ -10251,9 +9911,10 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 0 if required_files_ok and modules_ok else 1
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, include_lab: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="paopao helper")
     sub = parser.add_subparsers(dest="command", required=True)
+    pipeline_mode_choices = sorted(PIPELINE_MODE_VALUES) if include_lab else [PIPELINE_MODE_HTML_SOURCE_ONLY]
 
     init = sub.add_parser("init", help="Create a Paopao task folder")
     init.add_argument("--name", required=True)
@@ -10261,7 +9922,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--pages", type=int, default=None)
     init.add_argument("--language", default="")
     init.add_argument("--focus", default="")
-    init.add_argument("--pipeline-mode", default=PIPELINE_MODE_HTML_SOURCE_ONLY, choices=sorted(PIPELINE_MODE_VALUES))
+    init.add_argument("--pipeline-mode", default=PIPELINE_MODE_HTML_SOURCE_ONLY, choices=pipeline_mode_choices)
     init.set_defaults(func=cmd_init)
 
     make_deck = sub.add_parser(
@@ -10275,7 +9936,7 @@ def build_parser() -> argparse.ArgumentParser:
     make_deck.add_argument("--pages", type=int, default=None)
     make_deck.add_argument("--language", default="")
     make_deck.add_argument("--focus", default="")
-    make_deck.add_argument("--pipeline-mode", default=PIPELINE_MODE_HTML_SOURCE_ONLY, choices=sorted(PIPELINE_MODE_VALUES))
+    make_deck.add_argument("--pipeline-mode", default=PIPELINE_MODE_HTML_SOURCE_ONLY, choices=pipeline_mode_choices)
     make_deck.set_defaults(func=cmd_make_deck)
 
     fetch_workflow = sub.add_parser(
@@ -10303,6 +9964,14 @@ def build_parser() -> argparse.ArgumentParser:
     plan_prompts.add_argument("--topic", default="")
     plan_prompts.set_defaults(func=cmd_plan_prompts)
 
+    evidence_pool = sub.add_parser(
+        "extract-evidence-pool",
+        help="Extract source facts into analysis/evidence_pool.json for downstream context isolation",
+    )
+    evidence_pool.add_argument("--task-dir", required=True)
+    evidence_pool.add_argument("--max-facts", type=int, default=160)
+    evidence_pool.set_defaults(func=cmd_extract_evidence_pool)
+
     fill_prompt = sub.add_parser(
         "fill-prompt-template",
         help="Fill one allowed prompt template through the server-side fill API",
@@ -10321,6 +9990,33 @@ def build_parser() -> argparse.ArgumentParser:
     generate_html.add_argument("--all", action="store_true")
     generate_html.set_defaults(func=cmd_generate_html)
 
+    register_html = sub.add_parser(
+        "register-html",
+        help="Register finished HTML against the locked prompt packet and compact work order",
+    )
+    register_html.add_argument("--task-dir", required=True)
+    register_html.add_argument("--slide", type=int, default=1)
+    register_html.add_argument("--all", action="store_true")
+    register_html.set_defaults(func=cmd_register_html)
+
+    if include_lab:
+        compact_html = sub.add_parser(
+            "compact-html-packet",
+            help="Write token-saving agent-facing HTML work orders derived from locked prompt packets",
+        )
+        compact_html.add_argument("--task-dir", required=True)
+        compact_html.add_argument("--slide", type=int, default=1)
+        compact_html.add_argument("--all", action="store_true")
+        compact_html.set_defaults(func=cmd_compact_html_packet)
+
+        compact_guide = sub.add_parser(
+            "compact-renderer-guide",
+            help="Print or write the short HTML renderer checklist for agents",
+        )
+        compact_guide.add_argument("--task-dir", default="")
+        compact_guide.add_argument("--output", default="")
+        compact_guide.set_defaults(func=cmd_compact_renderer_guide)
+
     render = sub.add_parser("render", help="Render task HTML slides to PPTX")
     render.add_argument("--task-dir", required=True)
     render.add_argument("--pptx", required=True)
@@ -10328,198 +10024,177 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--html-source-only",
         action="store_true",
-        help="Treat the browser-rendered HTML preview as the sole visual reference; skip Image2 gates.",
+        help="Treat the browser-rendered HTML preview as the sole visual reference.",
     )
     render.add_argument("html", nargs="*")
     render.set_defaults(func=cmd_render)
 
 
-    image2 = sub.add_parser(
-        "prepare-image2-prompts",
-        help="Build locked per-slide Image2 prompt files and provenance manifest",
-    )
-    image2.add_argument("--task-dir", required=True)
-    image2.set_defaults(func=cmd_prepare_image2_prompts)
+    if include_lab:
+        image2 = sub.add_parser(
+            "prepare-image2-prompts",
+            help="Build locked per-slide Image2 prompt files and provenance manifest",
+        )
+        image2.add_argument("--task-dir", required=True)
+        image2.set_defaults(func=cmd_prepare_image2_prompts)
 
-    start_image2 = sub.add_parser(
-        "start-image2-generation",
-        help="Issue a controlled per-slide Image2 generation record from the locked prompt file",
-    )
-    start_image2.add_argument("--task-dir", required=True)
-    start_image2.add_argument("--slide", type=int, required=True)
-    start_image2.set_defaults(func=cmd_start_image2_generation)
+        start_image2 = sub.add_parser(
+            "start-image2-generation",
+            help="Issue a controlled per-slide Image2 generation record from the locked prompt file",
+        )
+        start_image2.add_argument("--task-dir", required=True)
+        start_image2.add_argument("--slide", type=int, required=True)
+        start_image2.set_defaults(func=cmd_start_image2_generation)
 
-    user_review = sub.add_parser(
-        "record-image2-user-review",
-        help="Record user approval or requested changes after showing selected Image2 references",
-    )
-    user_review.add_argument("--task-dir", required=True)
-    user_review.add_argument("--pages", type=int, default=None)
-    user_review.add_argument(
-        "--approved",
-        required=True,
-        choices=["yes", "no", "true", "false", "approved", "changes_requested"],
-    )
-    user_review.add_argument("--feedback", required=True)
-    user_review.set_defaults(func=cmd_record_image2_user_review)
+        user_review = sub.add_parser(
+            "record-image2-user-review",
+            help="Record user approval or requested changes after showing selected Image2 references",
+        )
+        user_review.add_argument("--task-dir", required=True)
+        user_review.add_argument("--pages", type=int, default=None)
+        user_review.add_argument(
+            "--approved",
+            required=True,
+            choices=["yes", "no", "true", "false", "approved", "changes_requested"],
+        )
+        user_review.add_argument("--feedback", required=True)
+        user_review.set_defaults(func=cmd_record_image2_user_review)
 
-    forget = sub.add_parser(
-        "forget-after-image2",
-        help="Lock the post-image memory boundary so reconstruction can use selected images only",
-    )
-    forget.add_argument("--task-dir", required=True)
-    forget.add_argument("--pages", type=int, default=None)
-    forget.set_defaults(func=cmd_forget_after_image2)
+        forget = sub.add_parser(
+            "forget-after-image2",
+            help="Lock the post-image memory boundary so reconstruction can use selected images only",
+        )
+        forget.add_argument("--task-dir", required=True)
+        forget.add_argument("--pages", type=int, default=None)
+        forget.set_defaults(func=cmd_forget_after_image2)
 
-    observation = sub.add_parser(
-        "record-image2-observation",
-        help="Record the fresh visual observation used as the only source for post-approval reconstruction",
-    )
-    observation.add_argument("--task-dir", required=True)
-    observation.add_argument("--slide", type=int, required=True)
-    observation.add_argument(
-        "--evidence",
-        required=True,
-        help="Concrete visual observation from reopening the selected image; at least 120 characters.",
-    )
-    observation.set_defaults(func=cmd_record_image2_observation)
+        observation = sub.add_parser(
+            "record-image2-observation",
+            help="Record the fresh visual observation used as the only source for post-approval reconstruction",
+        )
+        observation.add_argument("--task-dir", required=True)
+        observation.add_argument("--slide", type=int, required=True)
+        observation.add_argument(
+            "--evidence",
+            required=True,
+            help="Concrete visual observation from reopening the selected image; at least 120 characters.",
+        )
+        observation.set_defaults(func=cmd_record_image2_observation)
 
-    extract_contract = sub.add_parser(
-        "extract-image2-contract",
-        help="Generate an initial visual contract from the selected Image2 reference pixels",
-    )
-    extract_contract.add_argument("--task-dir", required=True)
-    extract_contract.add_argument("--slide", type=int, required=True)
-    extract_contract.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing slideXX_visual_contract.json.",
-    )
-    extract_contract.set_defaults(func=cmd_extract_image2_contract)
+        extract_contract = sub.add_parser(
+            "extract-image2-contract",
+            help="Generate an initial visual contract from the selected Image2 reference pixels",
+        )
+        extract_contract.add_argument("--task-dir", required=True)
+        extract_contract.add_argument("--slide", type=int, required=True)
+        extract_contract.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite an existing slideXX_visual_contract.json.",
+        )
+        extract_contract.set_defaults(func=cmd_extract_image2_contract)
 
-    visual_blueprint = sub.add_parser(
-        "build-visual-blueprint",
-        help="Build the locked editable PPTX blueprint from the selected Image2 visual contract",
-    )
-    visual_blueprint.add_argument("--task-dir", required=True)
-    visual_blueprint.add_argument("--slide", type=int, required=True)
-    visual_blueprint.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing slideXX_visual_blueprint.json.",
-    )
-    visual_blueprint.set_defaults(func=cmd_build_visual_blueprint)
+        layout_plan = sub.add_parser(
+            "build-powerpoint-layout-plan",
+            help="Build a PowerPoint-aware layout plan from visual inventory before object graph authoring",
+        )
+        layout_plan.add_argument("--task-dir", required=True)
+        layout_plan.add_argument("--slide", type=int, required=True)
+        layout_plan.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite an existing slideXX_powerpoint_layout_plan.json.",
+        )
+        layout_plan.set_defaults(func=cmd_build_powerpoint_layout_plan)
 
-    layout_plan = sub.add_parser(
-        "build-powerpoint-layout-plan",
-        help="Build a PowerPoint-aware layout plan from visual inventory before object graph authoring",
-    )
-    layout_plan.add_argument("--task-dir", required=True)
-    layout_plan.add_argument("--slide", type=int, required=True)
-    layout_plan.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing slideXX_powerpoint_layout_plan.json.",
-    )
-    layout_plan.set_defaults(func=cmd_build_powerpoint_layout_plan)
+        extract_codex_image = sub.add_parser(
+            "extract-codex-imagegen-result",
+            help="Extract a Codex built-in image_gen PNG result from session logs by tool-call id",
+        )
+        extract_codex_image.add_argument("--tool-call-id", required=True)
+        extract_codex_image.add_argument("--output", required=True)
+        extract_codex_image.add_argument(
+            "--session",
+            default="",
+            help="Optional rollout .jsonl path. Defaults to newest ~/.codex/sessions/**/*.jsonl files.",
+        )
+        extract_codex_image.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite output if it already exists.",
+        )
+        extract_codex_image.set_defaults(func=cmd_extract_codex_imagegen_result)
 
-    object_graph = sub.add_parser(
-        "build-object-graph",
-        help="Build the executable direct-PPTX object graph from visual inventory or locked visual blueprint",
-    )
-    object_graph.add_argument("--task-dir", required=True)
-    object_graph.add_argument("--slide", type=int, required=True)
-    object_graph.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing slideXX_object_graph.json.",
-    )
-    object_graph.set_defaults(func=cmd_build_visual_object_graph)
+        token_audit = sub.add_parser(
+            "token-audit",
+            help="Read real Codex session token usage and group it by Paopao pipeline stage",
+        )
+        token_audit.add_argument(
+            "--session",
+            default="",
+            help="Rollout jsonl path or session id substring. Defaults to recent ~/.codex/sessions logs.",
+        )
+        token_audit.add_argument(
+            "--recent",
+            type=int,
+            default=1,
+            help="Number of recent sessions to scan when --session is omitted.",
+        )
+        token_audit.add_argument("--output", default="", help="Optional Markdown report path")
+        token_audit.add_argument("--json", default="", help="Optional JSON report path")
+        token_audit.add_argument(
+            "--fail-on-waste",
+            action="store_true",
+            help="Exit non-zero when the session contains large outputs, failed commands, or repeated commands.",
+        )
+        token_audit.set_defaults(func=cmd_token_audit)
 
-    extract_codex_image = sub.add_parser(
-        "extract-codex-imagegen-result",
-        help="Extract a Codex built-in image_gen PNG result from session logs by tool-call id",
-    )
-    extract_codex_image.add_argument("--tool-call-id", required=True)
-    extract_codex_image.add_argument("--output", required=True)
-    extract_codex_image.add_argument(
-        "--session",
-        default="",
-        help="Optional rollout .jsonl path. Defaults to newest ~/.codex/sessions/**/*.jsonl files.",
-    )
-    extract_codex_image.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite output if it already exists.",
-    )
-    extract_codex_image.set_defaults(func=cmd_extract_codex_imagegen_result)
-
-    token_audit = sub.add_parser(
-        "token-audit",
-        help="Read real Codex session token usage and group it by Paopao pipeline stage",
-    )
-    token_audit.add_argument(
-        "--session",
-        default="",
-        help="Rollout jsonl path or session id substring. Defaults to recent ~/.codex/sessions logs.",
-    )
-    token_audit.add_argument(
-        "--recent",
-        type=int,
-        default=1,
-        help="Number of recent sessions to scan when --session is omitted.",
-    )
-    token_audit.add_argument("--output", default="", help="Optional Markdown report path")
-    token_audit.add_argument("--json", default="", help="Optional JSON report path")
-    token_audit.add_argument(
-        "--fail-on-waste",
-        action="store_true",
-        help="Exit non-zero when the session contains large outputs, failed commands, or repeated commands.",
-    )
-    token_audit.set_defaults(func=cmd_token_audit)
-
-    register_image2 = sub.add_parser(
-        "register-image2-reference",
-        help="Register one generated Image2 reference with locked prompt-sha provenance",
-    )
-    register_image2.add_argument("--task-dir", required=True)
-    register_image2.add_argument("--slide", type=int, required=True)
-    register_image2.add_argument("--image", required=True)
-    register_image2.add_argument(
-        "--generation-request",
-        required=True,
-        help="Locked generation_request_XX.json whose prompt_text was used exactly for image generation.",
-    )
-    register_image2.add_argument("--generated-prompt-sha256", required=True)
-    register_image2.add_argument(
-        "--source",
-        required=True,
-        choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS),
-        help="Provenance source for the selected reference; local screenshots/previews are rejected.",
-    )
-    register_image2.add_argument(
-        "--tool-call-id",
-        required=True,
-        help="Non-empty image generation tool call, job, or artifact id used for provenance audit.",
-    )
-    register_image2.add_argument(
-        "--controlled-generation",
-        default="",
-        help="Controlled generation JSON from start-image2-generation. Defaults to image2/controlled_generation_XX.json.",
-    )
-    register_image2.add_argument(
-        "--session",
-        default="",
-        help="Optional Codex rollout .jsonl for verifying the actual built-in image_gen prompt.",
-    )
-    register_image2.set_defaults(func=cmd_register_image2_reference)
+        register_image2 = sub.add_parser(
+            "register-image2-reference",
+            help="Register one generated Image2 reference with locked prompt-sha provenance",
+        )
+        register_image2.add_argument("--task-dir", required=True)
+        register_image2.add_argument("--slide", type=int, required=True)
+        register_image2.add_argument("--image", required=True)
+        register_image2.add_argument(
+            "--generation-request",
+            required=True,
+            help="Locked generation_request_XX.json whose prompt_text was used exactly for image generation.",
+        )
+        register_image2.add_argument("--generated-prompt-sha256", required=True)
+        register_image2.add_argument(
+            "--source",
+            required=True,
+            choices=sorted(IMAGE2_ALLOWED_SOURCE_KINDS),
+            help="Provenance source for the selected reference; local screenshots/previews are rejected.",
+        )
+        register_image2.add_argument(
+            "--tool-call-id",
+            required=True,
+            help="Non-empty image generation tool call, job, or artifact id used for provenance audit.",
+        )
+        register_image2.add_argument(
+            "--controlled-generation",
+            default="",
+            help="Controlled generation JSON from start-image2-generation. Defaults to image2/controlled_generation_XX.json.",
+        )
+        register_image2.add_argument(
+            "--session",
+            default="",
+            help="Optional Codex rollout .jsonl for verifying the actual built-in image_gen prompt.",
+        )
+        register_image2.set_defaults(func=cmd_register_image2_reference)
 
     check = sub.add_parser("check", help="Validate Paopao pipeline stage invariants")
     check.add_argument("--task-dir", required=True)
     check.add_argument("--pages", type=int, default=None)
     check.add_argument(
         "--stage",
-        choices=["analysis", "image2", "html", "direct", "pptx", "all", "pipeline", "delivery"],
+        choices=(
+            ["analysis", "image2", "html", "direct", "pptx", "all", "pipeline", "delivery"]
+            if include_lab
+            else ["analysis", "html", "pptx", "all", "pipeline", "delivery"]
+        ),
         default="all",
         help="Pipeline stage to validate. Later stages include earlier checks.",
     )
@@ -10531,14 +10206,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.set_defaults(func=cmd_check)
 
-    run_task = sub.add_parser(
-        "run-task",
-        help="Report the single allowed next step for a Paopao task; final delivery still requires finalize-delivery",
-    )
-    run_task.add_argument("--task-dir", required=True)
-    run_task.add_argument("--pages", type=int, default=None)
-    run_task.add_argument("--pptx", default="")
-    run_task.set_defaults(func=cmd_run_task)
+    if include_lab:
+        run_task = sub.add_parser(
+            "run-task",
+            help="Report the single allowed next step for a Paopao task; final delivery still requires finalize-delivery",
+        )
+        run_task.add_argument("--task-dir", required=True)
+        run_task.add_argument("--pages", type=int, default=None)
+        run_task.add_argument("--pptx", default="")
+        run_task.set_defaults(func=cmd_run_task)
 
     next_cmd = sub.add_parser(
         "next",
@@ -10548,26 +10224,27 @@ def build_parser() -> argparse.ArgumentParser:
     next_cmd.add_argument("--pages", type=int, default=None)
     next_cmd.set_defaults(func=cmd_next)
 
-    audit = sub.add_parser("audit-task", help="Run a full task audit and summarize blockers before delivery")
-    audit.add_argument("--task-dir", required=True)
-    audit.add_argument("--pages", type=int, default=None)
-    audit.add_argument("--pptx", default="", help="Optional PPTX path to audit")
-    audit.set_defaults(func=cmd_audit_task)
+    if include_lab:
+        audit = sub.add_parser("audit-task", help="Run a full task audit and summarize blockers before delivery")
+        audit.add_argument("--task-dir", required=True)
+        audit.add_argument("--pages", type=int, default=None)
+        audit.add_argument("--pptx", default="", help="Optional PPTX path to audit")
+        audit.set_defaults(func=cmd_audit_task)
 
-    cleanup = sub.add_parser("cleanup-delivery", help="Remove prompt Markdown artifacts before delivery")
-    cleanup.add_argument("--task-dir", required=True)
-    cleanup.add_argument(
-        "--keep-private-prompts",
-        action="store_true",
-        help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them from task output",
-    )
-    cleanup.set_defaults(func=cmd_cleanup)
+        cleanup = sub.add_parser("cleanup-delivery", help="Remove prompt Markdown artifacts before delivery")
+        cleanup.add_argument("--task-dir", required=True)
+        cleanup.add_argument(
+            "--keep-private-prompts",
+            action="store_true",
+            help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them from task output",
+        )
+        cleanup.set_defaults(func=cmd_cleanup)
 
-    publish = sub.add_parser("publish-delivery", help="Publish user-facing PPTX, slide images, and HTML to delivery/")
-    publish.add_argument("--task-dir", required=True)
-    publish.add_argument("--pptx", default="")
-    publish.add_argument("--output-dir", default="")
-    publish.set_defaults(func=cmd_publish_delivery)
+        publish = sub.add_parser("publish-delivery", help="Publish user-facing PPTX, slide images, and HTML to delivery/")
+        publish.add_argument("--task-dir", required=True)
+        publish.add_argument("--pptx", default="")
+        publish.add_argument("--output-dir", default="")
+        publish.set_defaults(func=cmd_publish_delivery)
 
     finalize = sub.add_parser(
         "finalize-delivery",
@@ -10582,56 +10259,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     finalize.set_defaults(func=cmd_finalize_delivery)
 
-    clean_icon = sub.add_parser(
-        "clean-icon-crop",
-        help="Crop an icon from a reference image, remove detected corner background, and export a transparent PNG.",
-    )
-    clean_icon.add_argument("--image", required=True, help="Source reference image path")
-    clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h")
-    clean_icon.add_argument(
-        "--box-space",
-        choices=["source", "1920x1080"],
-        default="source",
-        help="Coordinate space for --box. Use 1920x1080 for visual-contract/direct-PPTX coordinates.",
-    )
-    clean_icon.add_argument("--output", required=True, help="Output PNG path, usually output/<task>/html/assets/<name>.png")
-    clean_icon.add_argument("--expand", type=int, default=14, help="Pixels to expand around the supplied box before cleanup")
-    clean_icon.add_argument("--padding", type=int, default=10, help="Transparent padding around the cleaned icon")
-    clean_icon.add_argument("--threshold", type=int, default=34, help="RGB distance threshold for removing detected corner background")
-    clean_icon.add_argument("--min-canvas", type=int, default=96, help="Minimum square output canvas size")
-    clean_icon.set_defaults(func=cmd_clean_icon_crop)
+    if include_lab:
+        clean_icon = sub.add_parser(
+            "clean-icon-crop",
+            help="Crop an icon from a reference image, remove detected corner background, and export a transparent PNG.",
+        )
+        clean_icon.add_argument("--image", required=True, help="Source reference image path")
+        clean_icon.add_argument("--box", required=True, help="Crop box as x,y,w,h")
+        clean_icon.add_argument(
+            "--box-space",
+            choices=["source", "1920x1080"],
+            default="source",
+            help="Coordinate space for --box. Use 1920x1080 for visual-contract/direct-PPTX coordinates.",
+        )
+        clean_icon.add_argument("--output", required=True, help="Output PNG path, usually output/<task>/html/assets/<name>.png")
+        clean_icon.add_argument("--expand", type=int, default=14, help="Pixels to expand around the supplied box before cleanup")
+        clean_icon.add_argument("--padding", type=int, default=10, help="Transparent padding around the cleaned icon")
+        clean_icon.add_argument("--threshold", type=int, default=34, help="RGB distance threshold for removing detected corner background")
+        clean_icon.add_argument("--min-canvas", type=int, default=96, help="Minimum square output canvas size")
+        clean_icon.set_defaults(func=cmd_clean_icon_crop)
 
     commercial_render = sub.add_parser(
         "record-commercial-render",
-        help="Declare whether the commercial PPTX was produced through html or direct_pptx and bind its hash",
+        help="Bind the commercial PPTX hash to the declared production render path",
     )
     commercial_render.add_argument("--task-dir", required=True)
-    commercial_render.add_argument("--render-path", required=True, choices=sorted(COMMERCIAL_RENDER_PATHS))
+    commercial_render.add_argument(
+        "--render-path",
+        required=True,
+        choices=sorted(COMMERCIAL_RENDER_PATHS if include_lab else {"html"}),
+    )
     commercial_render.add_argument(
         "--source-of-truth",
         default="",
-        choices=["", *sorted(COMMERCIAL_SOURCE_OF_TRUTH_VALUES)],
+        choices=["", *sorted(COMMERCIAL_SOURCE_OF_TRUTH_VALUES if include_lab else {HTML_BROWSER_SOURCE_OF_TRUTH})],
         help="Declared visual source for commercial delivery. Defaults to the render manifest source.",
     )
     commercial_render.add_argument("--pptx", required=True)
     commercial_render.set_defaults(func=cmd_record_commercial_render)
 
-    package = sub.add_parser("package", help="Build a zip package of this plugin")
-    package.add_argument("--output", required=True)
-    package.add_argument(
-        "--include-private-assets",
-        action="store_true",
-        help="Internal debugging only: include private prompt and workflow files in the package",
-    )
-    package.set_defaults(func=cmd_package)
+    if include_lab:
+        package = sub.add_parser("package", help="Build a zip package of this plugin")
+        package.add_argument("--output", required=True)
+        package.add_argument(
+            "--include-private-assets",
+            action="store_true",
+            help="Internal debugging only: include private prompt and workflow files in the package",
+        )
+        package.set_defaults(func=cmd_package)
 
     doctor = sub.add_parser("doctor", help="Check local plugin files")
     doctor.set_defaults(func=cmd_doctor)
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
+def main(*, include_lab: bool = False) -> int:
+    parser = build_parser(include_lab=include_lab)
     args = parser.parse_args()
     return args.func(args)
 
