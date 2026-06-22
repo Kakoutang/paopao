@@ -687,13 +687,24 @@ def fetch_workflow_file(name: str, destination: Path) -> None:
     destination.write_text(content + "\n", encoding="utf-8")
 
 
-def ensure_workflow_file(name: str) -> Path:
+def ensure_workflow_file(name: str, max_age_seconds: int = 86400) -> Path:
     destinations = workflow_destinations()
     if name not in destinations:
         raise SystemExit(f"Unknown workflow file: {name}")
     path = destinations[name]
-    if not path.exists() or path.stat().st_size < 80:
-        fetch_workflow_file(name, path)
+    needs_fetch = not path.exists() or path.stat().st_size < 80
+    if not needs_fetch and max_age_seconds > 0:
+        age = time.time() - path.stat().st_mtime
+        if age > max_age_seconds:
+            needs_fetch = True
+    if needs_fetch:
+        try:
+            fetch_workflow_file(name, path)
+        except SystemExit:
+            if path.exists() and path.stat().st_size >= 80:
+                pass
+            else:
+                raise
     return path
 
 
@@ -9951,6 +9962,7 @@ def cmd_generate_html(args: argparse.Namespace) -> int:
         raise SystemExit(f"--slide must be between 1 and {expected}")
 
     ensure_workflow_file("SYSTEM_PROMPT.md")
+    ensure_workflow_file("renderer_guide.md")
     system_prompt_sha = sha256_file(SYSTEM_PROMPT)
     manifest_path = html_generation_manifest_path(task_dir)
     manifest = _read_json_file(manifest_path) or {
