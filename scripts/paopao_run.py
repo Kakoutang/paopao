@@ -9719,8 +9719,92 @@ def _detail_rows_from_text(text: str) -> list[dict[str, object]]:
     for label, pattern in row_markers:
         match = re.search(pattern, text or "", flags=re.IGNORECASE | re.DOTALL)
         if match:
-            rows.append({"label": label, "cells": _split_compact_items(match.group(1))})
+            role = _detail_row_role(label)
+            raw_cells = _split_detail_cells(match.group(1))
+            rows.append({
+                "label": label,
+                "role": role,
+                "cells": [
+                    _detail_cell_spec(cell, role, idx)
+                    for idx, cell in enumerate(raw_cells)
+                ],
+            })
     return rows
+
+
+def _detail_row_role(label: str) -> str:
+    lower = label.lower()
+    if "metric" in lower:
+        return "kpi"
+    if "risk" in lower or "status" in lower:
+        return "risk"
+    return "activity"
+
+
+def _split_detail_cells(text: str) -> list[str]:
+    raw = text or ""
+    if "|" in raw:
+        return [part.strip(" .") for part in raw.split("|") if part.strip(" .")]
+    return _split_compact_items(raw)
+
+
+def _extract_metric_tokens(text: str) -> list[str]:
+    raw = text or ""
+    patterns = [
+        r"20\d{2}\s*-\s*20\d{2}",
+        r"[+-]?\d[\d,]*(?:\.\d+)?%",
+        r"\d[\d,]*(?:\.\d+)?\s*tCO2e(?:\s+per\s+vehicle)?",
+        r"\d[\d,]*(?:\.\d+)?\s*vehicles?",
+        r"\d[\d,]*(?:\.\d+)?\s*credits?",
+        r"\d(?:\.\d+)?C\b",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, raw, flags=re.IGNORECASE):
+            token = re.sub(r"\s+", " ", str(match)).strip()
+            if token and token not in found:
+                found.append(token)
+    return found
+
+
+def _detail_cell_spec(text: str, role: str, index: int) -> dict[str, object]:
+    clean = re.sub(r"\s+", " ", (text or "").strip(" ."))
+    label = ""
+    body = clean
+    if ":" in clean:
+        label, body = [part.strip() for part in clean.split(":", 1)]
+    metrics = _extract_metric_tokens(body or clean)
+    spec: dict[str, object] = {
+        "text": clean,
+        "cell_role": role,
+        "stage_index": index + 1,
+    }
+    if label:
+        spec["label"] = label
+    if role == "kpi":
+        spec.update({
+            "primary_metric": metrics[0] if metrics else "",
+            "secondary_metrics": metrics[1:3],
+            "body": body,
+            "emphasis": "large_metric",
+            "visual_treatment": "large blue metric, short label, optional badge",
+        })
+    elif role == "risk":
+        severity = "watch"
+        lower = clean.lower()
+        if any(word in lower for word in ["risk", "depends", "delayed", "exposed", "must"]):
+            severity = "caution"
+        spec.update({
+            "severity": severity,
+            "emphasis": "muted_caution",
+            "visual_treatment": "small grey text with caution accent; do not compete with KPI row",
+        })
+    else:
+        spec.update({
+            "emphasis": "action_text",
+            "visual_treatment": "compact body text; align to matching stage column",
+        })
+    return spec
 
 
 def _zone_render_hint(zone: str, content: str, layout_name: str) -> dict[str, object]:
@@ -9749,10 +9833,20 @@ def _zone_render_hint(zone: str, content: str, layout_name: str) -> dict[str, ob
             "html_hint": "Render as connected chevrons or a clear horizontal process row.",
         })
     elif "DETAIL GRID" in zone_upper:
+        rows = _detail_rows_from_text(content)
+        stage_count = max((len(row.get("cells", [])) for row in rows), default=0)
         hint.update({
             "role": "detail_grid",
-            "rows": _detail_rows_from_text(content),
-            "html_hint": "Render as an aligned table/grid; keep row labels fixed and columns aligned to stages.",
+            "visual_structure": "stage_matrix",
+            "stage_count": stage_count,
+            "rows": rows,
+            "emphasis_rules": [
+                "Key metrics row is the hero row: show primary_metric large in blue, with label/badge above and body below.",
+                "Key activities row is supporting text: compact, aligned to the same stage columns, no large numbers.",
+                "Status / risk row is muted: grey text, smaller type, optional caution accent; it should not dominate the slide.",
+                "Columns must align to the stage header row; avoid a plain spreadsheet look by adding KPI badges and vertical accents.",
+            ],
+            "html_hint": "Render as a visually tiered stage matrix, not a generic table. Make KPI cells visually strongest, activity cells explanatory, and risk cells muted/cautionary.",
         })
     elif "COMMENTARY" in zone_upper:
         hint.update({
@@ -9902,6 +9996,7 @@ def write_html_compact_packet(
             "Use execution_zones only; do not reopen final_prompt, analysis, PDF/source, old drafts, or memory.",
             "Charts must use render_hint.charts and visible marks; no blank chart panels.",
             "Metric/process/grid zones must use render_hint.cards/stages/rows directly.",
+            "For detail_grid, follow render_hint.visual_structure and emphasis_rules; do not render a flat spreadsheet.",
             f"Every required zone must appear as an element with {HTML_ZONE_ATTR}.",
             "Use compact renderer guide only unless blocked.",
         ],
