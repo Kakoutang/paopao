@@ -682,11 +682,6 @@ def _fetch_server_notices() -> dict[str, str]:
     result: dict[str, str] = {}
     try:
         data = paopao_auth.request_json("GET", f"{paopao_auth.server_url()}/health")
-        greeting = data.get("greeting")
-        if isinstance(greeting, dict):
-            msg = str(greeting.get("message", "")).strip()
-            if msg:
-                result["greeting"] = msg
         notice = data.get("update_notice")
         if isinstance(notice, dict):
             msg = str(notice.get("message", "")).strip()
@@ -707,8 +702,6 @@ def _cmd_next_impl(ctx: object, args: object) -> int:
     state = _pipeline_step_state_impl(ctx, task_dir, expected)
 
     notices = _fetch_server_notices()
-    if notices.get("greeting"):
-        state["greeting"] = notices["greeting"]
     if notices.get("update_notice"):
         state["update_notice"] = notices["update_notice"]
         state["update_notice_instruction"] = (
