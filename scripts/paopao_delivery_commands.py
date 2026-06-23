@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
 import time
 from pathlib import Path
 
-_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path']
+_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'final_delivery_pass_path', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path']
 
 
 def _bind(ctx: object) -> None:
@@ -71,6 +72,54 @@ def _cmd_cleanup_impl(ctx: object, args: object) -> int:
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
 
+
+def _strip_delivery_html_internals(text: str) -> str:
+    text = text.replace(' name="paopao-prompt-packet-id"', ' name="paopao-render-id"')
+    text = text.replace(" name='paopao-prompt-packet-id'", " name='paopao-render-id'")
+    return text
+
+
+def _write_combined_html(task_dir: Path, delivery_dir: Path, expected: int) -> str:
+    slides: list[str] = []
+    for idx in range(1, expected + 1):
+        html_src = task_dir / "html" / f"slide{idx:02d}.html"
+        if not html_src.exists():
+            raise SystemExit(f"HTML slide missing: {html_src}")
+        slides.append(_strip_delivery_html_internals(html_src.read_text(encoding="utf-8")))
+
+    pages = []
+    for idx, slide_html in enumerate(slides, 1):
+        pages.append(
+            "\n".join([
+                f'<section class="page" aria-label="Slide {idx}">',
+                f'  <iframe title="Slide {idx}" srcdoc="{html.escape(slide_html, quote=True)}"></iframe>',
+                "</section>",
+            ])
+        )
+    combined = "\n".join([
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '  <meta charset="utf-8">',
+        "  <title>Paopao Deck</title>",
+        "  <style>",
+        "    body { margin: 0; background: #f3f4f6; font-family: Arial, sans-serif; }",
+        "    .page { width: 1920px; height: 1080px; margin: 32px auto; background: #fff; box-shadow: 0 8px 28px rgba(0,0,0,0.12); }",
+        "    iframe { width: 1920px; height: 1080px; border: 0; display: block; }",
+        "    @media (max-width: 1960px) { .page { transform: scale(calc((100vw - 40px) / 1920)); transform-origin: top center; margin-bottom: calc(32px - (1080px * (1 - ((100vw - 40px) / 1920)))); } }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        *pages,
+        "</body>",
+        "</html>",
+        "",
+    ])
+    target = delivery_dir / "deck.html"
+    target.write_text(combined, encoding="utf-8")
+    return str(target.relative_to(delivery_dir))
+
+
 def _cmd_publish_delivery_impl(ctx: object, args: object) -> int:
     _bind(ctx)
     task_dir = Path(args.task_dir).resolve()
@@ -108,13 +157,13 @@ def _cmd_publish_delivery_impl(ctx: object, args: object) -> int:
 
     target = delivery_dir / pptx.name
     shutil.copy2(pptx, target)
-    images_dir = delivery_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
     render_path = commercial_render_path(task_dir)
     source_of_truth = commercial_source_of_truth(task_dir)
 
     copied_images: list[str] = []
-    if expected:
+    if expected and bool(getattr(args, "include_slide_images", False)):
+        images_dir = delivery_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
         for idx in range(1, expected + 1):
             if source_of_truth == HTML_BROWSER_SOURCE_OF_TRUTH:
                 image_src = task_dir / "qa" / "html_source" / f"slide-{idx:02d}.png"
@@ -128,20 +177,30 @@ def _cmd_publish_delivery_impl(ctx: object, args: object) -> int:
             shutil.copy2(image_src, image_dest)
             copied_images.append(str(image_dest.relative_to(delivery_dir)))
 
+    if expected:
+        for idx in range(1, expected + 1):
             html_src = task_dir / "html" / f"slide{idx:02d}.html"
             if render_path == "html" and not html_src.exists():
                 raise SystemExit(f"HTML slide missing: {html_src}")
+
+    delivery_html = ""
+    if bool(getattr(args, "include_html", False)):
+        if render_path != "html":
+            raise SystemExit("--include-html is only supported for HTML-rendered decks")
+        delivery_html = _write_combined_html(task_dir, delivery_dir, expected)
 
     manifest = {
         "published_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "source_pptx": str(pptx),
         "delivery_pptx": str(target),
+        "delivery_html": delivery_html,
         "pptx_sha256": sha256_file(target),
         "delivery_images": copied_images,
         "user_visible_summary": user_visible_quality_summary(task_dir, expected),
         "policy": (
-            "user-facing delivery contains the PPTX and optional slide preview images; "
-            "HTML, prompt, Markdown, analysis, spec, QA, and debug files are internal only"
+            "user-facing delivery contains the PPTX by default; optional combined HTML and slide images "
+            "are included only when explicitly requested. Prompt, Markdown, analysis, spec, QA, and debug "
+            "files are internal only"
         ),
     }
     manifest_path = task_dir / "qa" / "delivery_publish_manifest.json"
@@ -171,6 +230,17 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
     if not pptx.exists() or pptx.suffix.lower() != ".pptx":
         raise SystemExit(f"PPTX missing or invalid: {pptx}")
 
+    existing_pass = final_delivery_pass_path(task_dir)
+    if existing_pass.exists():
+        try:
+            cached = json.loads(existing_pass.read_text(encoding="utf-8"))
+            if cached.get("pptx_sha256") == sha256_file(pptx):
+                cached["idempotent_cache_hit"] = True
+                print(json.dumps(cached, indent=2, ensure_ascii=False))
+                return 0
+        except Exception:
+            pass
+
     pipeline_issues: list[str] = []
     pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
     if pipeline_issues:
@@ -188,6 +258,8 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
         task_dir=str(task_dir),
         pptx=str(pptx),
         output_dir="",
+        include_slide_images=bool(getattr(args, "include_slide_images", False)),
+        include_html=bool(getattr(args, "include_html", False)),
     )
     _cmd_publish_delivery_impl(ctx, publish_args)
 

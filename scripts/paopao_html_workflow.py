@@ -188,17 +188,34 @@ def _cmd_generate_html_impl(ctx: object, args: object) -> int:
             and html_path.stat().st_mtime >= prompt_packet.stat().st_mtime
             and required_marker in read_text(html_path)
         )
+        agent_prompt_path = task_dir / "qa" / "html_generation_requests" / f"agent_prompt_{idx:02d}.md"
+        agent_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_prompt_text = "\n\n".join([
+            "# Paopao HTML Slide Generation — Self-Contained Agent Prompt",
+            f"Write exactly one complete 1920x1080 HTML slide to: `{html_path.relative_to(task_dir)}`",
+            f"Include this exact marker in the HTML `<head>`: `{required_marker}`",
+            "DO NOT read any other files. Everything you need is in this document.",
+            "---",
+            "## Output Contract (renderer requirements)",
+            compact_renderer_guide_text(),
+            "---",
+            "## Slide Specification (design brief)",
+            final_prompt_text,
+        ])
+        agent_prompt_path.write_text(agent_prompt_text, encoding="utf-8")
+
         written.append({
             "slide": idx,
             "status": "html_ready_for_register" if html_ready else "prompt_packet_ready",
             "prompt_packet": str(prompt_packet.relative_to(task_dir)),
             "final_prompt": str(final_prompt.relative_to(task_dir)),
             "compact_packet": str(compact_packet.relative_to(task_dir)),
+            "agent_prompt": str(agent_prompt_path.relative_to(task_dir)),
             "html_input_mode": "full_final_prompt",
             "prompt_packet_id": prompt_packet_id,
             "required_html_marker": required_marker,
             "html_path": str(html_path.relative_to(task_dir)),
-            "next_action": "Use final_prompt plus renderer_compact_guide as the default high-quality HTML inputs. Do not read PDF, analysis_report, full SKILL, full renderer_guide, prior drafts, or other pipeline materials. compact_packet is optional economy/debug input only. Generate or update html/slideXX.html, then run register-html for this slide.",
+            "next_action": f"Spawn a subagent that reads ONLY {agent_prompt_path.relative_to(task_dir)} and writes {html_path.relative_to(task_dir)}. Then run register-html.",
         })
 
     manifest.update({

@@ -1,88 +1,96 @@
 # paopao
 
-paopao helps create editable PowerPoint decks from PDFs, papers, reports, and reference materials inside your local AI workspace.
+paopao is a local plugin for creating editable consulting-style
+PPTX decks from PDFs, papers, reports, and reference images.
 
-## Welcome
+This MVP does not run a web app and does not call Paopao-owned model APIs. The
+user's local AI workspace performs the reasoning workflow.
 
-Welcome to paopao.
+## What Is Included
 
-- Output is editable `.pptx`.
-- Works locally in your AI workspace.
-- Quality is being updated frequently; if a result looks imperfect, try again later or reduce the page count for a cleaner first pass.
+- `skills/paopao-ppt/SKILL.md`: the local deck workflow.
+- `scripts/renderer.py`: HTML to editable PPTX renderer for the HTML commercial path.
+- `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
+- `scripts/paopao_run.py`: task initialization, commercial path validation, rendering, and packaging helper.
+- `prompts/`: layout annotation library.
+- `reference/renderer_guide.md`: HTML/PPTX stability rules for the HTML path.
 
-## Install
+## Quality Gates
 
-Install this repository as a Codex plugin, then mention paopao when asking for a deck.
+The plugin enforces the commercial delivery path with local checks:
 
-Example:
+- A commercial render contract must declare either `html` or `direct_pptx` as the editable reconstruction path, with Image2 as the source of truth.
+- Direct PPTX output is allowed only when it is built from image-derived measurement/visual contracts and passes the real PowerPoint preview gate.
+- HTML cannot use short text placeholders as icons inside icon containers when HTML is the declared path.
+- Screenshot-cropped icon PNGs are checked for opaque corner backgrounds. Use `python3 scripts/paopao_run.py clean-icon-crop --image <reference> --box x,y,w,h --output <asset.png>` to expand the crop, remove the detected background, trim to the real icon, and export a transparent PNG.
+- Final QA must explicitly compare title, module geometry, icons, takeaway, and color hierarchy against the generated visual reference, using real PPTX previews rather than HTML/browser previews.
+- PowerPoint QA must confirm actual PPTX opening, visible text/numbers/icons, layout match, and no overlap.
+- Delivery cleanup rejects exposed prompt Markdown files.
+- Delivery cleanup rejects multiple top-level PPTX drafts; only the final PPTX should remain visible.
 
-```text
-Use paopao to make a 5-page English PPT from this PDF.
-```
-
-Before generation, paopao may ask you to confirm:
-
-- Page count
-- Language
-- Focus, use case, or audience
-
-## Update
-
-Run this single command to update (it downloads the latest updater first, then updates everything else):
+## Quick Test
 
 ```bash
-python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/Kakoutang/paopao/main/scripts/paopao_run.py', 'scripts/paopao_run.py')" && python3 scripts/paopao_run.py update
+python3 scripts/paopao_run.py doctor
+python3 scripts/paopao_run.py init --name demo --pages 3 --language English
+python3 scripts/paopao_run.py check --task-dir output/demo
 ```
 
-Only changed files are downloaded — takes a few seconds.
+If Codex declares the HTML commercial path and creates `output/demo/html/slide01.html` and other slide HTML files:
 
-## Included
+```bash
+python3 scripts/paopao_run.py render \
+  --task-dir output/demo \
+  --pptx output/demo/pptx/demo.pptx
+```
 
-- Codex plugin manifest
-- Paopao PPT skill entry
-- Local runtime scripts
-- Runtime template index
+## Open Preview And Licensing
 
-## Template Access
+The commercial plugin supports activation-code licensing through the companion
+license API in `auth_server/`.
 
-paopao uses a managed template service to prepare slide layouts while keeping source templates protected.
+Open preview mode:
 
-## Privacy & Data Security / 隐私与数据安全
+- Early users can render without activation while `PAOPAO_OPEN_PREVIEW=1`.
+- This is the default during the initial feedback window.
+- Set `PAOPAO_OPEN_PREVIEW=0` when you are ready to turn paid licensing back on.
 
-paopao 的数据处理方式与您日常使用的 AI 工具（如 ChatGPT、Claude、Gemini）类似：生成过程中，部分信息需要经过云端服务处理。
+Paid mode:
 
-**什么会离开您的电脑：**
-- 每页幻灯片的摘要信息（标题、关键数据点、结论等即将出现在 PPT 上的内容）会发送至 paopao 设计服务器，用于版式匹配和页面设计。
-- 访问验证信息会在需要时发送至 paopao 服务。
+- Set `PAOPAO_FREE_MAX_SLIDES=10` to allow 10 slides without activation.
+- Larger decks require a paid license and page quota.
 
-**什么不会离开您的电脑：**
-- 您的原始文件（PDF、文档、Excel 等）始终保留在本地。
-- 生成的 PPT 文件始终保留在本地。
+Activate a paid installation:
 
-**我们不会：**
-- 存储您发送的摘要数据。
-- 将您的数据用于模型训练或其他用途。
+```bash
+PAOPAO_AUTH_URL=https://your-render-service.onrender.com \
+python3 scripts/paopao_auth.py activate --code PAOPAO-PLAN-XXXX
+```
 
-**安全建议：** 与使用任何 AI 工具一样，如果您的资料包含高度机密信息（如未公开财务数据、商业秘密、受保密协议约束的内容），请在使用前评估相关风险，或咨询您所在机构的信息安全部门。
+Check status:
 
----
+```bash
+python3 scripts/paopao_auth.py status
+```
 
-paopao handles data similarly to AI tools you already use (ChatGPT, Claude, Gemini): some information is processed through a cloud service during generation.
+When `PAOPAO_AUTH_REQUIRED=1` is set in a commercial package, rendering reserves
+page quota before generation. Successful jobs commit the quota; failed jobs
+cancel the reservation so users are not charged for failed output.
 
-**What leaves your computer:**
-- Per-slide summary data (titles, key figures, conclusions - content that will appear on the slides) is sent to the paopao design server for layout matching.
-- Access verification data is sent to the paopao service when needed.
+Manual license fulfillment:
 
-**What stays on your computer:**
-- Your source files (PDFs, documents, spreadsheets) never leave your machine.
-- Your generated PPTX files never leave your machine.
+```bash
+python3 ../../scripts/issue_paopao_license.py \
+  --server-url "$PAOPAO_AUTH_URL" \
+  --admin-key-id "$PAOPAO_ADMIN_KEY_ID" \
+  --admin-private-key "$PAOPAO_ADMIN_PRIVATE_KEY" \
+  --email user@example.com \
+  --plan pro_monthly \
+  --price-code early_bird_19_usd_monthly
+```
 
-**We do not:**
-- Store your summary data after processing.
-- Use your data for model training or any other purpose.
+For local development only, set:
 
-**Security advice:** As with any AI-powered tool, if your materials contain highly confidential information (e.g., unpublished financials, trade secrets, or NDA-protected content), please assess the risks before use, or consult your organization's information security team.
-
-## Support
-
-For feedback or access issues, contact WeChat: `sugarong_`.
+```bash
+PAOPAO_LOCAL_DEV=1
+```

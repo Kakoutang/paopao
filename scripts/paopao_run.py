@@ -7523,7 +7523,8 @@ def check_delivery_files(
         ] if delivery_files else [],
         "delivery_contract": {
             "pptx": 1,
-            "images": "optional_for_html_source_only" if html_source_only else expected,
+            "html": "optional_combined_deck_html_only_when_explicitly_requested",
+            "images": "optional_only_when_explicitly_requested",
             "forbidden": "prompt/markdown/json/analysis/spec/qa/internal files",
         },
         "final_delivery_pass": str(final_delivery_pass_path(task_dir).relative_to(task_dir)),
@@ -8431,10 +8432,20 @@ def build_parser(*, include_lab: bool = False) -> argparse.ArgumentParser:
         )
         cleanup.set_defaults(func=cmd_cleanup)
 
-        publish = sub.add_parser("publish-delivery", help="Publish user-facing PPTX, slide images, and HTML to delivery/")
+        publish = sub.add_parser("publish-delivery", help="Publish user-facing delivery files")
         publish.add_argument("--task-dir", required=True)
         publish.add_argument("--pptx", default="")
         publish.add_argument("--output-dir", default="")
+        publish.add_argument(
+            "--include-html",
+            action="store_true",
+            help="Also publish one combined delivery/deck.html. Off by default.",
+        )
+        publish.add_argument(
+            "--include-slide-images",
+            action="store_true",
+            help="Also publish delivery/images slide PNG previews. Off by default.",
+        )
         publish.set_defaults(func=cmd_publish_delivery)
 
     finalize = sub.add_parser(
@@ -8447,6 +8458,16 @@ def build_parser(*, include_lab: bool = False) -> argparse.ArgumentParser:
         "--keep-private-prompts",
         action="store_true",
         help="Debug only: move prompt artifacts under qa/private_prompts instead of deleting them",
+    )
+    finalize.add_argument(
+        "--include-html",
+        action="store_true",
+        help="Also publish one combined delivery/deck.html. Off by default.",
+    )
+    finalize.add_argument(
+        "--include-slide-images",
+        action="store_true",
+        help="Also publish delivery/images slide PNG previews. Off by default.",
     )
     finalize.set_defaults(func=cmd_finalize_delivery)
 

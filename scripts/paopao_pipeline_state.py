@@ -270,31 +270,18 @@ def _pipeline_step_state_impl(ctx: object, task_dir: Path, expected: int) -> dic
             state["step"] = "html_source"
             state["step_number"] = 2
             state["current_slide"] = slide_idx
-            final_prompt_rel = f"analysis/final_prompt_{slide_idx:02d}.md"
-            compact_packet_rel = f"qa/html_generation_requests/html_compact_packet_{slide_idx:02d}.md"
-            guide_rel = "qa/html_generation_requests/renderer_compact_guide.md"
+            agent_prompt_rel = f"qa/html_generation_requests/agent_prompt_{slide_idx:02d}.md"
             state["instruction"] = (
-                f"Prepare/register the locked Paopao HTML prompt packet for slide {slide_idx}:\n"
-                f"  paopao_run.py generate-html --task-dir <dir> --slide {slide_idx}\n"
-                "Then spawn an Agent using the subagent_prompt field below to generate the HTML in a clean context.\n"
-                "After the agent finishes, run:\n"
-                f"  paopao_run.py register-html --task-dir <dir> --slide {slide_idx}\n"
-                "When done, run: paopao_run.py next --task-dir <dir>"
+                f"Run these 3 commands in order for slide {slide_idx}:\n"
+                f"  1. paopao_run.py generate-html --task-dir {task_dir} --slide {slide_idx}\n"
+                f"  2. Spawn an Agent with this prompt: \"Read {task_dir}/{agent_prompt_rel} and follow its instructions. Do not read any other files.\"\n"
+                f"  3. paopao_run.py register-html --task-dir {task_dir} --slide {slide_idx}\n"
+                f"Then run: paopao_run.py next --task-dir {task_dir}"
             )
+            state["agent_prompt_file"] = str(task_dir / agent_prompt_rel)
             state["subagent_prompt"] = (
-                f"You are an MBB slide designer. Turn the final prompt into exactly one finished HTML slide.\n\n"
-                f"1. Read the full slide specification: {task_dir}/{final_prompt_rel}\n"
-                f"2. Read the output contract: {task_dir}/{guide_rel}\n"
-                f"3. Use this required HTML marker in <head>: "
-                f"<meta name=\"paopao-prompt-packet-id\" content=\"<copy from generate-html output>\">\n"
-                f"4. Write the HTML file to: {task_dir}/html/slide{slide_idx:02d}.html\n\n"
-                "Follow ONLY the full final_prompt and output contract. Do not read any other files "
-                "(no PDF, no analysis_report, no SYSTEM_PROMPT, no other slides, no full renderer guide).\n"
-                f"Do not use {task_dir}/{compact_packet_rel} unless the user explicitly asks for economy/low-token mode.\n"
-                "Treat editability and Excel-linked charts as implementation requirements, not as a reason to simplify the slide.\n"
-                "Apply the full final_prompt as the page specification; preserve its structure, visual detail, and information hierarchy.\n"
-                "Include the exact required_html_marker returned by generate-html in the HTML <head>.\n"
-                "The HTML must be a complete, self-contained 1920x1080 page with inline CSS."
+                f"Read {task_dir}/{agent_prompt_rel} and follow its instructions exactly. "
+                "Do not read any other files."
             )
             if html_issues:
                 state["issues"] = html_issues
