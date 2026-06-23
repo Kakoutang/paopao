@@ -694,6 +694,8 @@ def ensure_workflow_file(name: str, max_age_seconds: int = 86400) -> Path:
     if name not in destinations:
         raise SystemExit(f"Unknown workflow file: {name}")
     path = destinations[name]
+    if os.getenv("PAOPAO_OFFLINE_WORKFLOW") == "1" and path.exists() and path.stat().st_size >= 80:
+        return path
     needs_fetch = not path.exists() or path.stat().st_size < 80
     if not needs_fetch and max_age_seconds > 0:
         age = time.time() - path.stat().st_mtime
@@ -1366,7 +1368,10 @@ def image_similarity_score(reference: Path, actual: Path) -> float | None:
 
 
 def html_reference_preview_path(task_dir: Path, idx: int) -> Path:
-    return task_dir / "qa" / "html_reference" / f"slide-{idx:02d}.png"
+    primary = task_dir / "qa" / "html_reference" / f"slide-{idx:02d}.png"
+    if primary.exists():
+        return primary
+    return task_dir / "qa" / "html_source" / f"slide-{idx:02d}.png"
 
 
 def html_path_for_slide(task_dir: Path, idx: int) -> Path:
@@ -1515,39 +1520,40 @@ def parse_data_requires(text: str) -> list[str]:
 
 
 def load_prompt_catalog() -> list[dict[str, object]]:
-    try:
-        remote = paopao_auth.fetch_prompt_catalog()
-        prompts = remote if isinstance(remote, list) else remote.get("prompts", [])
-        if isinstance(prompts, list):
-            catalog: list[dict[str, object]] = []
-            for item in prompts:
-                if not isinstance(item, dict):
-                    continue
-                template = str(item.get("template", ""))
-                data_requires_raw = item.get("data_requires", "")
-                data_requires = (
-                    parse_data_requires(f"DATA_REQUIRES: {data_requires_raw}")
-                    if isinstance(data_requires_raw, str)
-                    else []
-                )
-                catalog.append({
-                    "template": template,
-                    "layout_name": str(item.get("layout_name", "") or Path(template).stem),
-                    "family": prompt_scaffold_family(template),
-                    "when_to_use": str(item.get("when_to_use", ""))[:320],
-                    "data_requires": data_requires,
-                    "free": bool(item.get("free")),
-                    "fill_zones": item.get("fill_zones", []),
-                    "layout_description": item.get("layout_description", ""),
-                })
-            if catalog:
-                return catalog
-    except paopao_auth.AuthError as exc:
-        if not any(
-            p.name not in {"SYSTEM_PROMPT.md", "INDEX.md"}
-            for p in PROMPT_LIBRARY_DIR.glob("*.md")
-        ):
-            raise SystemExit(str(exc)) from exc
+    if os.getenv("PAOPAO_OFFLINE_WORKFLOW") != "1":
+        try:
+            remote = paopao_auth.fetch_prompt_catalog()
+            prompts = remote if isinstance(remote, list) else remote.get("prompts", [])
+            if isinstance(prompts, list):
+                catalog: list[dict[str, object]] = []
+                for item in prompts:
+                    if not isinstance(item, dict):
+                        continue
+                    template = str(item.get("template", ""))
+                    data_requires_raw = item.get("data_requires", "")
+                    data_requires = (
+                        parse_data_requires(f"DATA_REQUIRES: {data_requires_raw}")
+                        if isinstance(data_requires_raw, str)
+                        else []
+                    )
+                    catalog.append({
+                        "template": template,
+                        "layout_name": str(item.get("layout_name", "") or Path(template).stem),
+                        "family": prompt_scaffold_family(template),
+                        "when_to_use": str(item.get("when_to_use", ""))[:320],
+                        "data_requires": data_requires,
+                        "free": bool(item.get("free")),
+                        "fill_zones": item.get("fill_zones", []),
+                        "layout_description": item.get("layout_description", ""),
+                    })
+                if catalog:
+                    return catalog
+        except paopao_auth.AuthError as exc:
+            if not any(
+                p.name not in {"SYSTEM_PROMPT.md", "INDEX.md"}
+                for p in PROMPT_LIBRARY_DIR.glob("*.md")
+            ):
+                raise SystemExit(str(exc)) from exc
 
     catalog: list[dict[str, object]] = []
     for path in sorted(PROMPT_LIBRARY_DIR.glob("*.md")):
@@ -1864,11 +1870,14 @@ def prompt_template_issue(text: str, prompt_name: str) -> list[str]:
             f"{prompt_name} missing PROMPT_TEMPLATE: <prompt-library-file>.md; final prompts must be filled from plugins/paopao-codex-plugin/prompts"
         ]
     template_name = match.group("name")
+    catalog = load_prompt_catalog()
     catalog_entry = next(
-        (entry for entry in load_prompt_catalog() if str(entry.get("template", "")) == template_name),
+        (entry for entry in catalog if str(entry.get("template", "")) == template_name),
         None,
     )
     if not catalog_entry:
+        if os.getenv("PAOPAO_OFFLINE_WORKFLOW") == "1" and not catalog:
+            return issues
         return [f"{prompt_name} PROMPT_TEMPLATE is not available for the current plan: {template_name}"]
     layout_name = str(catalog_entry.get("layout_name", "")).strip()
     if not layout_name:
@@ -7085,8 +7094,8 @@ def _path_is_under(path: Path, parent: Path) -> bool:
 
 def _looks_like_html_reference_preview(task_dir: Path, idx: int, path: Path) -> bool:
     html_preview = html_reference_preview_path(task_dir, idx)
-    html_preview_dir = task_dir / "qa" / "html_reference"
-    if _path_is_under(path, html_preview_dir):
+    html_preview_dirs = [task_dir / "qa" / "html_reference", task_dir / "qa" / "html_source"]
+    if any(_path_is_under(path, html_preview_dir) for html_preview_dir in html_preview_dirs):
         return True
     if html_preview.exists() and path.exists() and path.is_file():
         try:
@@ -7094,6 +7103,12 @@ def _looks_like_html_reference_preview(task_dir: Path, idx: int, path: Path) -> 
         except Exception:
             return False
     return False
+
+
+def _reference_path_label(task_dir: Path) -> str:
+    if is_html_source_only_task(task_dir):
+        return "the locked HTML browser preview under qa/html_reference/ or qa/html_source/"
+    return "the selected Image2 reference"
 
 
 def near_duplicate_evidence_pairs(evidences: list[str], *, threshold: float = 0.92) -> list[tuple[int, int]]:
@@ -7124,7 +7139,10 @@ def check_fidelity_review(
 ) -> dict[str, object] | None:
     review = task_dir / "qa" / "fidelity_review.json"
     if not review.exists():
-        issues.append("qa/fidelity_review.json missing; compare final PPTX against Image2 slide by slide before delivery")
+        issues.append(
+            f"qa/fidelity_review.json missing; compare final PPTX against {_reference_path_label(task_dir)} "
+            "slide by slide before delivery"
+        )
         return None
     try:
         data = json.loads(review.read_text(encoding="utf-8"))
@@ -7160,7 +7178,7 @@ def check_fidelity_review(
             actual_raw = entry.get("actual_preview_path")
             if not _review_path_exists(task_dir, reference_raw):
                 issues.append(
-                    f"fidelity review slide {idx}: reference_path must point to the selected Image2 reference"
+                    f"fidelity review slide {idx}: reference_path must point to {_reference_path_label(task_dir)}"
                 )
             if not _review_path_exists(task_dir, actual_raw):
                 issues.append(
@@ -7357,22 +7375,30 @@ def check_delivery_files(
     html_source_only = source_of_truth == HTML_BROWSER_SOURCE_OF_TRUTH
     if not html_source_only:
         check_image2_files(task_dir, expected, issues, require_prompt_files=False)
-    path_counts = check_render_path_profile(
-        task_dir,
-        expected,
-        render_path,
-        issues,
-        pptx=final_pptx,
-        pptx_summary=pptx_summary,
-        include_html_fidelity=not html_source_only,
-    )
-    if html_source_only:
-        path_counts["html_slide_count"] = len(sorted((task_dir / "html").glob("slide*.html")))
-        path_counts["html_reference_fidelity"] = "checked_before_cleanup"
-        path_counts["html_generation_manifest"] = "checked_before_cleanup"
-    fidelity = None if html_source_only else check_fidelity_review(task_dir, expected, issues, final_pptx)
-    commercial_similarity = {"min_required": COMMERCIAL_SIMILARITY_MIN, "scores": "not_required_for_html_browser_source"} if html_source_only else check_commercial_similarity(task_dir, expected, issues)
-    powerpoint = None if html_source_only else check_powerpoint_review(task_dir, expected, issues, final_pptx)
+    if final_delivery_pass_path(task_dir).exists():
+        path_counts: dict[str, object] = {
+            "render_manifest": "checked_in_pipeline_pass",
+            "html_reference_fidelity": "checked_in_pipeline_pass",
+            "html_generation_manifest": "checked_in_pipeline_pass",
+            "html_slide_count": "checked_in_pipeline_pass",
+        }
+    else:
+        path_counts = check_render_path_profile(
+            task_dir,
+            expected,
+            render_path,
+            issues,
+            pptx=final_pptx,
+            pptx_summary=pptx_summary,
+            include_html_fidelity=True,
+        )
+        if html_source_only:
+            path_counts["html_slide_count"] = len(sorted((task_dir / "html").glob("slide*.html")))
+            path_counts["html_reference_fidelity"] = "checked_against_pptx_actual"
+            path_counts["html_generation_manifest"] = "checked_before_cleanup"
+    fidelity = check_fidelity_review(task_dir, expected, issues, final_pptx)
+    commercial_similarity = check_commercial_similarity(task_dir, expected, issues)
+    powerpoint = check_powerpoint_review(task_dir, expected, issues, final_pptx)
     delivery_dir = task_dir / "delivery"
     delivery_files: list[Path] = []
     if delivery_dir.exists():
@@ -7468,17 +7494,9 @@ def check_pipeline_contract(
         pptx=pptx,
         pptx_summary=pptx_summary,
     ))
-    if html_source_only:
-        counts["powerpoint_review"] = "not_required_for_html_browser_source"
-        counts["fidelity_review"] = "not_required_for_html_browser_source"
-        counts["commercial_similarity"] = {
-            "min_required": COMMERCIAL_SIMILARITY_MIN,
-            "scores": "not_required_for_html_browser_source",
-        }
-    else:
-        counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues, pptx)
-        counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues, pptx)
-        counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
+    counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues, pptx)
+    counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues, pptx)
+    counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
     return counts
 
 
@@ -7870,12 +7888,12 @@ def task_controller_status(
             {
                 "id": "pptx",
                 "label": "HTML-source-only PPTX render",
-                "next_action": "Render/QA employee reads only HTML/PPTX previews and command check results. Do not read PDF/source, analysis, final_prompt, compact/full packets, prior drafts, or other pipeline materials. Run render --html-source-only, then record-commercial-render --source-of-truth html_browser_render.",
+                "next_action": "Render/QA employee reads only HTML/PPTX previews and command check results. Do not read PDF/source, analysis, final_prompt, compact/full packets, prior drafts, or other pipeline materials. Run render --html-source-only, record-commercial-render --source-of-truth html_browser_render, export actual PPTX previews to qa/pptx_actual, then complete fidelity_review.json and powerpoint_review.json.",
             },
             {
                 "id": "delivery",
                 "label": "Final delivery",
-                "next_action": "Delivery employee uses only delivery gates, HTML/PPTX previews, and check results; do not reopen PDF/source, analysis, final_prompt, prior drafts, or other pipeline materials. Run finalize-delivery after review passes.",
+                "next_action": "Delivery employee uses only delivery gates, HTML/PPTX actual previews, and check results; do not reopen PDF/source, analysis, final_prompt, prior drafts, or other pipeline materials. Run finalize-delivery only after PPTX actual preview review passes.",
             },
         ]
     else:
@@ -7971,6 +7989,14 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
         "expected_pages": expected,
         "pipeline_mode": task_pipeline_mode(task_dir),
     }
+
+    delivery_dir = task_dir / "delivery"
+    delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
+    if final_delivery_pass_path(task_dir).exists() and delivery_pptx:
+        state["step"] = "finalize"
+        state["step_number"] = 99
+        state["instruction"] = "All checks passed. Delivery is ready."
+        return state
 
     if is_html_source_only_task(task_dir):
         analysis_issues: list[str] = []
@@ -8073,6 +8099,22 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             state["issues"] = contract_issues
             return state
 
+        actual_dir = task_dir / "qa" / "pptx_actual"
+        actual_pngs = sorted(actual_dir.glob("slide-*.png"))
+        if len(actual_pngs) < expected:
+            state["step"] = "pptx_export"
+            state["step_number"] = 4
+            state["instruction"] = (
+                "QA employee context boundary: inspect only browser HTML preview, actual PPTX preview, and check results. "
+                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
+                "Export actual PowerPoint-rendered slide previews:\n"
+                "  1. Open pptx/deck.pptx in PowerPoint or another real PPTX renderer\n"
+                "  2. Export each slide to qa/pptx_actual/slide-1.png, slide-2.png, ...\n"
+                "  3. Do not copy qa/html_reference images; actual previews must come from the PPTX\n"
+                "When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            return state
+
         delivery_dir = task_dir / "delivery"
         delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
         if delivery_pptx:
@@ -8082,12 +8124,15 @@ def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
             return state
 
         state["step"] = "review"
-        state["step_number"] = 4
+        state["step_number"] = 5
         state["instruction"] = (
             "QA employee context boundary: inspect only browser HTML preview, actual PPTX preview, and check results. "
             "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
+            "Export actual PowerPoint-rendered slide previews to qa/pptx_actual/slide-1.png, slide-2.png, ... .\n"
             "Open the browser HTML preview and the actual PPTX preview. If PPTX differs from the browser render, "
             "fix renderer behavior or rerender from HTML; stay on the current HTML-source-only path.\n"
+            "Save qa/fidelity_review.json comparing each PPTX preview against qa/html_reference/slide-XX.png.\n"
+            "Save qa/powerpoint_review.json after opening the real PPTX and checking editability/overlap.\n"
             "When review is complete, run:\n"
             "  paopao_run.py finalize-delivery --task-dir <dir> --pptx pptx/deck.pptx"
         )
@@ -9178,24 +9223,7 @@ def cmd_finalize_delivery(args: argparse.Namespace) -> int:
         raise SystemExit(f"PPTX missing or invalid: {pptx}")
 
     pipeline_issues: list[str] = []
-    if is_html_source_only_task(task_dir):
-        pipeline_counts: dict[str, object] = {}
-        check_html_source_analysis_files(task_dir, expected, pipeline_issues)
-        pptx_summary = check_pptx_file(pptx, expected, pipeline_issues)
-        if pptx_summary is not None:
-            pipeline_counts["pptx"] = str(pptx)
-            pipeline_counts["pptx_summary"] = pptx_summary
-        pipeline_counts["commercial_render_contract"] = check_commercial_render_contract(task_dir, expected, pptx, pipeline_issues)
-        pipeline_counts.update(check_render_path_profile(
-            task_dir,
-            expected,
-            "html",
-            pipeline_issues,
-            pptx=pptx,
-            pptx_summary=pptx_summary,
-        ))
-    else:
-        pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
+    pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
     if pipeline_issues:
         print(json.dumps({
             "task_dir": str(task_dir),
@@ -9333,10 +9361,10 @@ def cmd_record_commercial_render(args: argparse.Namespace) -> int:
         "actual_preview_dir": "qa/pptx_actual",
         "html_is_debug_only": render_path == "direct_pptx",
         "policy": (
-            "Commercial delivery uses the declared source_of_truth only. "
-            "When source_of_truth=html_browser_render, the browser-rendered HTML preview is the sole visual reference "
-            "and renderer.py must copy that final browser layout into editable PPTX without reinterpreting prompts, "
-            "analysis, Image2, or remembered intent."
+            "Commercial delivery uses the declared source_of_truth as the reconstruction reference. "
+            "When source_of_truth=html_browser_render, renderer.py must copy the final browser layout into editable PPTX "
+            "without reinterpreting prompts, analysis, Image2, or remembered intent. Final delivery still requires "
+            "qa/pptx_actual exports plus fidelity_review.json and powerpoint_review.json against the actual PPTX render."
         ),
     }
     out = commercial_render_contract_path(task_dir)
