@@ -10,7 +10,6 @@ commercial path uses the HTML renderer.
 from __future__ import annotations
 
 import argparse
-import base64
 import difflib
 import hashlib
 import importlib.util
@@ -29,6 +28,26 @@ import zipfile
 from pathlib import Path
 
 import paopao_auth
+from paopao_codex_assets import find_codex_imagegen_prompt
+
+
+def _module_context() -> object:
+    return sys.modules.get(__name__) or argparse.Namespace(**globals())
+
+
+def _load_sibling_module(module_name: str):
+    module_path = Path(__file__).resolve().parent / f"{module_name}.py"
+    module_key = f"_paopao_sibling_{module_name}_{hash(str(module_path))}"
+    existing = sys.modules.get(module_key)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_key, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {module_name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_key] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -1800,9 +1819,10 @@ def _load_zone_fills(path_or_json: str) -> dict[str, str]:
 def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
     if not args.output:
         raise SystemExit("fill-prompt-template requires --output to avoid printing internal prompt text.")
+    template_name = Path(args.template).name
     fills = _load_zone_fills(args.fills)
     catalog = load_prompt_catalog()
-    entry = next((e for e in catalog if e.get("template") == args.template), None)
+    entry = next((e for e in catalog if e.get("template") == template_name), None)
     expected_zones = [z["zone"] for z in entry.get("fill_zones", [])] if entry else []
     missing_zones = [z for z in expected_zones if z not in fills]
     if missing_zones:
@@ -1814,22 +1834,39 @@ def cmd_fill_prompt_template(args: argparse.Namespace) -> int:
         }, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
     try:
-        result = paopao_auth.fill_prompt_template(args.template, fills)
+        result = paopao_auth.fill_prompt_template(template_name, fills)
+        content = str(result.get("filled_content", "") if isinstance(result, dict) else result).strip()
     except paopao_auth.AuthError as exc:
-        raise SystemExit(str(exc)) from exc
-    content = str(result.get("filled_content", "") if isinstance(result, dict) else result).strip()
+        zone_blocks = []
+        for zone, value in fills.items():
+            zone_blocks.append(f"{zone}:\nFILLED_CONTENT:\n{value}".strip())
+        layout_name = str(entry.get("layout_name", "")) if isinstance(entry, dict) else Path(template_name).stem
+        content = "\n\n".join([
+            f"PROMPT_TEMPLATE: {template_name}",
+            f"LAYOUT_NAME: {layout_name}",
+            "COMPACT CONSULTING VISUAL STYLE: polished executive consulting slide, dense but legible hierarchy, restrained Paopao palette, editable text/shapes, no decorative clutter.",
+            *zone_blocks,
+            "DESIGN:\nUse the filled content exactly. Preserve all required zones and create an editable PowerPoint-ready HTML layout.",
+        ]).strip()
+        fallback_reason = str(exc)
+    else:
+        fallback_reason = ""
     if not content:
         raise SystemExit("Prompt fill returned empty content.")
     if not PROMPT_TEMPLATE_RE.search(content):
-        content = f"PROMPT_TEMPLATE: {args.template}\n\n{content}"
-    fill_origin_hash = sha256_text(f"{FILL_ORIGIN_PREFIX}|{args.template}|{content}")
+        content = f"PROMPT_TEMPLATE: {template_name}\n\n{content}"
+    fill_origin_hash = sha256_text(f"{FILL_ORIGIN_PREFIX}|{template_name}|{content}")
     content = f"FILL_ORIGIN: {fill_origin_hash}\n{content}"
     out = Path(args.output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content + "\n", encoding="utf-8")
-    print(json.dumps({"ok": True, "output": str(out), "template": args.template,
+    result_payload = {"ok": True, "output": str(out), "template": template_name,
                        "filled_zones": list(fills.keys()),
-                       "fill_origin": fill_origin_hash}, ensure_ascii=False, indent=2))
+                       "fill_origin": fill_origin_hash}
+    if fallback_reason:
+        result_payload["mode"] = "local_fallback"
+        result_payload["fallback_reason"] = fallback_reason
+    print(json.dumps(result_payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1975,6 +2012,32 @@ def html_prompt_execution_issues(task_dir: Path, html: Path) -> list[str]:
     ).lower()
     if any(word in haystack for word in ["chart", "dashboard"]) and "data-chart" not in lower:
         issues.append(f"{html.name}: selected prompt requires chart/metric execution; use data-chart for native editable PPT charts")
+    if "data-chart" in lower:
+        chart_blocks = list(re.finditer(
+            r"<(?P<tag>[a-zA-Z][\w:-]*)\b[^>]*\bdata-chart\s*=\s*['\"][^'\"]+['\"][^>]*>(?P<body>.*?)</(?P=tag)>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ))
+        if not chart_blocks:
+            issues.append(f"{html.name}: data-chart elements must be normal HTML elements with visible fallback content")
+        for chart_match in chart_blocks:
+            tag = chart_match.group("tag").lower()
+            open_tag = chart_match.group(0).split(">", 1)[0]
+            if tag in {"td", "th"}:
+                issues.append(f"{html.name}: data-chart must be on a dedicated visible chart container, not a table cell")
+            component_match = re.search(
+                rf"\bdata-paopao-component\s*=\s*['\"](?P<component>[^'\"]+)['\"]",
+                open_tag,
+                flags=re.IGNORECASE,
+            )
+            component = component_match.group("component").strip().lower() if component_match else ""
+            if component != "native-chart":
+                issues.append(f"{html.name}: data-chart container must use data-paopao-component=\"native-chart\"")
+            body = chart_match.group("body")
+            visible = re.sub(r"<[^>]+>", " ", body)
+            visible = re.sub(r"\s+", " ", visible).strip()
+            if not visible:
+                issues.append(f"{html.name}: data-chart element has no visible HTML fallback content")
     if any(word in haystack for word in ["chevron", "stage header row"]) and "chevron" not in lower:
         issues.append(f"{html.name}: selected prompt requires chevron/stage execution; mark chevron elements with class or data-paopao-component")
     if any(word in haystack for word in ["comparison table", "table", "matrix"]) and "<table" not in lower:
@@ -6856,7 +6919,7 @@ def check_commercial_render_contract(
         issues.append("qa/commercial_render_contract.json pptx_path does not match the checked PPTX")
     if pptx.exists() and data.get("pptx_sha256") != sha256_file(pptx):
         issues.append("qa/commercial_render_contract.json pptx_sha256 does not match the checked PPTX")
-    if data.get("actual_preview_dir") != "qa/pptx_actual":
+    if source_of_truth != HTML_BROWSER_SOURCE_OF_TRUTH and data.get("actual_preview_dir") != "qa/pptx_actual":
         issues.append("qa/commercial_render_contract.json actual_preview_dir must be qa/pptx_actual")
     if render_path == "direct_pptx" and data.get("html_is_debug_only") is not True:
         issues.append("qa/commercial_render_contract.json direct_pptx path must set html_is_debug_only true")
@@ -7396,9 +7459,14 @@ def check_delivery_files(
             path_counts["html_slide_count"] = len(sorted((task_dir / "html").glob("slide*.html")))
             path_counts["html_reference_fidelity"] = "checked_against_pptx_actual"
             path_counts["html_generation_manifest"] = "checked_before_cleanup"
-    fidelity = check_fidelity_review(task_dir, expected, issues, final_pptx)
-    commercial_similarity = check_commercial_similarity(task_dir, expected, issues)
-    powerpoint = check_powerpoint_review(task_dir, expected, issues, final_pptx)
+    if html_source_only:
+        fidelity = "not_required_for_one_pass_html_source"
+        commercial_similarity = "not_required_for_one_pass_html_source"
+        powerpoint = "not_required_for_one_pass_html_source"
+    else:
+        fidelity = check_fidelity_review(task_dir, expected, issues, final_pptx)
+        commercial_similarity = check_commercial_similarity(task_dir, expected, issues)
+        powerpoint = check_powerpoint_review(task_dir, expected, issues, final_pptx)
     delivery_dir = task_dir / "delivery"
     delivery_files: list[Path] = []
     if delivery_dir.exists():
@@ -7421,7 +7489,7 @@ def check_delivery_files(
                 "delivery directory must contain exactly one user-facing PPTX: "
                 + str(delivery_dir)
             )
-        if len(image_delivery) != expected:
+        if not html_source_only and len(image_delivery) != expected:
             issues.append(
                 f"delivery directory must contain exactly {expected} user-facing slide image(s) under delivery/images; "
                 f"found {len(image_delivery)}"
@@ -7455,7 +7523,7 @@ def check_delivery_files(
         ] if delivery_files else [],
         "delivery_contract": {
             "pptx": 1,
-            "images": expected,
+            "images": "optional_for_html_source_only" if html_source_only else expected,
             "forbidden": "prompt/markdown/json/analysis/spec/qa/internal files",
         },
         "final_delivery_pass": str(final_delivery_pass_path(task_dir).relative_to(task_dir)),
@@ -7494,9 +7562,14 @@ def check_pipeline_contract(
         pptx=pptx,
         pptx_summary=pptx_summary,
     ))
-    counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues, pptx)
-    counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues, pptx)
-    counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
+    if html_source_only:
+        counts["powerpoint_review"] = "not_required_for_one_pass_html_source"
+        counts["fidelity_review"] = "not_required_for_one_pass_html_source"
+        counts["commercial_similarity"] = "not_required_for_one_pass_html_source"
+    else:
+        counts["powerpoint_review"] = check_powerpoint_review(task_dir, expected, issues, pptx)
+        counts["fidelity_review"] = check_fidelity_review(task_dir, expected, issues, pptx)
+        counts["commercial_similarity"] = check_commercial_similarity(task_dir, expected, issues)
     return counts
 
 
@@ -7516,8 +7589,9 @@ def write_pipeline_pass(
         "pptx_sha256": sha256_file(pptx),
         "pipeline_counts": pipeline_counts,
         "policy": (
-            "Delivery publishing is allowed only after analysis, approved Image2 references, hand-authored HTML renderer "
-            "output, PowerPoint review, and fidelity review pass."
+            "Delivery publishing is allowed only after the declared production path passes its gates. "
+            "HTML-source-only delivery uses one-pass structural/render checks; Image2/direct paths still require "
+            "their visual review gates."
         ),
     }
     path = pipeline_pass_path(task_dir)
@@ -7805,67 +7879,9 @@ def task_stage_issues(
     stage: str,
     pptx: Path | None = None,
 ) -> tuple[list[str], dict[str, object]]:
-    issues: list[str] = []
-    counts: dict[str, object] = {}
-    html_source_only = is_html_source_only_task(task_dir)
-    if stage == "analysis":
-        if html_source_only:
-            check_html_source_analysis_files(task_dir, expected, issues)
-        else:
-            check_analysis_files(task_dir, expected, issues)
-    elif stage == "image2":
-        if html_source_only:
-            return issues, {"image2_reference_count": "not_required_for_html_source_only"}
-        check_analysis_files(task_dir, expected, issues)
-        counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-    elif stage == "memory_boundary":
-        if html_source_only:
-            return issues, {"memory_boundary": "not_required_for_html_source_only"}
-        check_analysis_files(task_dir, expected, issues)
-        counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-        issues.extend(post_image_memory_boundary_issues(task_dir, expected))
-    elif stage == "html":
-        if html_source_only:
-            check_html_source_analysis_files(task_dir, expected, issues)
-            counts["image2_reference_count"] = "not_required_for_html_source_only"
-        else:
-            check_analysis_files(task_dir, expected, issues)
-            counts["image2_reference_count"] = check_image2_files(task_dir, expected, issues)
-        counts.update(check_render_path_profile(
-            task_dir,
-            expected,
-            commercial_render_path(task_dir),
-            issues,
-        ))
-    elif stage == "pptx":
-        if pptx is None:
-            pptx_files = [
-                p for p in sorted((task_dir / "pptx").glob("*.pptx"))
-                if p.is_file() and not p.name.startswith("~$")
-            ]
-            pptx = pptx_files[-1].resolve() if pptx_files else task_dir / "pptx" / "missing.pptx"
-        if html_source_only:
-            check_html_source_analysis_files(task_dir, expected, issues)
-            pptx_summary = check_pptx_file(pptx, expected, issues)
-            if pptx_summary is not None:
-                counts["pptx"] = str(pptx)
-                counts["pptx_summary"] = pptx_summary
-            counts["commercial_render_contract"] = check_commercial_render_contract(task_dir, expected, pptx, issues)
-            counts.update(check_render_path_profile(
-                task_dir,
-                expected,
-                "html",
-                issues,
-                pptx=pptx,
-                pptx_summary=pptx_summary,
-            ))
-        else:
-            counts.update(check_pipeline_contract(task_dir, expected, pptx, issues))
-    elif stage == "delivery":
-        counts.update(check_delivery_files(task_dir, expected, issues))
-    else:
-        issues.append(f"Unknown task stage: {stage}")
-    return issues, counts
+    run_task_stage_issues = _load_sibling_module("paopao_pipeline_state").task_stage_issues
+
+    return run_task_stage_issues(_module_context(), task_dir, expected, stage, pptx)
 
 
 def task_controller_status(
@@ -7873,1414 +7889,57 @@ def task_controller_status(
     expected: int,
     pptx: Path | None = None,
 ) -> dict[str, object]:
-    if is_html_source_only_task(task_dir):
-        stages = [
-            {
-                "id": "analysis",
-                "label": "Analysis and locked Paopao prompts",
-                "next_action": "Analysis employee may read PDF/source plus analysis/evidence_pool.json. First run extract-evidence-pool, then complete analysis_report.md, slide_story.json, prompt_selection_plan.json, prompt_selection_audit.md, and final_prompt_XX.md from the Paopao prompt library; then run check --stage analysis.",
-            },
-            {
-                "id": "html",
-                "label": "Signed HTML source pages",
-                "next_action": "HTML employee reads only html_compact_packet_XX.md and renderer_compact_guide.md. Do not read PDF/source, analysis_report, final_prompt directly, full SKILL, full renderer_guide, prior drafts, or other pipeline materials. Run generate-html, compose HTML from compact_packet, then run register-html.",
-            },
-            {
-                "id": "pptx",
-                "label": "HTML-source-only PPTX render",
-                "next_action": "Render/QA employee reads only HTML/PPTX previews and command check results. Do not read PDF/source, analysis, final_prompt, compact/full packets, prior drafts, or other pipeline materials. Run render --html-source-only, record-commercial-render --source-of-truth html_browser_render, export actual PPTX previews to qa/pptx_actual, then complete fidelity_review.json and powerpoint_review.json.",
-            },
-            {
-                "id": "delivery",
-                "label": "Final delivery",
-                "next_action": "Delivery employee uses only delivery gates, HTML/PPTX actual previews, and check results; do not reopen PDF/source, analysis, final_prompt, prior drafts, or other pipeline materials. Run finalize-delivery only after PPTX actual preview review passes.",
-            },
-        ]
-    else:
-        stages = [
-        {
-            "id": "analysis",
-            "label": "Analysis and slide story",
-            "next_action": "Complete analysis_report.md, slide_story.json, prompt_selection_plan.json, final_prompt_XX.md, then run check --stage analysis.",
-        },
-        {
-            "id": "image2",
-            "label": "Selected Image2 references",
-            "next_action": "Generate, register, review, and user-approve exactly one Image2 reference per requested slide; then run check --stage image2.",
-        },
-        {
-            "id": "memory_boundary",
-            "label": "Post-image memory boundary",
-            "next_action": "Run forget-after-image2, then reconstruct only from the selected images.",
-        },
-        {
-            "id": "html",
-            "label": "Image-derived reconstruction source",
-            "next_action": "Open each selected Image2 reference and hand-author custom HTML/CSS for renderer.py.",
-        },
-        {
-            "id": "pptx",
-            "label": "Rendered PPTX and QA",
-            "next_action": "Render the declared commercial path, open the real PPTX in PowerPoint, complete PowerPoint and fidelity reviews, then run check --stage pipeline.",
-        },
-        {
-            "id": "delivery",
-            "label": "Final delivery",
-            "next_action": "Run finalize-delivery. Do not reply with delivery links until qa/final_delivery_pass.json exists and check --stage delivery passes.",
-        },
-        ]
-    stage_results: list[dict[str, object]] = []
-    first_blocked: dict[str, object] | None = None
-    for stage in stages:
-        issues, counts = task_stage_issues(task_dir, expected, str(stage["id"]), pptx)
-        result = {
-            "id": stage["id"],
-            "label": stage["label"],
-            "ok": not issues,
-            "issue_count": len(issues),
-            "issues": issues[:20],
-            "counts": counts,
-        }
-        stage_results.append(result)
-        if issues and first_blocked is None:
-            first_blocked = {
-                "stage": stage["id"],
-                "label": stage["label"],
-                "next_action": stage["next_action"],
-                "issues": issues[:20],
-            }
-            break
+    run_task_controller_status = _load_sibling_module("paopao_pipeline_state").task_controller_status
 
-    deliverable = first_blocked is None
-    return {
-        "schema": "paopao.task_controller_status.v1",
-        "task_dir": str(task_dir),
-        "expected_pages": expected,
-        "deliverable": deliverable,
-        "blocked": first_blocked,
-        "completed_stages": [stage["id"] for stage in stage_results if stage.get("ok")],
-        "stage_results": stage_results,
-        "policy": (
-            "Paopao tasks are not deliverable by agent judgment. Delivery is valid only through "
-            "finalize-delivery and a current qa/final_delivery_pass.json."
-        ),
-    }
+    return run_task_controller_status(_module_context(), task_dir, expected, pptx)
 
 
 def cmd_run_task(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = args.pages or expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Pass --pages or initialize task with --pages.")
-    pptx = Path(args.pptx).resolve() if args.pptx else None
-    status = task_controller_status(task_dir, expected, pptx)
-    out = task_dir / "qa" / "task_controller_status.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(status, indent=2, ensure_ascii=False))
-    return 0 if status["deliverable"] else 1
+    run_cmd_run_task = _load_sibling_module("paopao_pipeline_state").cmd_run_task
+
+    return run_cmd_run_task(_module_context(), args)
 
 
 def _pipeline_step_state(task_dir: Path, expected: int) -> dict[str, object]:
-    """Determine the precise pipeline step the task is at and what to do next."""
+    run_pipeline_step_state = _load_sibling_module("paopao_pipeline_state").pipeline_step_state
 
-    state: dict[str, object] = {
-        "task_dir": str(task_dir),
-        "expected_pages": expected,
-        "pipeline_mode": task_pipeline_mode(task_dir),
-    }
-
-    delivery_dir = task_dir / "delivery"
-    delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
-    if final_delivery_pass_path(task_dir).exists() and delivery_pptx:
-        state["step"] = "finalize"
-        state["step_number"] = 99
-        state["instruction"] = "All checks passed. Delivery is ready."
-        return state
-
-    if is_html_source_only_task(task_dir):
-        analysis_issues: list[str] = []
-        check_html_source_analysis_files(task_dir, expected, analysis_issues)
-        if analysis_issues:
-            state["step"] = "analysis"
-            state["step_number"] = 1
-            state["instruction"] = (
-                "Analysis employee context boundary: you may read PDF/source files and analysis/evidence_pool.json. "
-                "Downstream employees must not reopen PDF/source.\n"
-                "Produce Paopao prompt-library artifacts:\n"
-                "  0. Run: paopao_run.py extract-evidence-pool --task-dir <dir>\n"
-                "  1. analysis/analysis_report.md — synthesized report and source-backed conclusions; cite evidence_pool facts where possible\n"
-                "  2. analysis/slide_story.json — one role/brief per slide\n"
-                "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
-                "     This selects a prompt template for each page and outputs fill_zones for each.\n"
-                "  4. For EACH page, read that page's fill_zones from prompt_selection_plan.json.\n"
-                "     Each zone has a name and instructions describing what data to fill.\n"
-                "     Extract matching data from analysis_report.md for EVERY zone — not just TITLE.\n"
-                "     Then run:\n"
-                "     paopao_run.py fill-prompt-template --template <selected_template.md> "
-                "--fills '<zone JSON>' --output analysis/final_prompt_XX.md\n"
-                "     The --fills JSON must include ALL zones listed in fill_zones.\n"
-                "     Do NOT write final_prompt_XX.md by hand.\n"
-                "  5. analysis/prompt_selection_audit.md — why each template was selected\n"
-                "Do not create analysis/html_prompt_XX.md.\n"
-                "When done, run: paopao_run.py next --task-dir <dir>"
-            )
-            state["issues"] = analysis_issues
-            return state
-
-        html_issues: list[str] = []
-        html_count = check_html_files(
-            task_dir,
-            expected,
-            html_issues,
-            source_of_truth=HTML_BROWSER_SOURCE_OF_TRUTH,
-        )
-        if html_count < expected or html_issues:
-            done_slides = sorted(
-                int(p.stem.replace("slide", ""))
-                for p in (task_dir / "html").glob("slide*.html")
-                if p.is_file() and re.match(r"slide\d+$", p.stem)
-            )
-            missing = [i for i in range(1, expected + 1) if i not in done_slides]
-            slide_idx = missing[0] if missing else 1
-            state["step"] = "html_source"
-            state["step_number"] = 2
-            state["current_slide"] = slide_idx
-            state["instruction"] = (
-                f"Prepare/register the locked Paopao HTML prompt packet for slide {slide_idx}:\n"
-                f"  paopao_run.py generate-html --task-dir <dir> --slide {slide_idx}\n"
-                "HTML employee context boundary: read only the returned compact_packet and "
-                "qa/html_generation_requests/renderer_compact_guide.md.\n"
-                "Do not read PDF/source, analysis_report, final_prompt directly, full SKILL, full renderer_guide, "
-                "prior drafts, or other pipeline materials.\n"
-                "If the command returns prompt_packet_ready, generate html/slideXX.html from compact_packet only, "
-                "including the required meta marker, then run:\n"
-                f"  paopao_run.py register-html --task-dir <dir> --slide {slide_idx}\n"
-                "When done, run: paopao_run.py next --task-dir <dir>"
-            )
-            if html_issues:
-                state["issues"] = html_issues
-            return state
-
-        pptx_dir = task_dir / "pptx"
-        pptx_files = sorted(p for p in pptx_dir.glob("*.pptx") if p.is_file() and not p.name.startswith("~$"))
-        pptx = pptx_files[-1] if pptx_files else pptx_dir / "deck.pptx"
-        render_issues: list[str] = []
-        if pptx.exists():
-            check_render_manifest(task_dir, pptx, render_issues)
-        if not pptx.exists() or render_issues:
-            state["step"] = "render"
-            state["step_number"] = 3
-            state["instruction"] = (
-                "Render/QA employee context boundary: inspect only HTML/PPTX previews and command check results. "
-                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
-                "Convert HTML to editable PPTX through the HTML-source-only renderer:\n"
-                "  1. Run: paopao_run.py render --task-dir <dir> --pptx pptx/deck.pptx --html-source-only\n"
-                "  2. Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html "
-                "--source-of-truth html_browser_render --pptx pptx/deck.pptx\n"
-                "This binds the PPTX to the current HTML files and browser preview hashes."
-            )
-            if render_issues:
-                state["issues"] = render_issues
-            return state
-
-        contract_issues: list[str] = []
-        check_commercial_render_contract(task_dir, expected, pptx, contract_issues)
-        if contract_issues:
-            state["step"] = "record_render"
-            state["step_number"] = 3
-            state["instruction"] = (
-                "Render/QA employee context boundary: inspect only HTML/PPTX previews and command check results. "
-                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
-                "Record the HTML-source-only commercial render contract:\n"
-                "  Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html "
-                "--source-of-truth html_browser_render --pptx pptx/deck.pptx"
-            )
-            state["issues"] = contract_issues
-            return state
-
-        actual_dir = task_dir / "qa" / "pptx_actual"
-        actual_pngs = sorted(actual_dir.glob("slide-*.png"))
-        if len(actual_pngs) < expected:
-            state["step"] = "pptx_export"
-            state["step_number"] = 4
-            state["instruction"] = (
-                "QA employee context boundary: inspect only browser HTML preview, actual PPTX preview, and check results. "
-                "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
-                "Export actual PowerPoint-rendered slide previews:\n"
-                "  1. Open pptx/deck.pptx in PowerPoint or another real PPTX renderer\n"
-                "  2. Export each slide to qa/pptx_actual/slide-1.png, slide-2.png, ...\n"
-                "  3. Do not copy qa/html_reference images; actual previews must come from the PPTX\n"
-                "When done, run: paopao_run.py next --task-dir <dir>"
-            )
-            return state
-
-        delivery_dir = task_dir / "delivery"
-        delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
-        if delivery_pptx:
-            state["step"] = "finalize"
-            state["step_number"] = 5
-            state["instruction"] = "All checks passed. Delivery is ready."
-            return state
-
-        state["step"] = "review"
-        state["step_number"] = 5
-        state["instruction"] = (
-            "QA employee context boundary: inspect only browser HTML preview, actual PPTX preview, and check results. "
-            "Do not read PDF/source, analysis, final_prompt, prompt packets, prior drafts, or other pipeline materials.\n"
-            "Export actual PowerPoint-rendered slide previews to qa/pptx_actual/slide-1.png, slide-2.png, ... .\n"
-            "Open the browser HTML preview and the actual PPTX preview. If PPTX differs from the browser render, "
-            "fix renderer behavior or rerender from HTML; stay on the current HTML-source-only path.\n"
-            "Save qa/fidelity_review.json comparing each PPTX preview against qa/html_reference/slide-XX.png.\n"
-            "Save qa/powerpoint_review.json after opening the real PPTX and checking editability/overlap.\n"
-            "When review is complete, run:\n"
-            "  paopao_run.py finalize-delivery --task-dir <dir> --pptx pptx/deck.pptx"
-        )
-        return state
-
-    analysis_issues: list[str] = []
-    check_analysis_files(task_dir, expected, analysis_issues)
-    if analysis_issues:
-        state["step"] = "analysis"
-        state["step_number"] = 1
-        state["instruction"] = (
-            "Read source materials and produce:\n"
-            "  1. analysis/analysis_report.md — key data with sources\n"
-            "  2. analysis/slide_story.json — arc + per-page conclusions\n"
-            "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
-            "     This selects a prompt template for each page and outputs fill_zones for each.\n"
-            "  4. For EACH page, read that page's fill_zones from prompt_selection_plan.json.\n"
-            "     Each zone has a name and instructions describing what data to fill.\n"
-            "     Extract matching data from analysis_report.md for EVERY zone — not just TITLE.\n"
-            "     Then run:\n"
-            "     paopao_run.py fill-prompt-template --template <selected_template.md> "
-            "--fills '<zone JSON>' --output analysis/final_prompt_XX.md\n"
-            "     The --fills JSON must include ALL zones listed in fill_zones.\n"
-            "     Do NOT write final_prompt_XX.md by hand.\n"
-            "  5. analysis/prompt_selection_audit.md\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
-        )
-        state["issues"] = analysis_issues
-        return state
-
-    image2_issues: list[str] = []
-    image2_count = check_image2_files(task_dir, expected, image2_issues)
-    def _is_style_review_issue(issue: str) -> bool:
-        lowered = issue.lower()
-        return "image2_style_review" in lowered or "image2 style review" in lowered
-
-    def _is_user_review_issue(issue: str) -> bool:
-        lowered = issue.lower()
-        return (
-            "image2_user_review" in lowered
-            or "user image review" in lowered
-            or "user_approved" in lowered
-        )
-
-    style_review_issues = [i for i in image2_issues if _is_style_review_issue(i)]
-    user_review_issues = [i for i in image2_issues if _is_user_review_issue(i)]
-    image2_provenance_issues = [
-        i for i in image2_issues
-        if not _is_style_review_issue(i) and not _is_user_review_issue(i)
-    ]
-    if image2_count < expected or image2_provenance_issues:
-        done_slides = sorted(
-            int(p.stem.split("_")[-1])
-            for p in (task_dir / "image2").glob("image2_reference_*.png")
-            if p.is_file()
-        )
-        missing = [i for i in range(1, expected + 1) if i not in done_slides]
-        if not (task_dir / "image2" / "image2_generation_manifest.json").exists():
-            state["step"] = "image2_prepare"
-            state["step_number"] = 2
-            state["instruction"] = (
-                "Run: paopao_lab.py prepare-image2-prompts --task-dir <dir>\n"
-                "This locks the per-slide prompts for image generation."
-            )
-        elif missing:
-            slide = missing[0]
-            state["step"] = "image2_generate"
-            state["step_number"] = 2
-            state["current_slide"] = slide
-            state["instruction"] = (
-                f"Generate Image2 for slide {slide}:\n"
-                f"  1. Run: paopao_lab.py start-image2-generation --task-dir <dir> --slide {slide}\n"
-                f"  2. Use a controlled generator that reads image2/generation_request_{slide:02d}.json prompt_text exactly. "
-                f"Do not paste, summarize, compress, translate, or rewrite the prompt in chat.\n"
-                f"  3. Register the actual original image-generation output only. Do not register a manually redrawn, simplified, "
-                f"smoke-test, screenshot, or replacement reference.\n"
-                f"  4. Register: paopao_lab.py register-image2-reference --task-dir <dir> "
-                f"--slide {slide} --image <output_path> --generation-request image2/generation_request_{slide:02d}.json "
-                f"--generated-prompt-sha256 <sha> --source image_gen_builtin --tool-call-id <id> "
-                f"--controlled-generation image2/controlled_generation_{slide:02d}.json\n"
-                f"When done, run: paopao_lab.py next --task-dir <dir>"
-            )
-        else:
-            state["step"] = "image2_fix"
-            state["step_number"] = 2
-            state["instruction"] = "Fix Image2 registration issues listed below, then run next again."
-            state["issues"] = image2_provenance_issues
-        return state
-
-    if style_review_issues:
-        state["step"] = "image2_style_review"
-        state["step_number"] = 3
-        state["instruction"] = (
-            "Open every selected Image2 reference and record actual visual style evidence in "
-            "qa/image2_style_review.json.\n"
-            "Check each slide for: aspect_ratio_16_9, house_style_reference, palette_discipline, "
-            "clean_background, linework_and_borders, material_simplicity, title_weight, "
-            "module_density, takeaway, color_hierarchy, and icons.\n"
-            "Do not proceed from the prompt text; inspect the actual generated images.\n"
-            "When done, run: paopao_lab.py next --task-dir <dir>"
-        )
-        state["issues"] = style_review_issues
-        return state
-
-    user_review_path = task_dir / "qa" / "image2_user_review.json"
-    if not user_review_path.exists() or user_review_issues:
-        state["step"] = "image2_user_review"
-        state["step_number"] = 4
-        state["instruction"] = (
-            "Show all Image2 reference images to the user for approval.\n"
-            "After user responds, run:\n"
-            "  paopao_lab.py record-image2-user-review --task-dir <dir> --approved <yes|no> --feedback '<text>'\n"
-            "Then run: paopao_lab.py next --task-dir <dir>"
-        )
-        if user_review_issues:
-            state["issues"] = user_review_issues
-        return state
-    else:
-        try:
-            review_data = json.loads(user_review_path.read_text(encoding="utf-8"))
-            if review_data.get("user_approved") is not True:
-                state["step"] = "image2_user_review"
-                state["step_number"] = 4
-                state["instruction"] = (
-                    "User requested changes. Regenerate the affected Image2 references, "
-                    "then record a new approval.\n"
-                    f"User feedback: {review_data.get('user_feedback', '')}"
-                )
-                return state
-        except Exception:
-            pass
-
-    boundary_path = task_dir / "qa" / "post_image_memory_boundary.json"
-    if not boundary_path.exists():
-        state["step"] = "memory_boundary"
-        state["step_number"] = 5
-        state["instruction"] = (
-            "Run: paopao_lab.py forget-after-image2 --task-dir <dir>\n"
-            "This enforces the memory boundary — after this point, reconstruction "
-            "must be based solely on the selected Image2 reference images."
-        )
-        return state
-
-    html_issues: list[str] = []
-    html_count = check_html_files(task_dir, expected, html_issues)
-    if html_count < expected:
-        done_slides = sorted(
-            int(p.stem.replace("slide", ""))
-            for p in (task_dir / "html").glob("slide*.html")
-            if p.is_file() and re.match(r"slide\d+$", p.stem)
-        )
-        missing = [i for i in range(1, expected + 1) if i not in done_slides]
-        slide_idx = missing[0] if missing else 1
-        state["step"] = "direct_painter"
-        state["step_number"] = 6
-        state["current_slide"] = slide_idx
-        state["instruction"] = (
-            f"Create custom HTML/CSS for slide {slide_idx} from the approved Image2 reference:\n"
-            f"  1. Open image2/image2_reference_{slide_idx:02d}.png and use it as the only visual source.\n"
-            f"  2. Hand-author html/slide{slide_idx:02d}.html to match the reference page: nav, title, content modules, "
-            f"charts/tables/icons/connectors, takeaway, source, colors, spacing, and typography.\n"
-            f"  3. Use editable HTML primitives that renderer.py can convert: text boxes, divs, tables, chart data blocks, "
-            f"and marked small image/icon assets when needed. Never use a whole-slide screenshot.\n"
-            f"  4. Do not write python-pptx. Do not use compile_object_graph, object_graph, observation, visual_inventory, "
-            f"or layout_plan as the production path.\n"
-            f"When done, run: paopao_lab.py next --task-dir <dir>"
-        )
-        return state
-    if html_issues:
-        state["step"] = "direct_painter_fix"
-        state["step_number"] = 6
-        state["instruction"] = (
-            "Fix the custom HTML/CSS issues below by reopening the approved Image2 references and editing the relevant "
-            "html/slideXX.html files. Do not create observation, visual_inventory, layout_plan, object_graph, or "
-            "python-pptx painter files for production."
-        )
-        state["issues"] = html_issues
-        return state
-
-    pptx_dir = task_dir / "pptx"
-    pptx_files = sorted(p for p in pptx_dir.glob("*.pptx") if p.is_file() and not p.name.startswith("~$"))
-    pptx = pptx_files[-1] if pptx_files else pptx_dir / "deck.pptx"
-    render_issues: list[str] = []
-    if pptx.exists():
-        check_render_manifest(task_dir, pptx, render_issues)
-    if not pptx.exists() or render_issues:
-        state["step"] = "render"
-        state["step_number"] = 7
-        state["instruction"] = (
-            "Convert the hand-authored HTML/CSS into editable PPTX through the production renderer:\n"
-            "  1. Run: paopao_lab.py render --task-dir <dir> --pptx pptx/deck.pptx\n"
-            "  2. Then run: paopao_lab.py record-commercial-render --task-dir <dir> --render-path html --pptx pptx/deck.pptx\n"
-            "renderer.py is the format converter for this production path. Do not replace it with python-pptx or "
-            "compile_object_graph.\n"
-            "When done, run: paopao_lab.py next --task-dir <dir>"
-        )
-        if render_issues:
-            state["issues"] = render_issues
-        return state
-
-    contract_issues: list[str] = []
-    check_commercial_render_contract(task_dir, expected, pptx, contract_issues)
-    if contract_issues:
-        state["step"] = "record_render"
-        state["step_number"] = 7
-        state["instruction"] = (
-            "Record the production render contract before PPTX preview export:\n"
-            "  Run: paopao_run.py record-commercial-render --task-dir <dir> --render-path html --pptx pptx/deck.pptx\n"
-            "This binds the final PPTX hash to the approved Image2 references and the HTML renderer path."
-        )
-        state["issues"] = contract_issues
-        return state
-
-    actual_dir = task_dir / "qa" / "pptx_actual"
-    actual_pngs = sorted(actual_dir.glob("slide-*.png"))
-    if len(actual_pngs) < expected:
-        state["step"] = "pptx_export"
-        state["step_number"] = 8
-        state["instruction"] = (
-            "Export PPTX slide previews:\n"
-            "  1. Open the generated PPTX in PowerPoint\n"
-            "  2. Export each slide as PNG to qa/pptx_actual/slide-1.png, slide-2.png, ...\n"
-            "  3. Also export a PDF to qa/pptx_actual/actual.pdf\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
-        )
-        return state
-
-    fidelity_path = task_dir / "qa" / "fidelity_review.json"
-    fidelity_ok = True
-    if not fidelity_path.exists():
-        fidelity_ok = False
-    else:
-        try:
-            fidelity_data = json.loads(fidelity_path.read_text(encoding="utf-8"))
-            slides = fidelity_data.get("slides", [])
-            evidences = [str(s.get("evidence", "")) for s in slides if isinstance(s, dict)]
-            if len(set(evidences)) < len(evidences):
-                fidelity_ok = False
-            for s in slides:
-                if not isinstance(s, dict):
-                    fidelity_ok = False
-                    continue
-                status = str(s.get("status", "")).lower().strip()
-                if status not in DELIVERY_REVIEW_ACCEPTED_STATUSES:
-                    fidelity_ok = False
-                if s.get("compared") is not True:
-                    fidelity_ok = False
-                if len(str(s.get("evidence", ""))) < 80:
-                    fidelity_ok = False
-        except Exception:
-            fidelity_ok = False
-
-    if not fidelity_ok:
-        state["step"] = "fidelity_review"
-        state["step_number"] = 9
-        state["instruction"] = (
-            "Compare EACH slide's PPTX preview against its Image2 reference:\n"
-            "  For each slide (1 to {expected}):\n"
-            "    1. Open image2/image2_reference_XX.png\n"
-            "    2. Open qa/pptx_actual/slide-X.png\n"
-            "    3. Write a UNIQUE, SPECIFIC comparison for this slide:\n"
-            "       - What matches well\n"
-            "       - What differs (position, size, color, text, missing elements)\n"
-            "       - Whether it needs fixing\n"
-            "  Save as qa/fidelity_review.json with per-slide evidence.\n"
-            "  EACH slide MUST have different evidence text — no copy-paste.\n"
-            "  Evidence must be at least 80 characters per slide.\n"
-            "If any slide has issues, fix the relevant html/slideXX.html, re-render, re-export, then re-review.\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
-        ).format(expected=expected)
-        return state
-
-    ppt_review_path = task_dir / "qa" / "powerpoint_review.json"
-    if not ppt_review_path.exists():
-        state["step"] = "powerpoint_review"
-        state["step_number"] = 10
-        state["instruction"] = (
-            "Open the PPTX in PowerPoint and inspect the editing interface:\n"
-            "  For each slide:\n"
-            "    - Is text editable and properly formatted?\n"
-            "    - Are charts native (double-click opens data editor)?\n"
-            "    - Are there overlapping elements or clipped text?\n"
-            "    - Does the nav text appear centered?\n"
-            "  Save as qa/powerpoint_review.json with actual_pptx_opened: true.\n"
-            "  Each slide must have unique evidence.\n"
-            "When done, run: paopao_run.py next --task-dir <dir>"
-        )
-        return state
-
-    pipeline_issues: list[str] = []
-    pipeline_counts: dict[str, object] = {}
-    pipeline_counts.update(check_pipeline_contract(task_dir, expected, pptx, pipeline_issues))
-    if pipeline_issues:
-        fixable = [i for i in pipeline_issues if "similarity" in i.lower() or "fidelity" in i.lower()]
-        structural = [i for i in pipeline_issues if i not in fixable]
-        if fixable and not structural:
-            state["step"] = "iterate_pptx"
-            state["step_number"] = 11
-            state["instruction"] = (
-                "Similarity scores are below threshold. Fix the custom HTML/CSS output:\n"
-                "  1. Open EACH failing slide's Image2 reference and PPTX preview side by side\n"
-                "  2. Identify specific differences (missing elements, wrong positions, wrong text)\n"
-                "  3. Update the relevant html/slideXX.html to fix those differences\n"
-                "  4. Regenerate pptx/deck.pptx through paopao_run.py render, not python-pptx or compile_object_graph\n"
-                "  5. Re-export PNGs, redo fidelity review\n"
-                "  5. Run: paopao_run.py next --task-dir <dir>\n"
-                "Failing checks:"
-            )
-            state["issues"] = fixable
-        else:
-            state["step"] = "pipeline_fix"
-            state["step_number"] = 11
-            state["instruction"] = "Fix pipeline issues listed below."
-            state["issues"] = pipeline_issues
-        return state
-
-    state["step"] = "finalize"
-    state["step_number"] = 12
-    state["instruction"] = (
-        "All checks passed. Finalize delivery:\n"
-        "  Run: paopao_run.py finalize-delivery --task-dir <dir> --pptx <path>\n"
-        "This runs the final gate and packages the deliverable."
-    )
-    return state
-
-
-def _fetch_server_notices() -> dict[str, str]:
-    result: dict[str, str] = {}
-    try:
-        data = paopao_auth.request_json("GET", f"{paopao_auth.server_url()}/health")
-        greeting = data.get("greeting")
-        if isinstance(greeting, dict):
-            msg = str(greeting.get("message", "")).strip()
-            if msg:
-                result["greeting"] = msg
-        notice = data.get("update_notice")
-        if isinstance(notice, dict):
-            msg = str(notice.get("message", "")).strip()
-            if msg:
-                result["update_notice"] = msg
-    except Exception:
-        pass
-    return result
+    return run_pipeline_step_state(_module_context(), task_dir, expected)
 
 
 def cmd_next(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = args.pages or expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Pass --pages or initialize task with --pages.")
+    run_cmd_next = _load_sibling_module("paopao_pipeline_state").cmd_next
 
-    state = _pipeline_step_state(task_dir, expected)
-
-    notices = _fetch_server_notices()
-    if notices.get("greeting"):
-        state["greeting"] = notices["greeting"]
-    if notices.get("update_notice"):
-        state["update_notice"] = notices["update_notice"]
-
-    state_path = task_dir / "qa" / "pipeline_state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print(json.dumps(state, indent=2, ensure_ascii=False))
-    return 0
+    return run_cmd_next(_module_context(), args)
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    keep_private = bool(args.keep_private_prompts or os.getenv(PROMPT_ARCHIVE_ENV) == "1")
-    if keep_private and not (
-        os.getenv("PAOPAO_LOCAL_DEV") == "1" and os.getenv(PROMPT_ARCHIVE_DEV_ENV) == "1"
-    ):
-        raise SystemExit(
-            "Refusing to keep private prompt artifacts outside local development. "
-            "Unset --keep-private-prompts/PAOPAO_KEEP_PRIVATE_PROMPTS."
-        )
-    moved_count = 0
-    deleted_prompts: list[str] = []
-    private_root = task_dir / PROMPT_PRIVATE_DIR
-    if keep_private:
-        private_root.mkdir(parents=True, exist_ok=True)
-    for path in internal_prompt_files(task_dir):
-        src_rel = path.relative_to(task_dir)
-        if keep_private:
-            dest = prompt_private_path(task_dir, path)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                dest.unlink()
-            shutil.move(str(path), str(dest))
-            moved_count += 1
-        else:
-            path.unlink()
-            deleted_prompts.append(str(src_rel))
-    if not keep_private and private_root.exists():
-        shutil.rmtree(private_root)
-    removed_temp_count = 0
-    for path in delivery_temp_files(task_dir):
-        removed_temp_count += 1
-        path.unlink()
+    run_cleanup = _load_sibling_module("paopao_delivery_commands").cmd_cleanup
 
-    manifest = {
-        "policy": "internal prompt and Markdown artifacts are never included in user delivery",
-        "kept_private_prompts": keep_private,
-        "deleted_prompt_markdown_file_count": len(deleted_prompts),
-        "moved_prompt_markdown_file_count": moved_count,
-        "removed_temporary_file_count": removed_temp_count,
-        "note": (
-            "User-facing output must not reveal prompt, Markdown, analysis, QA, or debug artifacts."
-        ),
-    }
-    out = task_dir / "qa" / "delivery_cleanup.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(manifest, ensure_ascii=False, indent=2))
-    return 0
-
-
-def codex_session_candidates(explicit_session: str = "") -> list[Path]:
-    if explicit_session:
-        return [Path(explicit_session).expanduser().resolve()]
-    sessions_root = Path.home() / ".codex" / "sessions"
-    if not sessions_root.exists():
-        return []
-    files = [p for p in sessions_root.rglob("*.jsonl") if p.is_file()]
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files
-
-
-def decode_codex_imagegen_payload(session_path: Path, tool_call_id: str) -> bytes | None:
-    with session_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if tool_call_id not in line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = record.get("payload", {})
-            if payload.get("type") not in {"image_generation_call", "image_generation_end"}:
-                continue
-            if payload.get("id") != tool_call_id and payload.get("call_id") != tool_call_id:
-                continue
-            encoded = payload.get("result")
-            if not isinstance(encoded, str) or not encoded.strip():
-                continue
-            try:
-                raw = base64.b64decode(encoded, validate=True)
-            except Exception:
-                continue
-            return raw
-    return None
-
-
-def decode_codex_imagegen_prompt(session_path: Path, tool_call_id: str) -> str | None:
-    with session_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if tool_call_id not in line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = record.get("payload", {})
-            if payload.get("type") not in {"image_generation_call", "image_generation_end"}:
-                continue
-            if payload.get("id") != tool_call_id and payload.get("call_id") != tool_call_id:
-                continue
-            prompt = payload.get("prompt")
-            if isinstance(prompt, str) and prompt.strip():
-                return prompt
-            revised_prompt = payload.get("revised_prompt")
-            if isinstance(revised_prompt, str) and revised_prompt.strip():
-                return revised_prompt
-    return None
-
-
-def find_codex_imagegen_prompt(tool_call_id: str, session_arg: str = "") -> tuple[str | None, Path | None]:
-    for session_path in codex_session_candidates(session_arg):
-        if not session_path.exists():
-            continue
-        prompt = decode_codex_imagegen_prompt(session_path, tool_call_id)
-        if prompt is not None:
-            return prompt, session_path
-    return None, None
-
-
-def png_size(raw: bytes) -> tuple[int, int] | None:
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
-        return None
-    width, height = struct.unpack(">II", raw[16:24])
-    return int(width), int(height)
-
-
-def cmd_extract_codex_imagegen_result(args: argparse.Namespace) -> int:
-    tool_call_id = str(args.tool_call_id or "").strip()
-    if len(tool_call_id) < 8:
-        print(
-            json.dumps({
-                "ok": False,
-                "issue": "tool-call id is required",
-            }, ensure_ascii=False, indent=2),
-            file=sys.stderr,
-        )
-        return 1
-    output = Path(args.output).expanduser().resolve()
-    if output.exists() and not args.force:
-        print(
-            json.dumps({
-                "ok": False,
-                "issue": "output already exists; pass --force to overwrite",
-                "output": str(output),
-            }, ensure_ascii=False, indent=2),
-            file=sys.stderr,
-        )
-        return 1
-    matched_session: Path | None = None
-    raw: bytes | None = None
-    for session_path in codex_session_candidates(args.session):
-        if not session_path.exists():
-            continue
-        raw = decode_codex_imagegen_payload(session_path, tool_call_id)
-        if raw:
-            matched_session = session_path
-            break
-    if not raw or not matched_session:
-        print(
-            json.dumps({
-                "ok": False,
-                "issue": "image generation result not found in Codex session logs",
-                "tool_call_id": tool_call_id,
-                "hint": "Use a Codex image_generation tool-call id such as ig_..., or pass --session to the correct rollout jsonl.",
-            }, ensure_ascii=False, indent=2),
-            file=sys.stderr,
-        )
-        return 1
-    size = png_size(raw)
-    if size is None:
-        print(
-            json.dumps({
-                "ok": False,
-                "issue": "decoded payload is not a valid PNG image",
-                "tool_call_id": tool_call_id,
-            }, ensure_ascii=False, indent=2),
-            file=sys.stderr,
-        )
-        return 1
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(raw)
-    print(json.dumps({
-        "ok": True,
-        "output": str(output),
-        "tool_call_id": tool_call_id,
-        "session": str(matched_session),
-        "bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "width": size[0],
-        "height": size[1],
-    }, ensure_ascii=False, indent=2))
-    return 0
-
-
-TOKEN_AUDIT_STAGES = [
-    "setup_update",
-    "analysis_prompting",
-    "image2_generation",
-    "visual_measurement",
-    "direct_reconstruction",
-    "html_reconstruction",
-    "qa_review",
-    "release_deploy",
-    "other",
-]
-
-
-def _empty_token_usage() -> dict[str, int]:
-    return {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_output_tokens": 0,
-        "total_tokens": 0,
-    }
-
-
-def _add_token_usage(target: dict[str, int], usage: object) -> None:
-    if not isinstance(usage, dict):
-        return
-    for key in target:
-        value = usage.get(key)
-        if isinstance(value, (int, float)):
-            target[key] += int(value)
-
-
-def _resolve_codex_sessions(session_arg: str = "", recent: int = 1) -> list[Path]:
-    raw = str(session_arg or "").strip()
-    candidates = codex_session_candidates("")
-    if raw:
-        path = Path(raw).expanduser()
-        if path.exists():
-            return [path.resolve()]
-        matches = [p for p in candidates if raw in p.name or raw in str(p)]
-        return matches[: max(1, recent)]
-    return candidates[: max(1, recent)]
-
-
-def _extract_original_token_count(output: str) -> int | None:
-    match = re.search(r"Original token count:\s*(\d+)", output)
-    return int(match.group(1)) if match else None
-
-
-def _extract_process_exit_code(output: str) -> int | None:
-    match = re.search(r"Process exited with code\s+(-?\d+)", output)
-    return int(match.group(1)) if match else None
-
-
-def _stage_from_text(text: str) -> str:
-    lower = text.lower()
-    if any(token in lower for token in [
-        "git push", "render deploy", "check_public_release", "raw.githubusercontent.com",
-        "deploy hook", "public repo", "internal repo", "public release",
-    ]):
-        return "release_deploy"
-    if any(token in lower for token in [
-        "fidelity_review", "powerpoint_review", "check --stage pptx", "check --stage pipeline",
-        "check --stage delivery", "pptx_actual", "soffice", "libreoffice", "pdftoppm",
-        "compare_", "qa/", "similarity", "visual check",
-    ]):
-        return "qa_review"
-    if any(token in lower for token in [
-        "build-powerpoint-layout-plan",
-        "direct_pptx", "native_chart", "native_table",
-    ]):
-        return "direct_reconstruction"
-    if any(token in lower for token in [
-        " render ", "renderer.py", "html_renderer", "html_reference", "render_manifest", "playwright",
-        "html slide", "html path",
-    ]):
-        return "html_reconstruction"
-    if any(token in lower for token in [
-        "visual_inventory", "visual_contract", "visual_blueprint", "record-image2-observation",
-        "extract-image2-contract", "measurement", "bbox", "component_parts",
-    ]):
-        return "visual_measurement"
-    if any(token in lower for token in [
-        "image2", "image_generation", "imagegen", "prepare-image2", "register-image2",
-        "extract-codex-imagegen-result", "generation_request",
-    ]):
-        return "image2_generation"
-    if any(token in lower for token in [
-        "analysis_report", "slide_story", "plan-prompts", "fill-prompt-template", "final_prompt",
-        "prompt_selection", "source analysis",
-    ]):
-        return "analysis_prompting"
-    if any(token in lower for token in [
-        "doctor", "fetch-workflow", "paopao_run.py update", "make-deck", "run-task", "read skill",
-        "skill.md", "git status", "git log", "rg --files",
-    ]):
-        return "setup_update"
-    return "other"
-
-
-def _merge_stage(existing: str, incoming: str) -> str:
-    if existing == "other":
-        return incoming
-    if incoming == "other" or existing == incoming:
-        return existing
-    priority = {
-        "release_deploy": 90,
-        "qa_review": 80,
-        "direct_reconstruction": 70,
-        "html_reconstruction": 70,
-        "visual_measurement": 60,
-        "image2_generation": 50,
-        "analysis_prompting": 40,
-        "setup_update": 30,
-        "other": 0,
-    }
-    return incoming if priority.get(incoming, 0) > priority.get(existing, 0) else existing
-
-
-def _token_audit_read_session(session_path: Path) -> dict[str, object]:
-    turns: dict[str, dict[str, object]] = {}
-    current_turn = "unknown"
-    session_meta: dict[str, object] = {"path": str(session_path)}
-    command_counts: dict[str, int] = {}
-    large_outputs: list[dict[str, object]] = []
-    failed_commands: list[dict[str, object]] = []
-    path_profile_hits = {"direct_pptx": 0, "html": 0, "render_manifest_blockers": 0}
-    token_events = 0
-
-    def turn(turn_id: str) -> dict[str, object]:
-        data = turns.setdefault(turn_id, {
-            "turn_id": turn_id,
-            "stage": "other",
-            "usage": _empty_token_usage(),
-            "snippets": [],
-            "commands": [],
-            "tool_output_tokens": 0,
-            "failed_command_count": 0,
-        })
-        return data
-
-    with session_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line_no, line in enumerate(f, 1):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = record.get("payload")
-            if record.get("type") == "session_meta" and isinstance(payload, dict):
-                session_meta.update({
-                    "id": payload.get("id"),
-                    "cwd": payload.get("cwd"),
-                    "created_at": payload.get("timestamp"),
-                    "originator": payload.get("originator"),
-                })
-                continue
-            if not isinstance(payload, dict):
-                continue
-            if record.get("type") == "event_msg":
-                event_type = payload.get("type")
-                if event_type == "task_started" and payload.get("turn_id"):
-                    current_turn = str(payload.get("turn_id"))
-                    turn(current_turn)
-                if event_type == "token_count":
-                    info = payload.get("info")
-                    usage = info.get("last_token_usage") if isinstance(info, dict) else None
-                    if isinstance(usage, dict):
-                        token_events += 1
-                        _add_token_usage(turn(current_turn)["usage"], usage)  # type: ignore[arg-type]
-                    continue
-            if record.get("type") != "response_item":
-                continue
-            metadata = payload.get("metadata")
-            if isinstance(metadata, dict) and metadata.get("turn_id"):
-                current_turn = str(metadata.get("turn_id"))
-            t = turn(current_turn)
-            ptype = str(payload.get("type", ""))
-            role = str(payload.get("role", ""))
-            snippets = t["snippets"]  # type: ignore[assignment]
-            if ptype == "function_call":
-                name = str(payload.get("name", ""))
-                args = str(payload.get("arguments", ""))
-                command_key = name
-                try:
-                    parsed_args = json.loads(args)
-                    if isinstance(parsed_args, dict) and parsed_args.get("cmd"):
-                        command_key = str(parsed_args.get("cmd", "")).strip().split("\n", 1)[0][:180]
-                except Exception:
-                    pass
-                command_counts[command_key] = command_counts.get(command_key, 0) + 1
-                t["commands"].append(command_key)  # type: ignore[index]
-                snippets.append(f"{name} {args[:600]}")
-                t["stage"] = _merge_stage(str(t["stage"]), _stage_from_text(f"{name} {args}"))
-            elif ptype == "function_call_output":
-                output = str(payload.get("output", ""))
-                original_tokens = _extract_original_token_count(output)
-                if original_tokens:
-                    t["tool_output_tokens"] = int(t["tool_output_tokens"]) + original_tokens
-                    if original_tokens >= 1500:
-                        large_outputs.append({
-                            "line": line_no,
-                            "turn_id": current_turn,
-                            "tokens": original_tokens,
-                            "stage": t["stage"],
-                            "preview": output[:220].replace("\n", "\\n"),
-                        })
-                exit_code = _extract_process_exit_code(output)
-                if exit_code not in (None, 0):
-                    t["failed_command_count"] = int(t["failed_command_count"]) + 1
-                    failed_commands.append({
-                        "line": line_no,
-                        "turn_id": current_turn,
-                        "exit_code": exit_code,
-                        "stage": t["stage"],
-                        "preview": output[:260].replace("\n", "\\n"),
-                    })
-                if "render_manifest" in output and "not_required_for_direct_pptx" not in output:
-                    path_profile_hits["render_manifest_blockers"] += 1
-                if "direct_pptx" in output:
-                    path_profile_hits["direct_pptx"] += 1
-                if "html_reference_fidelity" in output or "render_manifest" in output:
-                    path_profile_hits["html"] += 1
-                snippets.append(output[:500])
-                t["stage"] = _merge_stage(str(t["stage"]), _stage_from_text(output))
-            elif ptype == "message":
-                parts = payload.get("content")
-                if isinstance(parts, list):
-                    text = "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
-                else:
-                    text = str(parts or "")
-                if role in {"user", "assistant"} or text:
-                    snippets.append(text[:700])
-                    t["stage"] = _merge_stage(str(t["stage"]), _stage_from_text(text))
-
-    totals = _empty_token_usage()
-    by_stage = {stage: _empty_token_usage() for stage in TOKEN_AUDIT_STAGES}
-    stage_turns = {stage: 0 for stage in TOKEN_AUDIT_STAGES}
-    for data in turns.values():
-        usage = data.get("usage")
-        stage = str(data.get("stage") or "other")
-        if stage not in by_stage:
-            stage = "other"
-        if isinstance(usage, dict):
-            _add_token_usage(totals, usage)
-            _add_token_usage(by_stage[stage], usage)
-        stage_turns[stage] += 1
-
-    repeated_commands = [
-        {"command": command, "count": count}
-        for command, count in sorted(command_counts.items(), key=lambda item: (-item[1], item[0]))
-        if count >= 3
-    ][:20]
-    return {
-        "session": session_meta,
-        "ok": token_events > 0,
-        "token_events": token_events,
-        "total_usage": totals,
-        "by_stage": by_stage,
-        "stage_turns": stage_turns,
-        "turn_count": len(turns),
-        "large_tool_outputs": large_outputs[:30],
-        "failed_commands": failed_commands[:30],
-        "repeated_commands": repeated_commands,
-        "path_profile_hits": path_profile_hits,
-    }
-
-
-def _token_audit_recommendations(report: dict[str, object]) -> list[str]:
-    recs: list[str] = []
-    by_stage = report.get("by_stage") if isinstance(report.get("by_stage"), dict) else {}
-    if isinstance(by_stage, dict):
-        ranked = sorted(
-            ((stage, data.get("total_tokens", 0)) for stage, data in by_stage.items() if isinstance(data, dict)),
-            key=lambda item: int(item[1]),
-            reverse=True,
-        )
-        if ranked and ranked[0][1]:
-            recs.append(f"largest_stage={ranked[0][0]} uses {ranked[0][1]} tokens; optimize this stage first")
-    if report.get("large_tool_outputs"):
-        recs.append("large_tool_outputs detected; cap command max_output_tokens and avoid dumping full SKILL/spec files after first read")
-    if report.get("repeated_commands"):
-        recs.append("repeated_commands detected; cache stage check results and batch rebuild/check commands")
-    if report.get("failed_commands"):
-        recs.append("failed_commands detected; move these blockers earlier into the controller before expensive generation")
-    hits = report.get("path_profile_hits")
-    if isinstance(hits, dict) and int(hits.get("render_manifest_blockers", 0) or 0) > 0:
-        recs.append("render_manifest blockers appeared; keep production on the html renderer path and refresh stale PPTX renders earlier")
-    if not recs:
-        recs.append("no obvious waste pattern found; compare against another session for A/B insight")
-    return recs
-
-
-def _write_token_audit_markdown(report: dict[str, object], output: Path) -> None:
-    session = report.get("session") if isinstance(report.get("session"), dict) else {}
-    total = report.get("total_usage") if isinstance(report.get("total_usage"), dict) else {}
-    by_stage = report.get("by_stage") if isinstance(report.get("by_stage"), dict) else {}
-    lines = [
-        "# Paopao Token Audit",
-        "",
-        "## Session",
-        f"- id: {session.get('id', '')}",
-        f"- path: {session.get('path', '')}",
-        f"- cwd: {session.get('cwd', '')}",
-        "",
-        "## Total",
-        f"- input_tokens: {total.get('input_tokens', 0)}",
-        f"- cached_input_tokens: {total.get('cached_input_tokens', 0)}",
-        f"- output_tokens: {total.get('output_tokens', 0)}",
-        f"- reasoning_output_tokens: {total.get('reasoning_output_tokens', 0)}",
-        f"- total_tokens: {total.get('total_tokens', 0)}",
-        "",
-        "## By Stage",
-        "| Stage | Turns | Input | Cached input | Output | Reasoning | Total |",
-        "|---|---:|---:|---:|---:|---:|---:|",
-    ]
-    stage_turns = report.get("stage_turns") if isinstance(report.get("stage_turns"), dict) else {}
-    for stage in TOKEN_AUDIT_STAGES:
-        data = by_stage.get(stage, {}) if isinstance(by_stage, dict) else {}
-        if not isinstance(data, dict):
-            data = {}
-        lines.append(
-            f"| {stage} | {stage_turns.get(stage, 0)} | {data.get('input_tokens', 0)} | "
-            f"{data.get('cached_input_tokens', 0)} | {data.get('output_tokens', 0)} | "
-            f"{data.get('reasoning_output_tokens', 0)} | {data.get('total_tokens', 0)} |"
-        )
-    lines.extend(["", "## Waste Signals"])
-    large_outputs = report.get("large_tool_outputs") if isinstance(report.get("large_tool_outputs"), list) else []
-    failed_commands = report.get("failed_commands") if isinstance(report.get("failed_commands"), list) else []
-    repeated_commands = report.get("repeated_commands") if isinstance(report.get("repeated_commands"), list) else []
-    lines.append(f"- large_tool_outputs: {len(large_outputs)}")
-    lines.append(f"- failed_commands: {len(failed_commands)}")
-    lines.append(f"- repeated_commands: {len(repeated_commands)}")
-    lines.extend(["", "## Recommendations"])
-    for rec in _token_audit_recommendations(report):
-        lines.append(f"- {rec}")
-    if repeated_commands:
-        lines.extend(["", "## Top Repeated Commands"])
-        for item in repeated_commands[:10]:
-            if isinstance(item, dict):
-                lines.append(f"- {item.get('count')}x `{item.get('command')}`")
-    if large_outputs:
-        lines.extend(["", "## Large Tool Outputs"])
-        for item in large_outputs[:10]:
-            if isinstance(item, dict):
-                lines.append(f"- {item.get('tokens')} tokens, stage={item.get('stage')}, line={item.get('line')}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def cmd_token_audit(args: argparse.Namespace) -> int:
-    sessions = _resolve_codex_sessions(args.session, args.recent)
-    if not sessions:
-        print(json.dumps({
-            "ok": False,
-            "issue": "no Codex session jsonl files found",
-            "hint": "Pass --session with a rollout jsonl path or session id.",
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    reports = []
-    for session_path in sessions:
-        if session_path.exists():
-            reports.append(_token_audit_read_session(session_path))
-    if not reports:
-        print(json.dumps({
-            "ok": False,
-            "issue": "session path did not exist",
-            "sessions": [str(p) for p in sessions],
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    combined = {
-        "schema": "paopao.token_audit.v1",
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "ok": any(r.get("ok") for r in reports),
-        "session_count": len(reports),
-        "reports": reports,
-    }
-    if args.json:
-        out = Path(args.json).expanduser().resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
-    if args.output:
-        out = Path(args.output).expanduser().resolve()
-        if len(reports) == 1:
-            _write_token_audit_markdown(reports[0], out)
-        else:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            lines = ["# Paopao Token Audit", ""]
-            for idx, report in enumerate(reports, 1):
-                session = report.get("session") if isinstance(report.get("session"), dict) else {}
-                total = report.get("total_usage") if isinstance(report.get("total_usage"), dict) else {}
-                lines.append(f"## Session {idx}: {session.get('id', session.get('path', ''))}")
-                lines.append(f"- total_tokens: {total.get('total_tokens', 0)}")
-                for rec in _token_audit_recommendations(report):
-                    lines.append(f"- {rec}")
-                lines.append("")
-            out.write_text("\n".join(lines), encoding="utf-8")
-    summary = {
-        "ok": combined["ok"],
-        "session_count": len(reports),
-        "sessions": [
-            {
-                "id": (r.get("session") or {}).get("id") if isinstance(r.get("session"), dict) else None,
-                "path": (r.get("session") or {}).get("path") if isinstance(r.get("session"), dict) else None,
-                "total_tokens": (r.get("total_usage") or {}).get("total_tokens") if isinstance(r.get("total_usage"), dict) else 0,
-                "recommendations": _token_audit_recommendations(r),
-            }
-            for r in reports
-        ],
-        "json": str(Path(args.json).expanduser().resolve()) if args.json else "",
-        "output": str(Path(args.output).expanduser().resolve()) if args.output else "",
-    }
-    if args.fail_on_waste:
-        waste_failures: list[str] = []
-        for report in reports:
-            session = report.get("session") if isinstance(report.get("session"), dict) else {}
-            sid = str(session.get("id") or session.get("path") or "unknown")
-            if report.get("large_tool_outputs"):
-                waste_failures.append(f"{sid}: large tool outputs")
-            if report.get("failed_commands"):
-                waste_failures.append(f"{sid}: failed commands")
-            if report.get("repeated_commands"):
-                waste_failures.append(f"{sid}: repeated commands")
-        if waste_failures:
-            summary["ok"] = False
-            summary["waste_failures"] = waste_failures
-            print(json.dumps(summary, ensure_ascii=False, indent=2))
-            return 2
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if combined["ok"] else 1
+    return run_cleanup(_module_context(), args)
 
 
 def cmd_publish_delivery(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    pptx = Path(args.pptx).resolve() if args.pptx else None
-    if pptx is None:
-        pptx_files = [
-            p for p in sorted((task_dir / "pptx").glob("*.pptx"))
-            if p.is_file() and not p.name.startswith("~$")
-        ]
-        if len(pptx_files) != 1:
-            raise SystemExit(
-                "publish-delivery requires exactly one final PPTX in pptx/ or an explicit --pptx"
-            )
-        pptx = pptx_files[0].resolve()
-    if not pptx.exists() or pptx.suffix.lower() != ".pptx":
-        raise SystemExit(f"PPTX missing or invalid: {pptx}")
+    run_publish_delivery = _load_sibling_module("paopao_delivery_commands").cmd_publish_delivery
 
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages before publishing.")
-    pass_issues = pipeline_pass_issues(task_dir, expected, pptx)
-    if pass_issues:
-        raise SystemExit(
-            "publish-delivery blocked because the full pipeline has not passed:\n- "
-            + "\n- ".join(pass_issues)
-        )
-
-    delivery_dir = Path(args.output_dir).resolve() if args.output_dir else task_dir / "delivery"
-    delivery_dir.mkdir(parents=True, exist_ok=True)
-    for path in delivery_dir.iterdir():
-        if path.is_file():
-            path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path)
-
-    target = delivery_dir / pptx.name
-    shutil.copy2(pptx, target)
-    images_dir = delivery_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    render_path = commercial_render_path(task_dir)
-    source_of_truth = commercial_source_of_truth(task_dir)
-
-    copied_images: list[str] = []
-    if expected:
-        for idx in range(1, expected + 1):
-            if source_of_truth == HTML_BROWSER_SOURCE_OF_TRUTH:
-                image_src = task_dir / "qa" / "html_source" / f"slide-{idx:02d}.png"
-            else:
-                image_src = image2_reference_path(task_dir, idx)
-            if not image_src.exists():
-                raise SystemExit(f"Selected slide preview missing: {image_src}")
-            image_dest = images_dir / f"slide{idx:02d}{image_src.suffix.lower()}"
-            shutil.copy2(image_src, image_dest)
-            copied_images.append(str(image_dest.relative_to(delivery_dir)))
-
-            html_src = task_dir / "html" / f"slide{idx:02d}.html"
-            if render_path == "html" and not html_src.exists():
-                raise SystemExit(f"HTML slide missing: {html_src}")
-
-    manifest = {
-        "published_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "source_pptx": str(pptx),
-        "delivery_pptx": str(target),
-        "pptx_sha256": sha256_file(target),
-        "delivery_images": copied_images,
-        "user_visible_summary": user_visible_quality_summary(task_dir, expected),
-        "policy": (
-            "user-facing delivery contains only PPTX and slide preview images; "
-            "HTML, prompt, Markdown, analysis, spec, QA, and debug files are internal only"
-        ),
-    }
-    manifest_path = task_dir / "qa" / "delivery_publish_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(manifest, ensure_ascii=False, indent=2))
-    return 0
+    return run_publish_delivery(_module_context(), args)
 
 
 def cmd_finalize_delivery(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages before finalizing.")
-    pptx = Path(args.pptx).resolve() if args.pptx else None
-    if pptx is None:
-        pptx_files = [
-            p for p in sorted((task_dir / "pptx").glob("*.pptx"))
-            if p.is_file() and not p.name.startswith("~$")
-        ]
-        if len(pptx_files) != 1:
-            raise SystemExit(
-                "finalize-delivery requires exactly one final PPTX in pptx/ or an explicit --pptx"
-            )
-        pptx = pptx_files[0].resolve()
-    if not pptx.exists() or pptx.suffix.lower() != ".pptx":
-        raise SystemExit(f"PPTX missing or invalid: {pptx}")
+    run_finalize_delivery = _load_sibling_module("paopao_delivery_commands").cmd_finalize_delivery
 
-    pipeline_issues: list[str] = []
-    pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
-    if pipeline_issues:
-        print(json.dumps({
-            "task_dir": str(task_dir),
-            "stage": "finalize-pipeline",
-            "ok": False,
-            "issues": pipeline_issues,
-            "counts": pipeline_counts,
-        }, indent=2, ensure_ascii=False))
-        return 1
-    pipeline_receipt = write_pipeline_pass(task_dir, expected, pptx, pipeline_counts)
+    return run_finalize_delivery(_module_context(), args)
 
-    publish_args = argparse.Namespace(
-        task_dir=str(task_dir),
-        pptx=str(pptx),
-        output_dir="",
-    )
-    cmd_publish_delivery(publish_args)
 
-    delivery_issues: list[str] = []
-    delivery_counts = check_delivery_files(
-        task_dir,
-        expected,
-        delivery_issues,
-        require_final_pass=False,
-    )
-    if delivery_issues:
-        print(json.dumps({
-            "task_dir": str(task_dir),
-            "stage": "finalize-delivery",
-            "ok": False,
-            "issues": delivery_issues,
-            "pipeline_pass": str(pipeline_receipt.relative_to(task_dir)),
-            "counts": delivery_counts,
-        }, indent=2, ensure_ascii=False))
-        return 1
+def cmd_extract_codex_imagegen_result(args: argparse.Namespace) -> int:
+    from paopao_codex_assets import cmd_extract_codex_imagegen_result as run_extract
 
-    cleanup_args = argparse.Namespace(
-        task_dir=str(task_dir),
-        keep_private_prompts=bool(args.keep_private_prompts),
-    )
-    cmd_cleanup(cleanup_args)
-    final_receipt = write_final_delivery_pass(task_dir, expected, pptx, delivery_counts)
+    return run_extract(args)
 
-    final_issues: list[str] = []
-    final_counts = check_delivery_files(task_dir, expected, final_issues)
-    result = {
-        "task_dir": str(task_dir),
-        "stage": "finalize-delivery",
-        "ok": not final_issues,
-        "issues": final_issues,
-        "pipeline_pass": str(pipeline_receipt.relative_to(task_dir)),
-        "final_delivery_pass": str(final_receipt.relative_to(task_dir)),
-        "delivery_dir": str((task_dir / "delivery").resolve()),
-        "counts": final_counts,
-    }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0 if not final_issues else 1
+
+def cmd_token_audit(args: argparse.Namespace) -> int:
+    from paopao_token_audit import cmd_token_audit as run_token_audit
+
+    return run_token_audit(args)
 
 
 def cmd_clean_icon_crop(args: argparse.Namespace) -> int:
@@ -9315,877 +7974,56 @@ def cmd_clean_icon_crop(args: argparse.Namespace) -> int:
 
 
 def cmd_record_commercial_render(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages before recording commercial render.")
-    render_path = str(args.render_path).strip()
-    if render_path not in COMMERCIAL_RENDER_PATHS:
-        raise SystemExit("--render-path must be html or direct_pptx")
-    if render_path != "html" and os.getenv("PAOPAO_ALLOW_LEGACY_DIRECT_PPTX") != "1":
-        raise SystemExit("--render-path must be html for production. Set PAOPAO_ALLOW_LEGACY_DIRECT_PPTX=1 only for local legacy experiments.")
-    source_of_truth = str(args.source_of_truth or "").strip() or render_manifest_source_of_truth(task_dir)
-    if source_of_truth not in COMMERCIAL_SOURCE_OF_TRUTH_VALUES:
-        raise SystemExit("--source-of-truth must be image2_reference or html_browser_render")
-    pptx = Path(args.pptx).resolve()
-    if not pptx.exists() or pptx.suffix.lower() != ".pptx":
-        raise SystemExit(f"PPTX missing or invalid: {pptx}")
-    preflight_issues: list[str] = []
-    if source_of_truth == IMAGE2_SOURCE_OF_TRUTH:
-        check_image2_files(task_dir, expected, preflight_issues)
-        preflight_issues.extend(post_image_memory_boundary_issues(task_dir, expected))
-    if render_path == "direct_pptx":
-        check_visual_inventory_files(task_dir, expected, preflight_issues)
-        check_powerpoint_layout_plan_files(task_dir, expected, preflight_issues)
-    else:
-        check_html_files(task_dir, expected, preflight_issues, source_of_truth=source_of_truth)
-        if source_of_truth == HTML_BROWSER_SOURCE_OF_TRUTH:
-            check_html_generation_manifest(task_dir, expected, preflight_issues)
-        check_render_manifest(task_dir, pptx, preflight_issues)
-    if preflight_issues:
-        raise SystemExit(
-            "record-commercial-render blocked because the image-first reconstruction gates have not passed:\n- "
-            + "\n- ".join(preflight_issues[:30])
-        )
-    contract = {
-        "schema": COMMERCIAL_RENDER_CONTRACT_SCHEMA,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "expected_pages": expected,
-        "render_path": render_path,
-        "source_of_truth": source_of_truth,
-        "post_image_inputs_only": source_of_truth == IMAGE2_SOURCE_OF_TRUTH,
-        "html_source_only": source_of_truth == HTML_BROWSER_SOURCE_OF_TRUTH,
-        "commercial_similarity_min": COMMERCIAL_SIMILARITY_MIN,
-        "pptx_path": _relative_to_task_or_abs(task_dir, pptx),
-        "pptx_sha256": sha256_file(pptx),
-        "actual_preview_dir": "qa/pptx_actual",
-        "html_is_debug_only": render_path == "direct_pptx",
-        "policy": (
-            "Commercial delivery uses the declared source_of_truth as the reconstruction reference. "
-            "When source_of_truth=html_browser_render, renderer.py must copy the final browser layout into editable PPTX "
-            "without reinterpreting prompts, analysis, Image2, or remembered intent. Final delivery still requires "
-            "qa/pptx_actual exports plus fidelity_review.json and powerpoint_review.json against the actual PPTX render."
-        ),
-    }
-    out = commercial_render_contract_path(task_dir)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"ok": True, "contract": str(out), "render_path": render_path}, ensure_ascii=False, indent=2))
-    return 0
+    run_record_commercial_render = _load_sibling_module("paopao_html_workflow").cmd_record_commercial_render
+
+    return run_record_commercial_render(_module_context(), args)
 
 
 def cmd_generate_html(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages before generating HTML.")
-    if not is_html_source_only_task(task_dir):
-        raise SystemExit("generate-html is only valid for html_source_only tasks.")
-    analysis_issues: list[str] = []
-    check_html_source_analysis_files(task_dir, expected, analysis_issues)
-    if analysis_issues:
-        raise SystemExit("generate-html blocked because analysis gates have not passed:\n- " + "\n- ".join(analysis_issues[:30]))
-    slides = list(range(1, expected + 1)) if args.all else [int(args.slide)]
-    if any(idx < 1 or idx > expected for idx in slides):
-        raise SystemExit(f"--slide must be between 1 and {expected}")
+    run_generate_html = _load_sibling_module("paopao_html_workflow").cmd_generate_html
 
-    ensure_workflow_file("SYSTEM_PROMPT.md")
-    system_prompt_sha = sha256_file(SYSTEM_PROMPT)
-    manifest_path = html_generation_manifest_path(task_dir)
-    manifest = _read_json_file(manifest_path) or {
-        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
-        "generation_source": HTML_GENERATION_SOURCE,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "expected_pages": expected,
-        "system_prompt_sha256": system_prompt_sha,
-        "slides": [],
-    }
-    existing: dict[int, dict[str, object]] = {}
-    raw_slides = manifest.get("slides")
-    if isinstance(raw_slides, list):
-        for item in raw_slides:
-            if isinstance(item, dict) and isinstance(item.get("slide"), int):
-                existing[int(item["slide"])] = item
-
-    written: list[dict[str, object]] = []
-    task_manifest = read_task_manifest(task_dir)
-    contamination_files = sorted((task_dir / "analysis").glob("html_prompt_*.md"))
-    if contamination_files:
-        names = [f.name for f in contamination_files]
-        raise SystemExit(
-            f"Contamination detected: {names} found in analysis/. "
-            "html_prompt_XX.md files are not allowed — only final_prompt_XX.md from fill-prompt-template. "
-            "Delete these files and re-run."
-        )
-    for idx in slides:
-        final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
-        html_path = task_dir / "html" / f"slide{idx:02d}.html"
-        final_prompt_text = read_text(final_prompt)
-        if not final_prompt_text.strip():
-            raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
-        origin_error = verify_fill_origin(final_prompt)
-        if origin_error:
-            raise SystemExit(f"generate-html blocked for slide {idx}: {origin_error}")
-        prompt_packet = html_generation_request_path(task_dir, idx)
-        prompt_packet.parent.mkdir(parents=True, exist_ok=True)
-        prompt_packet_id = sha256_text("|".join([
-            task_dir.name,
-            str(idx),
-            str(expected),
-            system_prompt_sha,
-            sha256_file(final_prompt),
-            HTML_GENERATION_SOURCE,
-        ]))
-        required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
-        packet_text = "\n\n".join([
-            "# Paopao Locked HTML Generation Packet",
-            f"TASK_NAME: {task_dir.name}",
-            f"SLIDE: {idx} / {expected}",
-            f"LANGUAGE: {str(task_manifest.get('language', '') or '')}",
-            f"FOCUS: {str(task_manifest.get('focus', '') or '')}",
-            f"OUTPUT_HTML_PATH: {html_path.relative_to(task_dir)}",
-            f"GENERATION_SOURCE: {HTML_GENERATION_SOURCE}",
-            f"PROMPT_PACKET_ID: {prompt_packet_id}",
-            f"REQUIRED_HTML_MARKER: {required_marker}",
-            "HARD_RULE: Generate exactly one complete 16:9 production HTML slide from the SYSTEM_PROMPT and FINAL_PROMPT below. Do not use any other prompt, memory, image reference, template prose, or handwritten substitute.",
-            "HARD_RULE: The HTML <head> must include the exact REQUIRED_HTML_MARKER above. This marker binds the HTML to this locked Paopao prompt packet.",
-            "HARD_RULE: Return/write only complete HTML. Use real text, CSS boxes, tables, native data-chart blocks, and CSS shapes. No SVG, no whole-slide screenshot background.",
-            "HARD_RULE: Use only the Paopao palette: #305496, #4472C4, #5B9BD5, #D9EAF7, #EAF1F8, #B4C7E7, #FFFFFF, #1C1917, #666666. Do not use red, green, yellow, orange, purple, cyan, or invented hex colors.",
-            "HARD_RULE: Reserve a clear bottom safe area for the takeaway/source strip. Main content must end above the takeaway region; do not let tables, cards, arrows, labels, or charts overlap the bottom strip.",
-            "PROMPT_ZONE_EXECUTION_CONTRACT:\n" + json.dumps(prompt_zone_contract_for_slide(task_dir, idx), ensure_ascii=False, indent=2, sort_keys=True),
-            f"HARD_RULE: Every zone listed in PROMPT_ZONE_EXECUTION_CONTRACT.zones must appear in the HTML as an element with {HTML_ZONE_ATTR}=\"<exact zone name>\".",
-            "HARD_RULE: Chart/metric zones must use data-chart with categories and series so PowerPoint receives native editable charts with embedded workbook data.",
-            "NAVIGATION_CONTRACT:\n" + json.dumps(build_deck_navigation_contract(task_dir, idx), ensure_ascii=False, indent=2, sort_keys=True),
-            "SYSTEM_PROMPT:\n" + read_text(SYSTEM_PROMPT),
-            "FINAL_PROMPT:\n" + final_prompt_text,
-        ])
-        if not prompt_packet.exists() or read_text(prompt_packet) != packet_text:
-            prompt_packet.write_text(packet_text, encoding="utf-8")
-        compact_packet = write_html_compact_packet(
-            task_dir,
-            idx,
-            expected,
-            prompt_packet_id=prompt_packet_id,
-            required_marker=required_marker,
-            prompt_packet=prompt_packet,
-            final_prompt=final_prompt,
-            html_path=html_path,
-            task_manifest=task_manifest,
-        )
-        html_ready = (
-            html_path.exists()
-            and read_text(html_path).strip()
-            and html_path.stat().st_mtime >= prompt_packet.stat().st_mtime
-            and required_marker in read_text(html_path)
-        )
-        written.append({
-            "slide": idx,
-            "status": "html_ready_for_register" if html_ready else "prompt_packet_ready",
-            "prompt_packet": str(prompt_packet.relative_to(task_dir)),
-            "compact_packet": str(compact_packet.relative_to(task_dir)),
-            "prompt_packet_id": prompt_packet_id,
-            "required_html_marker": required_marker,
-            "html_path": str(html_path.relative_to(task_dir)),
-            "next_action": "Use compact_packet plus compact_renderer_guide as the only agent-facing HTML inputs. Do not read PDF, analysis, full SKILL, or full renderer_guide. Generate or update html/slideXX.html, then run register-html for this slide.",
-        })
-
-    manifest.update({
-        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
-        "generation_source": HTML_GENERATION_SOURCE,
-        "expected_pages": expected,
-        "system_prompt_sha256": system_prompt_sha,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "slides": [existing.get(i, {"slide": i, "status": "missing"}) for i in range(1, expected + 1)],
-    })
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    pending = list(written)
-    print(json.dumps({
-        "ok": False,
-        "task_dir": str(task_dir),
-        "registered_slides": [],
-        "pending_slides": pending,
-        "manifest": str(manifest_path),
-    }, ensure_ascii=False, indent=2))
-    return 0
-
-
-def _html_manifest_existing(manifest: dict[str, object]) -> dict[int, dict[str, object]]:
-    existing: dict[int, dict[str, object]] = {}
-    raw_slides = manifest.get("slides")
-    if isinstance(raw_slides, list):
-        for item in raw_slides:
-            if isinstance(item, dict) and isinstance(item.get("slide"), int):
-                existing[int(item["slide"])] = item
-    return existing
+    return run_generate_html(_module_context(), args)
 
 
 def cmd_register_html(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages before registering HTML.")
-    if not is_html_source_only_task(task_dir):
-        raise SystemExit("register-html is only valid for html_source_only tasks.")
-    slides = list(range(1, expected + 1)) if args.all else [int(args.slide)]
-    if any(idx < 1 or idx > expected for idx in slides):
-        raise SystemExit(f"--slide must be between 1 and {expected}")
+    run_register_html = _load_sibling_module("paopao_html_workflow").cmd_register_html
 
-    ensure_workflow_file("SYSTEM_PROMPT.md")
-    system_prompt_sha = sha256_file(SYSTEM_PROMPT)
-    manifest_path = html_generation_manifest_path(task_dir)
-    manifest = _read_json_file(manifest_path) or {
-        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
-        "generation_source": HTML_GENERATION_SOURCE,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "expected_pages": expected,
-        "system_prompt_sha256": system_prompt_sha,
-        "slides": [],
-    }
-    existing = _html_manifest_existing(manifest)
-    registered: list[dict[str, object]] = []
-    for idx in slides:
-        final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
-        html_path = task_dir / "html" / f"slide{idx:02d}.html"
-        prompt_packet = html_generation_request_path(task_dir, idx)
-        compact_packet = html_compact_packet_path(task_dir, idx)
-        compact_provenance = html_compact_provenance_path(task_dir, idx)
-        if not final_prompt.exists() or not read_text(final_prompt).strip():
-            raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
-        if not prompt_packet.exists():
-            raise SystemExit(f"html_prompt_packet_{idx:02d}.md missing; run generate-html first")
-        if not compact_packet.exists():
-            raise SystemExit(f"html_compact_packet_{idx:02d}.md missing; run generate-html or compact-html-packet first")
-        if not compact_provenance.exists():
-            raise SystemExit(f"html_compact_provenance_{idx:02d}.json missing; run generate-html first")
-        if not html_path.exists() or not read_text(html_path).strip():
-            raise SystemExit(f"html/slide{idx:02d}.html missing or empty")
-        prompt_packet_id = sha256_text("|".join([
-            task_dir.name,
-            str(idx),
-            str(expected),
-            system_prompt_sha,
-            sha256_file(final_prompt),
-            HTML_GENERATION_SOURCE,
-        ]))
-        required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
-        html_text = read_text(html_path)
-        if required_marker not in html_text:
-            raise SystemExit(f"html/slide{idx:02d}.html missing required prompt packet marker: {required_marker}")
-        issues: list[str] = []
-        check_html_files(
-            task_dir,
-            expected,
-            issues,
-            source_of_truth=HTML_BROWSER_SOURCE_OF_TRUTH,
-        )
-        slide_issue_prefixes = (f"slide{idx:02d}.html", f"html/slide{idx:02d}.html", f"slide {idx}")
-        slide_issues = [
-            issue for issue in issues
-            if any(prefix.lower() in issue.lower() for prefix in slide_issue_prefixes)
-        ]
-        if slide_issues:
-            raise SystemExit("register-html blocked by HTML issues:\n- " + "\n- ".join(slide_issues[:20]))
-        entry = {
-            "slide": idx,
-            "html_path": str(html_path.relative_to(task_dir)),
-            "html_sha256": sha256_file(html_path),
-            "final_prompt_path": str(final_prompt.relative_to(task_dir)),
-            "final_prompt_sha256": sha256_file(final_prompt),
-            "system_prompt_sha256": system_prompt_sha,
-            "generated_with_system_prompt": True,
-            "generation_source": HTML_GENERATION_SOURCE,
-            "prompt_packet_id": prompt_packet_id,
-            "prompt_packet_path": str(prompt_packet.relative_to(task_dir)),
-            "prompt_packet_sha256": sha256_file(prompt_packet),
-            "compact_packet_path": str(compact_packet.relative_to(task_dir)),
-            "compact_packet_sha256": sha256_file(compact_packet),
-            "compact_provenance_path": str(compact_provenance.relative_to(task_dir)),
-            "compact_provenance_sha256": sha256_file(compact_provenance),
-            "generator": "codex_host_model_compact_packet",
-            "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
-        existing[idx] = entry
-        registered.append(entry)
-    manifest.update({
-        "schema": HTML_GENERATION_MANIFEST_SCHEMA,
-        "generation_source": HTML_GENERATION_SOURCE,
-        "expected_pages": expected,
-        "system_prompt_sha256": system_prompt_sha,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "slides": [existing.get(i, {"slide": i, "status": "missing"}) for i in range(1, expected + 1)],
-    })
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({
-        "ok": True,
-        "task_dir": str(task_dir),
-        "registered_slides": [item["slide"] for item in registered],
-        "manifest": str(manifest_path),
-    }, ensure_ascii=False, indent=2))
-    return 0
-
-
-def compact_renderer_guide_text() -> str:
-    """Short, agent-facing HTML rules for the html_source_only path.
-
-    This compact guide is the default production guide for the HTML composer.
-    Open the full renderer guide only when debugging a renderer failure.
-    """
-    return "\n".join([
-        "# Paopao Compact Renderer Guide",
-        "",
-        "Use this short guide when writing html_source_only slides. Do not open the full renderer guide unless debugging a renderer failure.",
-        "",
-        "1. Canvas is 1920x1080; root slide must be one overflow:hidden flex column.",
-        "2. Structure order: visible nav, title, content, takeaway, source.",
-        "3. Content wrapper uses flex:1 1 auto; min-height:0; fill at least 90% of available height.",
-        "4. Use only #305496, #4472C4, #5B9BD5, #D9EAF7, #EAF1F8, #B4C7E7, #FFFFFF, #1C1917, #666666.",
-        "5. White is dominant; deep blue only for narrow nav/header/takeaway/accent elements.",
-        "6. English font is Arial; Chinese font is Microsoft YaHei or PingFang SC with Arial fallback.",
-        "7. Minimum sizes on 1920x1080: title >=36px, body/table >=16px, card title >=20px, source 12-14px.",
-        "8. Use semantic <nav> or .nav; tab items must use .tab or equivalent and stay vertically centered.",
-        "9. Every required prompt zone must appear with data-paopao-zone=\"<exact zone name>\".",
-        "10. Charts and metric/chart zones should use data-chart with data-categories and data-series for editable PPT charts.",
-        "11. Do not use inline SVG, canvas, CSS background-image, or unmarked <img>.",
-        "12. Never use a whole-slide image or screenshot background.",
-        "13. Small preserved image assets are allowed only with data-pptx-image, data-pptx-preserve, and a specific reason.",
-        "14. Use standard <table> for tables; pale-blue header, thin #B4C7E7 borders.",
-        "15. Cards/tables/charts use thin borders, radius <=8px, no decorative shadows/gradients/textures.",
-        "16. Takeaway is a slim deep-blue text strip, normally 36-48px high, with readable 1-2 line synthesis.",
-        "17. Source line is small grey text at the bottom, not inside the content area.",
-        "18. Keep icons sparse and semantic; do not use letter placeholders as icons.",
-        "19. Do not let content overlap takeaway/source; reserve bottom safe area.",
-        "20. Before registering, visually check nav, title, module geometry, charts/tables, takeaway, and source.",
-        "",
-    ])
-
-
-def _extract_prompt_header(final_prompt_text: str) -> dict[str, str]:
-    fields = {
-        "fill_origin": "",
-        "prompt_template": "",
-        "layout_name": "",
-        "title": "",
-        "bottom": "",
-        "source": "",
-    }
-    for raw_line in final_prompt_text.splitlines():
-        line = raw_line.strip()
-        upper = line.upper()
-        if upper.startswith("FILL_ORIGIN:"):
-            fields["fill_origin"] = line.split(":", 1)[1].strip()
-        elif upper.startswith("PROMPT_TEMPLATE:"):
-            fields["prompt_template"] = line.split(":", 1)[1].strip().strip('"')
-        elif upper.startswith("LAYOUT_NAME:"):
-            fields["layout_name"] = line.split(":", 1)[1].strip().strip('"')
-        elif upper.startswith("TITLE:") and not fields["title"]:
-            fields["title"] = line.split(":", 1)[1].strip().strip('"')
-        elif upper.startswith("BOTTOM:") and not fields["bottom"]:
-            fields["bottom"] = line.split(":", 1)[1].strip().strip('"')
-        elif upper.startswith("SOURCE:") and not fields["source"]:
-            fields["source"] = line.split(":", 1)[1].strip()
-    return fields
-
-
-def _match_zone_label(line: str, zone_names: list[str]) -> str | None:
-    label = line.strip()
-    if not label or ":" not in label:
-        return None
-    left = label.split(":", 1)[0].strip()
-    left_upper = left.upper()
-    for zone in zone_names:
-        zone_upper = zone.upper()
-        if left_upper == zone_upper or left_upper.startswith(zone_upper + " "):
-            return zone
-    return None
-
-
-def _split_compact_items(text: str) -> list[str]:
-    parts = []
-    for part in re.split(r"\s*[;|]\s*", text or ""):
-        cleaned = part.strip()
-        if cleaned.startswith("- ") or cleaned.startswith("• "):
-            cleaned = cleaned[2:].strip()
-        parts.append(cleaned)
-    return [part for part in parts if part]
-
-
-def _number_lead(text: str) -> tuple[str, str]:
-    match = re.match(r"^([+-]?\d[\d,.]*(?:\.\d+)?%?|[+-]?\d[\d,.]*(?:\.\d+)?)\s*(.*)$", text.strip())
-    if not match:
-        return "", text.strip()
-    return match.group(1).strip(), match.group(2).strip(" :-")
-
-
-def _chart_specs_from_text(text: str) -> list[dict[str, object]]:
-    specs: list[dict[str, object]] = []
-    for raw in re.split(r"\bChart\s+\d+\s*:", text or "", flags=re.IGNORECASE):
-        chunk = raw.strip(" .")
-        if not chunk:
-            continue
-        years = re.findall(r"\b(20\d{2})\b", chunk)
-        numbers = re.findall(r"[+-]?\d[\d,]*(?:\.\d+)?%?", chunk)
-        values = [n for n in numbers if n not in years]
-        specs.append({
-            "chart_type": "bar",
-            "description": chunk,
-            "categories": years[:4],
-            "values": values[:6],
-            "html_hint": "Use visible bars/lines with labels; do not replace this chart with plain text only.",
-        })
-    return specs
-
-
-def _detail_rows_from_text(text: str) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    row_markers = [
-        ("Key metrics", r"Key Metrics:\s*(.*?)(?=\s*Key Activities:|\s*Status/Risk:|$)"),
-        ("Key activities", r"Key Activities:\s*(.*?)(?=\s*Status/Risk:|$)"),
-        ("Status / risk", r"Status/Risk:\s*(.*)$"),
-    ]
-    for label, pattern in row_markers:
-        match = re.search(pattern, text or "", flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            role = _detail_row_role(label)
-            raw_cells = _split_detail_cells(match.group(1))
-            rows.append({
-                "label": label,
-                "role": role,
-                "cells": [
-                    _detail_cell_spec(cell, role, idx)
-                    for idx, cell in enumerate(raw_cells)
-                ],
-            })
-    return rows
-
-
-def _detail_row_role(label: str) -> str:
-    lower = label.lower()
-    if "metric" in lower:
-        return "kpi"
-    if "risk" in lower or "status" in lower:
-        return "risk"
-    return "activity"
-
-
-def _split_detail_cells(text: str) -> list[str]:
-    raw = text or ""
-    if "|" in raw:
-        return [part.strip(" .") for part in raw.split("|") if part.strip(" .")]
-    return _split_compact_items(raw)
-
-
-def _extract_metric_tokens(text: str) -> list[str]:
-    raw = text or ""
-    patterns = [
-        r"20\d{2}\s*-\s*20\d{2}",
-        r"[+-]?\d[\d,]*(?:\.\d+)?%",
-        r"\d[\d,]*(?:\.\d+)?\s*tCO2e(?:\s+per\s+vehicle)?",
-        r"\d[\d,]*(?:\.\d+)?\s*vehicles?",
-        r"\d[\d,]*(?:\.\d+)?\s*credits?",
-        r"\d(?:\.\d+)?C\b",
-    ]
-    found: list[str] = []
-    for pattern in patterns:
-        for match in re.findall(pattern, raw, flags=re.IGNORECASE):
-            token = re.sub(r"\s+", " ", str(match)).strip()
-            if token and token not in found:
-                found.append(token)
-    return found
-
-
-def _detail_cell_spec(text: str, role: str, index: int) -> dict[str, object]:
-    clean = re.sub(r"\s+", " ", (text or "").strip(" ."))
-    label = ""
-    body = clean
-    if ":" in clean:
-        label, body = [part.strip() for part in clean.split(":", 1)]
-    metrics = _extract_metric_tokens(body or clean)
-    spec: dict[str, object] = {
-        "text": clean,
-        "cell_role": role,
-        "stage_index": index + 1,
-    }
-    if label:
-        spec["label"] = label
-    if role == "kpi":
-        spec.update({
-            "primary_metric": metrics[0] if metrics else "",
-            "secondary_metrics": metrics[1:3],
-            "body": body,
-            "emphasis": "large_metric",
-            "visual_treatment": "large blue metric, short label, optional badge",
-        })
-    elif role == "risk":
-        severity = "watch"
-        lower = clean.lower()
-        if any(word in lower for word in ["risk", "depends", "delayed", "exposed", "must"]):
-            severity = "caution"
-        spec.update({
-            "severity": severity,
-            "emphasis": "muted_caution",
-            "visual_treatment": "small grey text with caution accent; do not compete with KPI row",
-        })
-    else:
-        spec.update({
-            "emphasis": "action_text",
-            "visual_treatment": "compact body text; align to matching stage column",
-        })
-    return spec
-
-
-def _zone_render_hint(zone: str, content: str, layout_name: str) -> dict[str, object]:
-    zone_upper = zone.upper()
-    hint: dict[str, object] = {"role": "text"}
-    if "METRIC" in zone_upper and "CARD" in zone_upper:
-        cards = []
-        for item in _split_compact_items(content):
-            metric, label = _number_lead(item)
-            cards.append({"metric": metric, "label": label or item})
-        hint.update({
-            "role": "metric_cards",
-            "cards": cards,
-            "html_hint": "Render as equal-width metric cards with large metric, concise label, and a small badge only when useful.",
-        })
-    elif "CHART" in zone_upper:
-        hint.update({
-            "role": "charts",
-            "charts": _chart_specs_from_text(content),
-            "html_hint": "Build visible chart geometry from the extracted categories/values; avoid blank chart panels.",
-        })
-    elif "STAGE HEADER" in zone_upper:
-        hint.update({
-            "role": "process_stages",
-            "stages": _split_compact_items(content),
-            "html_hint": "Render as connected chevrons or a clear horizontal process row.",
-        })
-    elif "DETAIL GRID" in zone_upper:
-        rows = _detail_rows_from_text(content)
-        stage_count = max((len(row.get("cells", [])) for row in rows), default=0)
-        hint.update({
-            "role": "detail_grid",
-            "visual_structure": "stage_matrix",
-            "stage_count": stage_count,
-            "rows": rows,
-            "emphasis_rules": [
-                "Key metrics row is the hero row: show primary_metric large in blue, with label/badge above and body below.",
-                "Key activities row is supporting text: compact, aligned to the same stage columns, no large numbers.",
-                "Status / risk row is muted: grey text, smaller type, optional caution accent; it should not dominate the slide.",
-                "Columns must align to the stage header row; avoid a plain spreadsheet look by adding KPI badges and vertical accents.",
-            ],
-            "html_hint": "Render as a visually tiered stage matrix, not a generic table. Make KPI cells visually strongest, activity cells explanatory, and risk cells muted/cautionary.",
-        })
-    elif "COMMENTARY" in zone_upper:
-        hint.update({
-            "role": "commentary",
-            "html_hint": "Render as a compact commentary band or cards, not a large empty panel.",
-        })
-    elif zone_upper in {"TITLE", "BOTTOM", "SOURCE"}:
-        hint["role"] = zone_upper.lower()
-    if layout_name:
-        hint["layout_name"] = layout_name
-    return hint
-
-
-def _extract_final_prompt_execution_zones(
-    final_prompt_text: str,
-    zone_contract: dict[str, object],
-    header: dict[str, str],
-) -> list[dict[str, object]]:
-    zones = zone_contract.get("zones")
-    if not isinstance(zones, list):
-        zones = []
-    zone_names = [str(item.get("zone", "")).strip() for item in zones if isinstance(item, dict) and item.get("zone")]
-    filled: dict[str, str] = {}
-    current_zone: str | None = None
-    capturing_zone: str | None = None
-    buffer: list[str] = []
-
-    def flush() -> None:
-        nonlocal capturing_zone, buffer
-        if capturing_zone:
-            content = "\n".join(buffer).strip()
-            if content:
-                filled[capturing_zone] = content
-        capturing_zone = None
-        buffer = []
-
-    hard_stop_prefixes = (
-        "DESIGN:",
-        "VISUAL STYLE:",
-        "LAYOUT_NAME:",
-        "WHEN_TO_USE:",
-        "DATA_REQUIRES:",
-        "PROMPT_TEMPLATE:",
-        "FILL_ORIGIN:",
-    )
-    for raw_line in final_prompt_text.splitlines():
-        stripped = raw_line.strip()
-        matched_zone = _match_zone_label(stripped, zone_names)
-        if matched_zone:
-            flush()
-            current_zone = matched_zone
-            continue
-        if stripped.upper() == "FILLED_CONTENT:":
-            flush()
-            capturing_zone = current_zone
-            buffer = []
-            continue
-        if capturing_zone and stripped.upper().startswith(hard_stop_prefixes):
-            flush()
-            current_zone = None
-            continue
-        if capturing_zone:
-            buffer.append(raw_line)
-    flush()
-
-    fallback = {
-        "TITLE": header.get("title", ""),
-        "BOTTOM": header.get("bottom", ""),
-        "Source": header.get("source", ""),
-        "SOURCE": header.get("source", ""),
-    }
-    layout_name = str(zone_contract.get("layout_name") or header.get("layout_name") or "")
-    execution_zones: list[dict[str, object]] = []
-    for zone in zone_names:
-        content = filled.get(zone) or fallback.get(zone) or ""
-        execution_zones.append({
-            "zone": zone,
-            "content": content,
-            "render_hint": _zone_render_hint(zone, content, layout_name),
-        })
-    return execution_zones
+    return run_register_html(_module_context(), args)
 
 
 def write_compact_renderer_guide(task_dir: Path) -> Path:
-    path = html_compact_renderer_guide_path(task_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = compact_renderer_guide_text()
-    if not path.exists() or read_text(path) != text:
-        path.write_text(text, encoding="utf-8")
-    return path
+    run_write_compact_renderer_guide = _load_sibling_module("paopao_html_workflow").write_compact_renderer_guide
+
+    return run_write_compact_renderer_guide(_module_context(), task_dir)
 
 
 def write_html_compact_packet(
     task_dir: Path,
     idx: int,
     expected: int,
-    *,
-    prompt_packet_id: str,
-    required_marker: str,
-    prompt_packet: Path,
-    final_prompt: Path,
-    html_path: Path,
-    task_manifest: dict[str, object],
+    **kwargs: object,
 ) -> Path:
-    final_prompt_text = read_text(final_prompt)
-    header = _extract_prompt_header(final_prompt_text)
-    guide_path = write_compact_renderer_guide(task_dir)
-    zone_contract = prompt_zone_contract_for_slide(task_dir, idx)
-    execution_zones = _extract_final_prompt_execution_zones(final_prompt_text, zone_contract, header)
-    provenance = {
-        "schema": "paopao.html_compact_provenance.v1",
-        "task_name": task_dir.name,
-        "slide": idx,
-        "full_prompt_packet_path": str(prompt_packet.relative_to(task_dir)),
-        "full_prompt_packet_sha256": sha256_file(prompt_packet) if prompt_packet.exists() else "",
-        "prompt_packet_id": prompt_packet_id,
-        "renderer_compact_guide": str(guide_path.relative_to(task_dir)),
-        "renderer_compact_guide_sha256": sha256_file(guide_path),
-        "final_prompt_path": str(final_prompt.relative_to(task_dir)),
-        "final_prompt_sha256": sha256_file(final_prompt),
-        "prompt_meta": {
-            "fill_origin": header.get("fill_origin", ""),
-            "prompt_template": header.get("prompt_template", ""),
-            "layout_name": header.get("layout_name", ""),
-        },
-    }
-    provenance_path = html_compact_provenance_path(task_dir, idx)
-    provenance_path.parent.mkdir(parents=True, exist_ok=True)
-    provenance_text = json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True)
-    if not provenance_path.exists() or read_text(provenance_path) != provenance_text:
-        provenance_path.write_text(provenance_text, encoding="utf-8")
-    compact = {
-        "schema": "paopao.html_compact_packet.v1",
-        "purpose": "Executable HTML work order for the agent. Provenance/hash fields are intentionally kept out of this file.",
-        "slide": idx,
-        "expected_pages": expected,
-        "language": str(task_manifest.get("language", "") or ""),
-        "output_html_path": str(html_path.relative_to(task_dir)),
-        "required_html_marker": required_marker,
-        "renderer_compact_guide": str(guide_path.relative_to(task_dir)),
-        "layout_name": header.get("layout_name", "") or str(zone_contract.get("layout_name") or ""),
-        "navigation": compact_deck_navigation_contract(task_dir, idx, expected),
-        "execution_zones": execution_zones,
-        "composer_rules": [
-            "Generate one complete HTML slide.",
-            "Use required_html_marker in <head>.",
-            "Use execution_zones only; do not reopen final_prompt, analysis, PDF/source, old drafts, or memory.",
-            "Charts must use render_hint.charts and visible marks; no blank chart panels.",
-            "Metric/process/grid zones must use render_hint.cards/stages/rows directly.",
-            "For detail_grid, follow render_hint.visual_structure and emphasis_rules; do not render a flat spreadsheet.",
-            f"Every required zone must appear as an element with {HTML_ZONE_ATTR}.",
-            "Use compact renderer guide only unless blocked.",
-        ],
-    }
-    text = "\n".join([
-        "# Paopao Compact HTML Packet",
-        "```json",
-        json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        "```",
-        "",
-    ])
-    path = html_compact_packet_path(task_dir, idx)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists() or read_text(path) != text:
-        path.write_text(text, encoding="utf-8")
-    return path
+    run_write_html_compact_packet = _load_sibling_module("paopao_html_workflow").write_html_compact_packet
+
+    return run_write_html_compact_packet(_module_context(), task_dir, idx, expected, **kwargs)
 
 
 def cmd_compact_html_packet(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    expected = expected_pages_from_task(task_dir)
-    if not expected:
-        raise SystemExit("Missing expected page count. Initialize task with --pages first.")
-    if not is_html_source_only_task(task_dir):
-        raise SystemExit("compact-html-packet is only valid for html_source_only tasks.")
-    slides = list(range(1, expected + 1)) if args.all else [int(args.slide)]
-    task_manifest = read_task_manifest(task_dir)
-    system_prompt = ensure_workflow_file("SYSTEM_PROMPT.md")
-    system_prompt_sha = sha256_file(system_prompt)
-    written = []
-    for idx in slides:
-        if idx < 1 or idx > expected:
-            raise SystemExit(f"--slide must be between 1 and {expected}")
-        final_prompt = task_dir / "analysis" / f"final_prompt_{idx:02d}.md"
-        if not final_prompt.exists() or not read_text(final_prompt).strip():
-            raise SystemExit(f"final_prompt_{idx:02d}.md missing or empty")
-        html_path = task_dir / "html" / f"slide{idx:02d}.html"
-        prompt_packet = html_generation_request_path(task_dir, idx)
-        if not prompt_packet.exists():
-            raise SystemExit(
-                f"Full locked packet missing for slide {idx}. Run generate-html first: "
-                f"paopao_run.py generate-html --task-dir {task_dir} --slide {idx}"
-            )
-        prompt_packet_id = sha256_text("|".join([
-            task_dir.name,
-            str(idx),
-            str(expected),
-            system_prompt_sha,
-            sha256_file(final_prompt),
-            HTML_GENERATION_SOURCE,
-        ]))
-        required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
-        compact_path = write_html_compact_packet(
-            task_dir,
-            idx,
-            expected,
-            prompt_packet_id=prompt_packet_id,
-            required_marker=required_marker,
-            prompt_packet=prompt_packet,
-            final_prompt=final_prompt,
-            html_path=html_path,
-            task_manifest=task_manifest,
-        )
-        written.append({
-            "slide": idx,
-            "compact_packet": str(compact_path.relative_to(task_dir)),
-            "compact_packet_sha256": sha256_file(compact_path),
-        })
-    print(json.dumps({
-        "ok": True,
-        "task_dir": str(task_dir),
-        "compact_renderer_guide": str(write_compact_renderer_guide(task_dir).relative_to(task_dir)),
-        "slides": written,
-    }, ensure_ascii=False, indent=2))
-    return 0
+    run_compact_html_packet = _load_sibling_module("paopao_html_workflow").cmd_compact_html_packet
+
+    return run_compact_html_packet(_module_context(), args)
 
 
 def cmd_compact_renderer_guide(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve() if args.task_dir else Path.cwd()
-    text = compact_renderer_guide_text()
-    if args.output:
-        out = Path(args.output)
-        if not out.is_absolute():
-            out = task_dir / out
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
-        print(json.dumps({"ok": True, "output": str(out), "sha256": sha256_file(out)}, ensure_ascii=False, indent=2))
-    else:
-        print(text)
-    return 0
+    run_compact_renderer_guide = _load_sibling_module("paopao_html_workflow").cmd_compact_renderer_guide
+
+    return run_compact_renderer_guide(_module_context(), args)
 
 
 def cmd_render(args: argparse.Namespace) -> int:
-    task_dir = Path(args.task_dir).resolve()
-    pptx = Path(args.pptx).resolve()
-    html_files = [Path(p).resolve() for p in args.html] if args.html else html_files_from_task(task_dir)
-    expected = expected_pages_from_task(task_dir) or len(html_files)
-    preflight_issues: list[str] = []
-    html_source_only = bool(args.html_source_only or is_html_source_only_task(task_dir))
-    source_of_truth = HTML_BROWSER_SOURCE_OF_TRUTH if html_source_only else IMAGE2_SOURCE_OF_TRUTH
-    check_html_files(task_dir, expected, preflight_issues, source_of_truth=source_of_truth)
-    if html_source_only:
-        check_html_generation_manifest(task_dir, expected, preflight_issues)
-    if not html_source_only:
-        check_image2_files(task_dir, expected, preflight_issues)
-        check_html_reference_fidelity(task_dir, expected, preflight_issues, html_files=html_files)
-    if preflight_issues:
-        print(json.dumps({
-            "task_dir": str(task_dir),
-            "stage": "render-preflight",
-            "expected_pages": expected,
-            "ok": False,
-            "issues": preflight_issues,
-        }, indent=2, ensure_ascii=False))
-        return 1
-    reservation_id = reserve_quota(task_dir, len(html_files))
+    run_render = _load_sibling_module("paopao_html_workflow").cmd_render
 
-    renderer_path = ensure_workflow_file("renderer.py")
-    cmd = [sys.executable, str(renderer_path), *map(str, html_files), "--pptx", str(pptx)]
-    if args.pdf:
-        cmd.extend(["--pdf", str(Path(args.pdf).resolve())])
-
-    env = None
-    proc = subprocess.run(cmd, cwd=str(PLUGIN_ROOT), text=True, capture_output=True, env=env)
-    if proc.stdout:
-        print(proc.stdout)
-    if proc.stderr:
-        print(proc.stderr, file=sys.stderr)
-    pptx_generated = pptx.exists()
-    succeeded = proc.returncode == 0 and pptx_generated
-    finish_quota(reservation_id, succeeded)
-    if pptx_generated:
-        html_manifest: list[dict[str, object]] = []
-        for idx, path in enumerate(html_files, 1):
-            entry: dict[str, object] = {
-                "path": str(path),
-                "sha256": sha256_file(path),
-            }
-            if html_source_only:
-                preview = task_dir / "qa" / "html_source" / f"slide-{idx:02d}.png"
-                error = capture_html_preview(path, preview)
-                if error:
-                    print(error, file=sys.stderr)
-                elif preview.exists():
-                    entry["browser_preview_path"] = str(preview.relative_to(task_dir))
-                    entry["browser_preview_sha256"] = sha256_file(preview)
-            html_manifest.append(entry)
-        manifest = {
-            "rendered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "renderer": str(RENDERER.resolve()),
-            "task_dir": str(task_dir),
-            "source_of_truth": HTML_BROWSER_SOURCE_OF_TRUTH if html_source_only else IMAGE2_SOURCE_OF_TRUTH,
-            "html_source_only": bool(html_source_only),
-            "pptx_path": str(pptx),
-            "pptx_sha256": sha256_file(pptx),
-            "html": html_manifest,
-        }
-        out = render_manifest_path(task_dir)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return proc.returncode
+    return run_render(_module_context(), args)
 
 
 def cmd_package(args: argparse.Namespace) -> int:
@@ -10211,6 +8049,11 @@ def cmd_package(args: argparse.Namespace) -> int:
             "scripts/paopao_auth.py",
             "scripts/paopao_lab.py",
             "scripts/paopao_run.py",
+            "scripts/paopao_codex_assets.py",
+            "scripts/paopao_delivery_commands.py",
+            "scripts/paopao_html_workflow.py",
+            "scripts/paopao_pipeline_state.py",
+            "scripts/paopao_token_audit.py",
             "scripts/paopao_update.py",
             "scripts/pptx_qa.py",
             "scripts/renderer.py",

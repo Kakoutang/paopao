@@ -2,7 +2,7 @@
 pptx_qa.py — Post-render PPTX inspection.
 
 Catches mechanical bugs that escape composer + render:
-  - Shape with opaque fill covering chart/table
+  - Shape with opaque fill covering chart/table (z-order bug, Jenny 2026-05-04 slide 4 donut)
   - Shape extending past canvas (1920×1080 / 13.33"×7.5")
   - Shape extending into the detected bottom takeaway band
   - Chart with 0 dimension or invalid data
@@ -280,29 +280,32 @@ def qa_and_fix(pptx_path: str | Path, *, verbose: bool = False, fix: bool = Fals
                 ))
                 if changed: summary.fixes_applied += 1
 
-        # 4. Find shapes overflowing the takeaway region. The top is detected
-        # from the actual deep-blue bottom band instead of a fixed y value.
+        # 4. Find shapes overflowing the Paopao takeaway region, but only when
+        # that actual deep-blue bottom band exists. A generic finished HTML
+        # slide may use a different footer structure, so the old fallback band
+        # became a template assumption inside the renderer.
         takeaway_top, takeaway_detected = _detect_takeaway_top(slide)
-        for j, sh in enumerate(slide.shapes):
-            bb = _shape_bbox(sh)
-            if not bb: continue
-            x, y, w, h = bb
-            if y < takeaway_top and y + h > takeaway_top:
-                # Don't fix if shape is the title band, nav, or covers full canvas (pinning element)
-                if w >= CANVAS_W_EMU * 0.95 and h >= CANVAS_H_EMU * 0.7:
-                    continue  # whole-slide background, leave alone
-                changed, reason = _clip_bbox_above_takeaway(sh, takeaway_top) if fix else (False, "refill_html_required")
-                summary.issues.append(QAIssue(
-                    slide_idx=slide_idx,
-                    kind="overflow_takeaway",
-                    detail=(
-                        f"shape[{j}] bbox=({x},{y},{w},{h}) extends into "
-                        f"{'detected' if takeaway_detected else 'fallback'} takeaway band top={takeaway_top}"
-                    ),
-                    fixed=changed,
-                    fix_action=f"clip: {reason}" if changed else reason,
-                ))
-                if changed: summary.fixes_applied += 1
+        if takeaway_detected:
+            for j, sh in enumerate(slide.shapes):
+                bb = _shape_bbox(sh)
+                if not bb: continue
+                x, y, w, h = bb
+                if y < takeaway_top and y + h > takeaway_top:
+                    # Don't fix if shape is the title band, nav, or covers full canvas (pinning element)
+                    if w >= CANVAS_W_EMU * 0.95 and h >= CANVAS_H_EMU * 0.7:
+                        continue  # whole-slide background, leave alone
+                    changed, reason = _clip_bbox_above_takeaway(sh, takeaway_top) if fix else (False, "refill_html_required")
+                    summary.issues.append(QAIssue(
+                        slide_idx=slide_idx,
+                        kind="overflow_takeaway",
+                        detail=(
+                            f"shape[{j}] bbox=({x},{y},{w},{h}) extends into "
+                            f"detected takeaway band top={takeaway_top}"
+                        ),
+                        fixed=changed,
+                        fix_action=f"clip: {reason}" if changed else reason,
+                    ))
+                    if changed: summary.fixes_applied += 1
 
         # 5. Find charts with 0 dimension
         for j, sh in enumerate(slide.shapes):

@@ -27,8 +27,14 @@ MANAGED_FILES = [
     "scripts/paopao_auth.py",
     "scripts/paopao_lab.py",
     "scripts/paopao_run.py",
+    "scripts/paopao_codex_assets.py",
+    "scripts/paopao_delivery_commands.py",
+    "scripts/paopao_html_workflow.py",
+    "scripts/paopao_pipeline_state.py",
+    "scripts/paopao_token_audit.py",
     "scripts/paopao_update.py",
     "scripts/pptx_qa.py",
+    "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
 ]
 
