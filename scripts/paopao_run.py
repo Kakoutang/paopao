@@ -1080,10 +1080,37 @@ def _extract_pdf_pages(path: Path) -> list[tuple[int | None, str]]:
     return pages
 
 
+def _extract_docx_pages(path: Path) -> list[tuple[int | None, str]]:
+    try:
+        import xml.etree.ElementTree as ET
+    except Exception:
+        return []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            raw = zf.read("word/document.xml")
+    except Exception:
+        return []
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs: list[str] = []
+    for para in root.iter(f"{ns}p"):
+        parts = [node.text or "" for node in para.iter(f"{ns}t")]
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    joined = "\n".join(paragraphs)
+    return [(None, joined)] if joined.strip() else []
+
+
 def _extract_plain_document_pages(path: Path) -> list[tuple[int | None, str]]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         return _extract_pdf_pages(path)
+    if suffix == ".docx":
+        return _extract_docx_pages(path)
     if suffix in {".txt", ".md", ".csv", ".tsv", ".json"}:
         text = read_text(path)
         return [(None, text)] if text.strip() else []
@@ -1099,6 +1126,12 @@ def _split_fact_candidates(text: str) -> list[str]:
     for part in parts:
         item = part.strip(" \t\r\n-•")
         if 35 <= len(item) <= 320 and re.search(r"\d|%|\$|€|£|¥|million|billion|bn|mn|tons?|teu|co2|emissions?", item, re.I):
+            candidates.append(item)
+    if candidates:
+        return candidates
+    for part in parts:
+        item = part.strip(" \t\r\n-•")
+        if 50 <= len(item) <= 320:
             candidates.append(item)
     return candidates
 
