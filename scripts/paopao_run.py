@@ -138,6 +138,9 @@ python3 <plugin-root>/scripts/paopao_run.py fetch-workflow --all
 
 Then follow the refreshed Paopao instructions exactly. If the command fails,
 tell the user to update the paopao plugin and try again.
+
+Before starting a deck, confirm slide count, output language, and focus or
+highlight points. Do not infer them from the chat language or source filename.
 """
 TASK_LOCAL_GITIGNORE = """# Paopao build workspace: internal by default.
 # The user-facing artifacts are published under delivery/ after final QA.

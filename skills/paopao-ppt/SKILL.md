@@ -39,6 +39,16 @@ If the output is non-empty, show it to the user and wait.
 
 Use the `next` command to drive the workflow. Do NOT self-manage the pipeline or skip steps.
 
+### 0. Intake
+
+Before `make-deck`, confirm these three user-facing choices. If any one is missing, ask a short question and wait:
+
+1. Slide count / page count.
+2. Output language.
+3. Focus or highlight points.
+
+Do not infer these from the chat language or source filename. Do not start `make-deck` until all three are known.
+
 ### 1. Initialize
 
 ```bash
