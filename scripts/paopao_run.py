@@ -748,8 +748,13 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
     for name in names:
         if name not in destinations:
             raise SystemExit(f"Unknown workflow file: {name}")
-        fetch_workflow_file(name, destinations[name])
-        written.append(str(destinations[name].relative_to(PLUGIN_ROOT)))
+        destination = destinations[name]
+        fetch_workflow_file(name, destination)
+        try:
+            label = str(destination.relative_to(PLUGIN_ROOT))
+        except ValueError:
+            label = str(destination)
+        written.append(label)
     print(json.dumps({"ok": True, "written": written}, ensure_ascii=False, indent=2))
     return 0
 
