@@ -669,6 +669,15 @@ def _fetch_server_notices() -> dict[str, str]:
     result: dict[str, str] = {}
     try:
         data = paopao_auth.request_json("GET", f"{paopao_auth.server_url()}/health")
+        min_version = str(data.get("min_plugin_version", "")).strip()
+        local_version = str(getattr(paopao_auth, "PLUGIN_VERSION", "")).strip()
+        if min_version and local_version:
+            def version_tuple(version: str) -> tuple[int, int, int]:
+                parts = [int(p) for p in re.findall(r"\d+", version)[:3]]
+                return tuple((parts + [0, 0, 0])[:3])
+
+            if version_tuple(local_version) >= version_tuple(min_version):
+                return result
         notice = data.get("update_notice")
         if isinstance(notice, dict):
             msg = str(notice.get("message", "")).strip()

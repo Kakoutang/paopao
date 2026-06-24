@@ -11,7 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'final_delivery_pass_path', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path']
+_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'final_delivery_pass_path', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path', 'write_html_prompt_attestation']
 
 
 def _bind(ctx: object) -> None:
@@ -262,6 +262,7 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
         include_html=bool(getattr(args, "include_html", False)),
     )
     _cmd_publish_delivery_impl(ctx, publish_args)
+    attestation = write_html_prompt_attestation(task_dir, expected)
 
     delivery_issues: list[str] = []
     delivery_counts = check_delivery_files(
@@ -297,6 +298,7 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
         "issues": final_issues,
         "pipeline_pass": str(pipeline_receipt.relative_to(task_dir)),
         "final_delivery_pass": str(final_receipt.relative_to(task_dir)),
+        "html_prompt_attestation": str(attestation.relative_to(task_dir)) if attestation else None,
         "delivery_dir": str((task_dir / "delivery").resolve()),
         "counts": final_counts,
     }

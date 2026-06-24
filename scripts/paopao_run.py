@@ -111,6 +111,7 @@ SENSITIVE_CONTENT_MARKERS = {
 }
 PROMPT_SAFE_STATE_FILES = {
     Path("image2") / "image2_generation_manifest.json",
+    Path("qa") / "html_prompt_attestation.json",
     Path("qa") / "post_image_memory_boundary.json",
     Path("qa") / "public_runtime_state.json",
 }
@@ -461,6 +462,7 @@ COMMERCIAL_SOURCE_OF_TRUTH_VALUES = {IMAGE2_SOURCE_OF_TRUTH, HTML_BROWSER_SOURCE
 HTML_GENERATION_MANIFEST_SCHEMA = "paopao.html_generation_manifest.v1"
 HTML_GENERATION_SOURCE = "system_prompt_plus_final_prompt"
 HTML_PROMPT_PACKET_META = "paopao-prompt-packet-id"
+HTML_PROMPT_ATTESTATION_SCHEMA = "paopao.html_prompt_attestation.v1"
 PIPELINE_MODE_IMAGE_FIRST = "gated_direct"
 PIPELINE_MODE_HTML_SOURCE_ONLY = "html_source_only"
 PIPELINE_MODE_VALUES = {PIPELINE_MODE_IMAGE_FIRST, PIPELINE_MODE_HTML_SOURCE_ONLY}
@@ -543,7 +545,7 @@ PROMPT_ROLE_FAMILY_PREFERENCES = [
     ),
     (
         re.compile(r"增长|驱动|需求|driver|growth|demand|acceleration", re.IGNORECASE),
-        {"center-radial": 36, "process-flow": 26, "four-quadrant": 20, "row-stack": 14, "waterfall": -18},
+        {"process-flow": 34, "four-quadrant": 20, "row-stack": 14, "dashboard": 12, "center-radial": 4, "waterfall": -18},
     ),
     (
         re.compile(r"细分|赛道|品类|对比|segment|category|compare|matrix", re.IGNORECASE),
@@ -551,7 +553,7 @@ PROMPT_ROLE_FAMILY_PREFERENCES = [
     ),
     (
         re.compile(r"机会落点|产业链|供应链|链路|主体|value chain|supply chain|winners?|map", re.IGNORECASE),
-        {"process-flow": 34, "swimlane": 28, "center-radial": 20, "dashboard": 12},
+        {"process-flow": 34, "swimlane": 28, "dashboard": 12, "center-radial": 6},
     ),
     (
         re.compile(r"风险|约束|risk|priority|prioriti[sz]ation|评估|score", re.IGNORECASE),
@@ -559,7 +561,7 @@ PROMPT_ROLE_FAMILY_PREFERENCES = [
     ),
     (
         re.compile(r"机制|因果|虚构|协作|认知|门槛|system|mechanism|causal", re.IGNORECASE),
-        {"two-column": 34, "center-radial": 30, "process-flow": 26, "swimlane": 18},
+        {"two-column": 34, "process-flow": 30, "swimlane": 18, "center-radial": 8},
     ),
     (
         re.compile(r"革命|阶段|跃迁|时间|演化|revolution|phase|timeline", re.IGNORECASE),
@@ -576,13 +578,21 @@ PROMPT_ROLE_FAMILY_PREFERENCES = [
 ]
 PROMPT_TEMPLATE_KEYWORD_BONUSES = [
     (re.compile(r"tam|sam|som|市场|空间|规模|market", re.IGNORECASE), "12D_market_tam_sam_som.md", 30),
-    (re.compile(r"驱动|driver|增长|growth|需求", re.IGNORECASE), "13D_hub_spoke_ecosystem.md", 24),
-    (re.compile(r"驱动|driver|增长|growth|需求", re.IGNORECASE), "02D_flow_diagram_with_detail_panels.md", 18),
+    (re.compile(r"驱动|driver|增长|growth|需求", re.IGNORECASE), "02D_flow_diagram_with_detail_panels.md", 28),
     (re.compile(r"细分|赛道|品类|segment|category", re.IGNORECASE), "08F_trend_matrix_grid.md", 28),
     (re.compile(r"细分|赛道|品类|segment|category", re.IGNORECASE), "16A_segment_attribute_matrix.md", 22),
     (re.compile(r"产业链|供应链|链路|value chain|supply chain", re.IGNORECASE), "09C_value_chain_decomposition.md", 28),
     (re.compile(r"机会落点|主体|winners?|stakeholder", re.IGNORECASE), "13E_stakeholder_map.md", 18),
 ]
+PROMPT_RENDER_RISK_PENALTY_BY_TEMPLATE = {
+    "13D_hub_spoke_ecosystem.md": 120,
+    "13E_stakeholder_map.md": 80,
+    "13F_nested_concentric_layers.md": 80,
+}
+PROMPT_EXPLICIT_RADIAL_NEED_RE = re.compile(
+    r"生态|伙伴|利益相关|干系人|关系网络|网络效应|ecosystem|stakeholder|partner|relationship network|network effect",
+    re.IGNORECASE,
+)
 
 PROMPT_SELECTION_PLAN_SCHEMA = "paopao.prompt_selection_plan.v1"
 PROMPT_SELECTION_PLAN_PATH = Path("analysis") / "prompt_selection_plan.json"
@@ -742,6 +752,11 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
         written.append(str(destinations[name].relative_to(PLUGIN_ROOT)))
     print(json.dumps({"ok": True, "written": written}, ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_update(_: argparse.Namespace) -> int:
+    updater = _load_sibling_module("paopao_update")
+    return updater.main()
 
 
 def reserve_quota(task_dir: Path, pages: int) -> str:
@@ -1620,6 +1635,24 @@ def prompt_role_base_score(entry: dict[str, object], story_text: str, slide_idx:
     return score
 
 
+def prompt_render_risk_penalty(entry: dict[str, object], story_text: str) -> tuple[int, str]:
+    """Penalize layouts that are visually fragile in browser-to-PPTX translation.
+
+    This is not an aesthetic gate. It only avoids defaulting to structures that
+    routinely create overcrowded HTML and hard-to-edit PPTX unless the story
+    explicitly asks for an ecosystem/stakeholder relationship map.
+    """
+    template = str(entry.get("template", ""))
+    family = str(entry.get("family", ""))
+    penalty = PROMPT_RENDER_RISK_PENALTY_BY_TEMPLATE.get(template, 0)
+    if family == "center-radial":
+        penalty = max(penalty, 90)
+    if penalty and PROMPT_EXPLICIT_RADIAL_NEED_RE.search(story_text):
+        penalty = min(penalty, 25)
+    reason = f"layout_render_risk=-{penalty}" if penalty else ""
+    return penalty, reason
+
+
 def max_template_uses(pages: int, available: int) -> int:
     if available <= 0:
         return pages
@@ -1645,6 +1678,10 @@ def prompt_candidate_score(
     reasons: list[str] = []
     if score:
         reasons.append(f"role_fit={score}")
+    risk_penalty, risk_reason = prompt_render_risk_penalty(entry, story_text)
+    if risk_penalty:
+        score -= risk_penalty
+        reasons.append(risk_reason)
     current_count = used_templates.get(template, 0)
     if current_count >= max_uses:
         score -= 1000
@@ -2192,6 +2229,10 @@ def image2_manifest_path(task_dir: Path) -> Path:
 
 def html_generation_manifest_path(task_dir: Path) -> Path:
     return task_dir / "qa" / "html_generation_manifest.json"
+
+
+def html_prompt_attestation_path(task_dir: Path) -> Path:
+    return task_dir / "qa" / "html_prompt_attestation.json"
 
 
 def html_generation_request_path(task_dir: Path, idx: int) -> Path:
@@ -6355,6 +6396,60 @@ def check_html_generation_manifest(task_dir: Path, expected: int, issues: list[s
     return data
 
 
+def write_html_prompt_attestation(task_dir: Path, expected: int) -> Path | None:
+    """Persist prompt-provenance proof without retaining prompt text.
+
+    Delivery cleanup removes full prompt packets and final_prompt files. This
+    attestation keeps the hash chain needed to prove that each HTML file was
+    registered against the current SYSTEM_PROMPT and final_prompt without
+    exposing any private prompt content.
+    """
+    manifest_path = html_generation_manifest_path(task_dir)
+    manifest = _read_json_file(manifest_path)
+    if not manifest:
+        return None
+    slides = manifest.get("slides")
+    if not isinstance(slides, list):
+        return None
+    attested: list[dict[str, object]] = []
+    for idx in range(1, expected + 1):
+        entry = slides[idx - 1] if idx - 1 < len(slides) else {}
+        if not isinstance(entry, dict):
+            entry = {}
+        html_rel = str(entry.get("html_path", "") or f"html/slide{idx:02d}.html")
+        html_path = task_dir / html_rel
+        packet_id = str(entry.get("prompt_packet_id", "") or "")
+        html_text = read_text(html_path) if html_path.exists() else ""
+        marker = f'name="{HTML_PROMPT_PACKET_META}" content="{packet_id}"'
+        attested.append({
+            "slide": idx,
+            "html_path": html_rel,
+            "html_sha256": entry.get("html_sha256", ""),
+            "final_prompt_sha256": entry.get("final_prompt_sha256", ""),
+            "system_prompt_sha256": entry.get("system_prompt_sha256", ""),
+            "prompt_packet_id": packet_id,
+            "html_marker_verified": bool(packet_id and marker in html_text),
+            "generated_with_system_prompt": entry.get("generated_with_system_prompt") is True,
+            "html_input_mode": entry.get("html_input_mode", ""),
+            "generator": entry.get("generator", ""),
+        })
+    out = html_prompt_attestation_path(task_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": HTML_PROMPT_ATTESTATION_SCHEMA,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task_dir": str(task_dir),
+        "expected_pages": expected,
+        "source_manifest": str(manifest_path.relative_to(task_dir)),
+        "source_manifest_sha256": sha256_file(manifest_path),
+        "contains_prompt_text": False,
+        "purpose": "Post-cleanup proof that registered HTML was bound to the full locked SYSTEM_PROMPT + final_prompt packet by hash.",
+        "slides": attested,
+    }
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
 def check_pptx_file(pptx: Path, expected: int, issues: list[str]) -> dict[str, int] | None:
     if not pptx.exists():
         issues.append(f"PPTX missing: {pptx}")
@@ -7443,6 +7538,11 @@ def check_delivery_files(
             "render_manifest": "checked_in_pipeline_pass",
             "html_reference_fidelity": "checked_in_pipeline_pass",
             "html_generation_manifest": "checked_in_pipeline_pass",
+            "html_prompt_attestation": (
+                str(html_prompt_attestation_path(task_dir).relative_to(task_dir))
+                if html_prompt_attestation_path(task_dir).exists()
+                else None
+            ),
             "html_slide_count": "checked_in_pipeline_pass",
         }
     else:
@@ -8146,6 +8246,12 @@ def build_parser(*, include_lab: bool = False) -> argparse.ArgumentParser:
         choices=sorted(workflow_destinations().keys()),
     )
     fetch_workflow.set_defaults(func=cmd_fetch_workflow)
+
+    update = sub.add_parser(
+        "update",
+        help="Incrementally update the public Paopao plugin files",
+    )
+    update.set_defaults(func=cmd_update)
 
     plan_prompts = sub.add_parser(
         "plan-prompts",

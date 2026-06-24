@@ -190,14 +190,24 @@ def _cmd_generate_html_impl(ctx: object, args: object) -> int:
         )
         agent_prompt_path = task_dir / "qa" / "html_generation_requests" / f"agent_prompt_{idx:02d}.md"
         agent_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        zone_contract = prompt_zone_contract_for_slide(task_dir, idx)
+        nav_contract = compact_deck_navigation_contract(task_dir, idx, expected)
+        nav_labels = [e["label"] for e in nav_contract.get("labels", []) if e.get("label")]
         agent_prompt_text = "\n\n".join([
             "# Paopao HTML Slide Generation — Self-Contained Agent Prompt",
             f"Write exactly one complete 1920x1080 HTML slide to: `{html_path.relative_to(task_dir)}`",
             f"Include this exact marker in the HTML `<head>`: `{required_marker}`",
             "DO NOT read any other files. Everything you need is in this document.",
             "---",
+            "## Zone Contract (MUST match exactly)",
+            "Every zone below MUST appear in your HTML as `data-paopao-zone=\"EXACT_NAME\"` where EXACT_NAME is the zone string from the list. Copy the zone name character-for-character including uppercase.",
+            "ZONES: " + json.dumps(zone_contract.get("zones", []), ensure_ascii=False),
+            "The nav bar element (`data-paopao-zone=\"nav\"`) MUST contain visible navigation text — never leave it empty. Use the section labels below.",
+            "NAV_LABELS: " + json.dumps(nav_labels, ensure_ascii=False),
+            f"ACTIVE_SLIDE: {idx} / {expected}",
+            "---",
             "## Output Contract (renderer requirements)",
-            compact_renderer_guide_text(),
+            compact_renderer_guide_text(read_text(SYSTEM_PROMPT)),
             "---",
             "## Slide Specification (design brief)",
             final_prompt_text,
@@ -357,41 +367,52 @@ def _cmd_register_html_impl(ctx: object, args: object) -> int:
     return 0
 
 
-def compact_renderer_guide_text() -> str:
-    """Short HTML output contract for the html_source_only path.
+def compact_renderer_guide_text(system_prompt_text: str = "") -> str:
+    """Full visual design rules + renderer technical contract for subagents.
 
-    Design comes from the per-slide final prompt. This contract only states
-    renderer requirements that are also enforced by code-side checks.
+    Subagents have their own context window — no need to compress.
+    When system_prompt_text is provided, includes the complete SYSTEM_PROMPT
+    visual language so the subagent produces the same quality as the full
+    prompt packet path.
     """
-    return "\n".join([
-        "# Paopao HTML Output Contract",
+    parts = [
+        "# Paopao HTML Output Contract + Visual Design System",
         "",
-        "Use this with one slide's full final_prompt_XX.md. The final_prompt is the design brief; this file is only the editable-PPTX output contract.",
+        "Use this with one slide's full final_prompt_XX.md. The final_prompt is the design brief; this file provides the complete visual design system and editable-PPTX output contract.",
+    ]
+    if system_prompt_text.strip():
+        parts.extend([
+            "",
+            "---",
+            "",
+            "## SYSTEM PROMPT (complete visual design rules)",
+            "",
+            system_prompt_text,
+        ])
+    parts.extend([
         "",
-        "## Hard Requirements",
+        "---",
+        "",
+        "## Hard Technical Requirements (HTML → PPTX renderer)",
         "",
         "1. Canvas is 1920x1080; root slide must be one overflow:hidden flex column.",
         "2. Structure order: visible nav, title, content, takeaway, source.",
-        "3. Do not default to blue-filled cards or panels. Use white/near-white as normal fills; use blue fills only when the final prompt intentionally asks for a filled band, chevron, highlight, or semantic emphasis. Renderer preserves intentional HTML colors.",
-        "4. English font is Arial; Chinese font is Microsoft YaHei or PingFang SC with Arial fallback.",
-        "5. Every required prompt zone must appear with data-paopao-zone=\"<exact zone name>\".",
-        "6. Quantitative chart zones must include data-chart, data-categories, and data-series for editable PPT charts linked to workbook data.",
-        "7. If data-chart is used, keep a visible HTML chart/table fallback inside the same element so the browser preview is not blank.",
-        "8. Use real text, divs, tables, and simple CSS shapes; do not bake editable content into images.",
-        "9. No whole-slide image or screenshot background. No inline SVG, canvas, CSS background-image, or unmarked <img>.",
-        "10. Keep takeaway and source visible; no content may overlap or be clipped.",
+        "3. Every required prompt zone must appear with data-paopao-zone=\"<exact zone name>\".",
+        "4. Use real text, divs, tables, and simple CSS shapes; do not bake editable content into images.",
+        "5. No whole-slide image or screenshot background. No inline SVG, canvas, CSS background-image, or unmarked <img>.",
+        "6. Keep takeaway and source visible; no content may overlap or be clipped.",
+        "7. Reserve a clear bottom safe area for takeaway/source. Main content must end above the takeaway region.",
+        "8. Do not default to blue-filled cards or panels. Use white/near-white as normal fills; use blue fills only when the final prompt intentionally asks for a filled band, chevron, highlight, or semantic emphasis.",
         "",
-        "## Minimal Semantic Markers",
+        "## Semantic Markers",
         "",
-        "Keep the visual design free. When the final prompt naturally contains one of these objects, add the marker so the renderer can identify intent; do not simplify or redesign the slide to fit these markers.",
-        "",
-        "- KPI/card/callout/diagram regions may add `data-paopao-component=\"kpi-card|callout|diagram-node\"`; this is a semantic label, not a required style.",
-        "- Tables stay real `<table>` elements; add `data-paopao-component=\"table\"` when helpful.",
-        "- Process/chevron rows may add `data-paopao-component=\"chevron-flow\"`; avoid SVG-only arrows.",
-        "- Real charts must use a dedicated visible container marked `data-paopao-component=\"native-chart\"` plus `data-chart`, `data-categories`, and `data-series`; include visible fallback content inside the same container.",
-        "- Do not attach `data-chart` to a normal KPI/table cell just to pass validation. If the design is a KPI, keep it a KPI; if it is a chart, use a chart-shaped container.",
+        "- KPI/card/callout/diagram regions: `data-paopao-component=\"kpi-card|callout|diagram-node\"`",
+        "- Tables: real `<table>` with `data-paopao-component=\"table\"`",
+        "- Charts: `data-paopao-component=\"native-chart\"` + `data-chart` + `data-categories` + `data-series` with visible fallback",
+        "- Process/chevron: `data-paopao-component=\"chevron-flow\"`; avoid SVG-only arrows",
         "",
     ])
+    return "\n".join(parts)
 
 
 def _extract_prompt_header(final_prompt_text: str) -> dict[str, str]:
@@ -695,7 +716,7 @@ def _write_compact_renderer_guide_impl(ctx: object, task_dir: Path) -> Path:
     _bind(ctx)
     path = html_compact_renderer_guide_path(task_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = compact_renderer_guide_text()
+    text = compact_renderer_guide_text(read_text(SYSTEM_PROMPT))
     if not path.exists() or read_text(path) != text:
         path.write_text(text, encoding="utf-8")
     return path
@@ -843,7 +864,7 @@ def _cmd_compact_html_packet_impl(ctx: object, args: object) -> int:
 def _cmd_compact_renderer_guide_impl(ctx: object, args: object) -> int:
     _bind(ctx)
     task_dir = Path(args.task_dir).resolve() if args.task_dir else Path.cwd()
-    text = compact_renderer_guide_text()
+    text = compact_renderer_guide_text(read_text(SYSTEM_PROMPT))
     if args.output:
         out = Path(args.output)
         if not out.is_absolute():
