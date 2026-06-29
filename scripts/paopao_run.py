@@ -85,7 +85,7 @@ def fetch_workflow_bundle(names: list[str]) -> list[str]:
     return written
 
 
-def authorized_prompt_names() -> list[str]:
+def authorized_prompt_names(*, full_library: bool = False) -> list[str]:
     paopao_auth = _load_sibling("paopao_auth")
     try:
         catalog = paopao_auth.fetch_prompt_catalog()
@@ -95,6 +95,8 @@ def authorized_prompt_names() -> list[str]:
     for item in catalog.get("prompts", []):
         name = str(item.get("template", "")).strip()
         if name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+            if not full_library and not item.get("free"):
+                continue
             names.append(name)
     return names
 
@@ -142,19 +144,23 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
         if name not in destinations:
             raise SystemExit(f"Unknown workflow file: {name}")
     if args.all:
-        names = [*names, *authorized_prompt_names()]
+        names = [*names, *authorized_prompt_names(full_library=bool(getattr(args, "full_library", False)))]
     written = fetch_workflow_bundle(list(names))
-    print(json.dumps({"ok": True, "written": summarize(written)}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "ok": True,
+        "library_mode": "full" if getattr(args, "full_library", False) else "quick",
+        "written": summarize(written),
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
-def cmd_update(_: argparse.Namespace) -> int:
+def cmd_update(args: argparse.Namespace) -> int:
     updater = _load_sibling("paopao_update")
-    return updater.main()
+    return updater.main(full_library=bool(getattr(args, "full_library", False)))
 
 
 def cmd_runtime_required(args: argparse.Namespace) -> int:
-    cmd_fetch_workflow(argparse.Namespace(all=True, name="paopao_run.py"))
+    cmd_fetch_workflow(argparse.Namespace(all=True, name="paopao_run.py", full_library=False))
     os.execv(
         sys.executable,
         [sys.executable, str(PLUGIN_ROOT / "scripts" / "paopao_run.py"), *sys.argv[1:]],
@@ -170,10 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     update = sub.add_parser("update", help="Update public bootstrap files")
+    update.add_argument("--full-library", action="store_true", help="Also refresh every authorized prompt template")
     update.set_defaults(func=cmd_update)
 
     fetch = sub.add_parser("fetch-workflow", help="Fetch authorized Paopao runtime files")
     fetch.add_argument("--all", action="store_true")
+    fetch.add_argument("--full-library", action="store_true", help="Also fetch every authorized prompt template")
     fetch.add_argument("--name", default="paopao_run.py", choices=sorted(workflow_destinations().keys()))
     fetch.set_defaults(func=cmd_fetch_workflow)
 

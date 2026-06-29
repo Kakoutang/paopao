@@ -74,21 +74,25 @@ def fetch(path: str, ref: str) -> bytes:
         return resp.read()
 
 
-def fetch_authorized_runtime() -> tuple[list[str], str]:
+def fetch_authorized_runtime(*, full_library: bool = False) -> tuple[list[str], str, int]:
     try:
         import paopao_auth
     except Exception as exc:
-        return [], f"paopao_auth unavailable: {exc}"
+        return [], f"paopao_auth unavailable: {exc}", 0
     names = list(AUTHORIZED_WORKFLOW_FILES)
+    skipped_prompts = 0
     try:
         catalog = paopao_auth.fetch_prompt_catalog()
         for item in catalog.get("prompts", []):
             name = str(item.get("template", "")).strip()
             if not name.endswith(".md") or "/" in name or "\\" in name or ".." in name:
                 continue
+            if not full_library and not item.get("free"):
+                skipped_prompts += 1
+                continue
             names.append(name)
     except Exception as exc:
-        return [], str(exc)
+        return [], str(exc), skipped_prompts
 
     written: list[str] = []
     try:
@@ -109,8 +113,8 @@ def fetch_authorized_runtime() -> tuple[list[str], str]:
                 target.write_text(content + "\n", encoding="utf-8")
                 written.append(str(target.relative_to(ROOT)))
     except Exception as exc:
-        return written, str(exc)
-    return written, ""
+        return written, str(exc), skipped_prompts
+    return written, "", skipped_prompts
 
 
 def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
@@ -121,12 +125,13 @@ def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
     }
 
 
-def main() -> int:
+def main(*, full_library: bool = False) -> int:
     updated: list[str] = []
     unchanged: list[str] = []
     failed: list[str] = []
     runtime_written: list[str] = []
     runtime_error = ""
+    skipped_prompts = 0
     ref = remote_ref()
 
     for rel in MANAGED_FILES:
@@ -144,7 +149,7 @@ def main() -> int:
             failed.append(f"{rel}: {exc}")
 
     if not failed:
-        runtime_written, runtime_error = fetch_authorized_runtime()
+        runtime_written, runtime_error, skipped_prompts = fetch_authorized_runtime(full_library=full_library)
 
     result = {
         "ok": not failed and not runtime_error,
@@ -155,6 +160,8 @@ def main() -> int:
         "unchanged_count": len(unchanged),
         "failed": failed,
         "authorized_runtime_updated": summarize(runtime_written),
+        "library_mode": "full" if full_library else "quick",
+        "authorized_prompts_skipped": skipped_prompts,
         "authorized_runtime_error": runtime_error,
         "next_step": (
             "Restart the paopao task. Paopao is ready to create decks."
