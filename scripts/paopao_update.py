@@ -16,47 +16,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from paopao_file_manifest import (
+    LICENSED_DIRECT_RUNTIME_FILES,
+    PUBLIC_SHELL_FILES,
+    WORKFLOW_DESTINATION_RELS,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_BASE_TEMPLATE = "https://raw.githubusercontent.com/Kakoutang/paopao/{ref}"
-MANAGED_FILES = [
-    ".codex-plugin/plugin.json",
-    "README.md",
-    "prompts/INDEX.md",
-    "scripts/check_public_release.py",
-    "scripts/paopao_auth.py",
-    "scripts/paopao_lab.py",
-    "scripts/paopao_run.py",
-    "scripts/paopao_codex_assets.py",
-    "scripts/paopao_delivery_commands.py",
-    "scripts/paopao_html_workflow.py",
-    "scripts/paopao_pipeline_state.py",
-    "scripts/paopao_token_audit.py",
-    "scripts/paopao_update.py",
-    "scripts/pptx_qa.py",
-    "scripts/renderer.py",
-    "skills/paopao-ppt/SKILL.md",
-]
-
-LICENSED_RUNTIME_FILES = [
-    "paopao_run.py",
-    "SKILL.md",
-    "SYSTEM_PROMPT.md",
-    "direct_pptx_guide.md",
-    "deck_frame.py",
-    "renderer_guide.md",
-    "renderer.py",
-]
-
-WORKFLOW_DESTINATIONS = {
-    "paopao_run.py": ROOT / "scripts" / "paopao_run.py",
-    "SKILL.md": ROOT / "skills" / "paopao-ppt" / "SKILL.md",
-    "SYSTEM_PROMPT.md": ROOT / "prompts" / "SYSTEM_PROMPT.md",
-    "direct_pptx_guide.md": ROOT / "reference" / "direct_pptx_guide.md",
-    "deck_frame.py": ROOT / "scripts" / "deck_frame.py",
-    "renderer_guide.md": ROOT / "reference" / "renderer_guide.md",
-    "renderer.py": ROOT / "scripts" / "renderer.py",
-}
+MANAGED_FILES = PUBLIC_SHELL_FILES
+LICENSED_RUNTIME_FILES = LICENSED_DIRECT_RUNTIME_FILES
+WORKFLOW_DESTINATIONS = {name: ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
 
 
 def ssl_context() -> ssl.SSLContext:

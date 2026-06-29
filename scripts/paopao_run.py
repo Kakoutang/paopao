@@ -14,17 +14,10 @@ import os
 import sys
 from pathlib import Path
 
+from paopao_file_manifest import LICENSED_DIRECT_RUNTIME_FILES, WORKFLOW_DESTINATION_RELS
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-LICENSED_RUNTIME_FILES = [
-    "paopao_run.py",
-    "SKILL.md",
-    "SYSTEM_PROMPT.md",
-    "direct_pptx_guide.md",
-    "deck_frame.py",
-    "renderer_guide.md",
-    "renderer.py",
-]
+LICENSED_RUNTIME_FILES = LICENSED_DIRECT_RUNTIME_FILES
 
 
 def _load_sibling(name: str):
@@ -33,15 +26,7 @@ def _load_sibling(name: str):
 
 
 def workflow_destinations() -> dict[str, Path]:
-    return {
-        "paopao_run.py": PLUGIN_ROOT / "scripts" / "paopao_run.py",
-        "SKILL.md": PLUGIN_ROOT / "skills" / "paopao-ppt" / "SKILL.md",
-        "SYSTEM_PROMPT.md": PLUGIN_ROOT / "prompts" / "SYSTEM_PROMPT.md",
-        "direct_pptx_guide.md": PLUGIN_ROOT / "reference" / "direct_pptx_guide.md",
-        "deck_frame.py": PLUGIN_ROOT / "scripts" / "deck_frame.py",
-        "renderer_guide.md": PLUGIN_ROOT / "reference" / "renderer_guide.md",
-        "renderer.py": PLUGIN_ROOT / "scripts" / "renderer.py",
-    }
+    return {name: PLUGIN_ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
 
 
 def fetch_workflow_file(name: str, destination: Path) -> None:
@@ -153,9 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "make-deck",
         "next",
         "check",
-        "render",
         "finalize-delivery",
-        "record-commercial-render",
         "prepare-direct-build-packets",
         "render-pptx-previews",
     ]:

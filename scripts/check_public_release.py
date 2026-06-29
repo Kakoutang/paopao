@@ -8,30 +8,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from paopao_file_manifest import PUBLIC_SHELL_FILES
 
 ROOT = Path(__file__).resolve().parents[1]
 
 ALLOWED_TRACKED = {
-    ".codex-plugin/plugin.json",
     ".gitignore",
     "CLAUDE.md",
-    "README.md",
-    "prompts/INDEX.md",
-    "scripts/check_public_release.py",
-    "scripts/paopao_auth.py",
-    "scripts/paopao_lab.py",
-    "scripts/paopao_run.py",
-    "scripts/paopao_codex_assets.py",
-    "scripts/paopao_delivery_commands.py",
-    "scripts/paopao_html_workflow.py",
-    "scripts/paopao_pipeline_state.py",
-    "scripts/paopao_token_audit.py",
-    "scripts/paopao_update.py",
-    "scripts/pptx_qa.py",
-    "scripts/renderer.py",
-    "skills/paopao-ppt/SKILL.md",
     ".github/workflows/public-release-guard.yml",
-}
+} | set(PUBLIC_SHELL_FILES)
 
 FORBIDDEN_PATTERNS = [
     "auth_server/**",
@@ -46,6 +31,13 @@ FORBIDDEN_PATTERNS = [
     "spec/**",
     "reference/**",
     "scripts/deck_frame.py",
+    "scripts/paopao_codex_assets.py",
+    "scripts/paopao_delivery_commands.py",
+    "scripts/paopao_html_workflow.py",
+    "scripts/paopao_pipeline_state.py",
+    "scripts/paopao_token_audit.py",
+    "scripts/pptx_qa.py",
+    "scripts/renderer.py",
     "scripts/issue_paopao_license.py",
     "scripts/update_paopao_license.py",
     "prompts/*.md",
@@ -145,12 +137,6 @@ def main() -> int:
         if pattern:
             issues.append(f"tracked forbidden file {path} matched {pattern}")
         issues.extend(text_issues(path))
-
-    renderer = ROOT / "scripts" / "renderer.py"
-    if renderer.exists() and renderer.stat().st_size > 5000:
-        issues.append(
-            f"scripts/renderer.py is {renderer.stat().st_size} bytes; only a thin public bootstrap is allowed."
-        )
 
     for path in all_worktree_files():
         pattern = matches_forbidden(path)
