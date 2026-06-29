@@ -286,6 +286,20 @@ def fetch_workflow_file(name: str) -> dict[str, Any]:
     return request_json("GET", f"{server_url()}/workflow/{name}", token=auth_token())
 
 
+def fetch_workflow_bundle(names: list[str]) -> dict[str, Any]:
+    clean_names = [name for name in names if name]
+    if not clean_names:
+        return {"files": []}
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
+    return request_json(
+        "POST",
+        f"{server_url()}/workflow/bundle",
+        {"names": clean_names},
+        token=auth_token(),
+    )
+
+
 def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     if reservation_id == "local-dev":
         return {"ok": True, "license": {"remaining_pages": 999999}}

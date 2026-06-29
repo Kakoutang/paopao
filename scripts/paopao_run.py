@@ -18,6 +18,7 @@ from paopao_file_manifest import AUTHORIZED_RUNTIME_FILES, WORKFLOW_DESTINATION_
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
+BUNDLE_CHUNK_SIZE = 80
 
 
 def _load_sibling(name: str):
@@ -59,17 +60,61 @@ def fetch_prompt_templates() -> list[str]:
     return written
 
 
+def fetch_workflow_bundle(names: list[str]) -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    written: list[str] = []
+    for start in range(0, len(names), BUNDLE_CHUNK_SIZE):
+        try:
+            result = paopao_auth.fetch_workflow_bundle(names[start:start + BUNDLE_CHUNK_SIZE])
+        except paopao_auth.AuthError as exc:
+            raise SystemExit(str(exc)) from exc
+        for item in result.get("files", []):
+            name = str(item.get("name", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not content:
+                raise SystemExit(f"Workflow file is empty: {name}")
+            if name in WORKFLOW_DESTINATION_RELS:
+                target = PLUGIN_ROOT / WORKFLOW_DESTINATION_RELS[name]
+            elif name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+                target = PLUGIN_ROOT / "prompts" / name
+            else:
+                raise SystemExit(f"Unknown workflow file: {name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content + "\n", encoding="utf-8")
+            written.append(str(target.relative_to(PLUGIN_ROOT)))
+    return written
+
+
+def authorized_prompt_names() -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        catalog = paopao_auth.fetch_prompt_catalog()
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    names: list[str] = []
+    for item in catalog.get("prompts", []):
+        name = str(item.get("template", "")).strip()
+        if name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+            names.append(name)
+    return names
+
+
+def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
+    return {
+        "count": len(paths),
+        "sample": paths[:sample_size],
+        "truncated": len(paths) > sample_size,
+    }
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     runtime = PLUGIN_ROOT / "scripts" / "deck_frame.py"
     fetched: list[str] = []
     error = ""
     if not runtime.exists():
         try:
-            for name in AUTHORIZED_WORKFLOW_FILES:
-                target = workflow_destinations()[name]
-                fetch_workflow_file(name, target)
-                fetched.append(str(target.relative_to(PLUGIN_ROOT)))
-            fetched.extend(fetch_prompt_templates())
+            names = [*AUTHORIZED_WORKFLOW_FILES, *authorized_prompt_names()]
+            fetched = fetch_workflow_bundle(names)
         except SystemExit as exc:
             error = str(exc)
     checks = {
@@ -77,7 +122,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "public_bootstrap": True,
         "runtime_present": runtime.exists(),
         "access_ready": True,
-        "fetched": fetched,
+        "fetched": summarize(fetched),
         "next_step": (
             "Paopao is ready. You can start creating the deck."
             if runtime.exists()
@@ -93,16 +138,13 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 def cmd_fetch_workflow(args: argparse.Namespace) -> int:
     destinations = workflow_destinations()
     names = AUTHORIZED_WORKFLOW_FILES if args.all else [args.name]
-    written: list[str] = []
     for name in names:
         if name not in destinations:
             raise SystemExit(f"Unknown workflow file: {name}")
-        target = destinations[name]
-        fetch_workflow_file(name, target)
-        written.append(str(target.relative_to(PLUGIN_ROOT)))
     if args.all:
-        written.extend(fetch_prompt_templates())
-    print(json.dumps({"ok": True, "written": written}, ensure_ascii=False, indent=2))
+        names = [*names, *authorized_prompt_names()]
+    written = fetch_workflow_bundle(list(names))
+    print(json.dumps({"ok": True, "written": summarize(written)}, ensure_ascii=False, indent=2))
     return 0
 
 

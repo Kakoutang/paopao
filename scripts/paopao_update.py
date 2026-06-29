@@ -27,6 +27,7 @@ RAW_BASE_TEMPLATE = "https://raw.githubusercontent.com/Kakoutang/paopao/{ref}"
 MANAGED_FILES = PUBLIC_SHELL_FILES
 AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 WORKFLOW_DESTINATIONS = {name: ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
+BUNDLE_CHUNK_SIZE = 80
 
 
 def ssl_context() -> ssl.SSLContext:
@@ -78,36 +79,46 @@ def fetch_authorized_runtime() -> tuple[list[str], str]:
         import paopao_auth
     except Exception as exc:
         return [], f"paopao_auth unavailable: {exc}"
-    written: list[str] = []
-    for name in AUTHORIZED_WORKFLOW_FILES:
-        try:
-            result = paopao_auth.fetch_workflow_file(name)
-            content = str(result.get("content", "")).strip()
-            if not content:
-                return written, f"Runtime file is empty: {name}"
-            target = WORKFLOW_DESTINATIONS[name]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content + "\n", encoding="utf-8")
-            written.append(str(target.relative_to(ROOT)))
-        except Exception as exc:
-            return written, str(exc)
+    names = list(AUTHORIZED_WORKFLOW_FILES)
     try:
         catalog = paopao_auth.fetch_prompt_catalog()
         for item in catalog.get("prompts", []):
             name = str(item.get("template", "")).strip()
             if not name.endswith(".md") or "/" in name or "\\" in name or ".." in name:
                 continue
-            result = paopao_auth.fetch_workflow_file(name)
-            content = str(result.get("content", "")).strip()
-            if not content:
-                return written, f"Prompt file is empty: {name}"
-            target = ROOT / "prompts" / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content + "\n", encoding="utf-8")
-            written.append(str(target.relative_to(ROOT)))
+            names.append(name)
+    except Exception as exc:
+        return [], str(exc)
+
+    written: list[str] = []
+    try:
+        for start in range(0, len(names), BUNDLE_CHUNK_SIZE):
+            result = paopao_auth.fetch_workflow_bundle(names[start:start + BUNDLE_CHUNK_SIZE])
+            for item in result.get("files", []):
+                name = str(item.get("name", "")).strip()
+                content = str(item.get("content", "")).strip()
+                if name in WORKFLOW_DESTINATIONS:
+                    target = WORKFLOW_DESTINATIONS[name]
+                elif name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+                    target = ROOT / "prompts" / name
+                else:
+                    return written, f"Unexpected workflow file: {name}"
+                if not content:
+                    return written, f"Workflow file is empty: {name}"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content + "\n", encoding="utf-8")
+                written.append(str(target.relative_to(ROOT)))
     except Exception as exc:
         return written, str(exc)
     return written, ""
+
+
+def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
+    return {
+        "count": len(paths),
+        "sample": paths[:sample_size],
+        "truncated": len(paths) > sample_size,
+    }
 
 
 def main() -> int:
@@ -140,10 +151,10 @@ def main() -> int:
         "public_files_ok": not failed,
         "plugin_root": str(ROOT),
         "remote_ref": ref,
-        "updated": updated,
+        "updated": summarize(updated),
         "unchanged_count": len(unchanged),
         "failed": failed,
-        "authorized_runtime_updated": runtime_written,
+        "authorized_runtime_updated": summarize(runtime_written),
         "authorized_runtime_error": runtime_error,
         "next_step": (
             "Restart the paopao task. Paopao is ready to create decks."
