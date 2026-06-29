@@ -15,6 +15,15 @@ from pathlib import Path
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+LICENSED_RUNTIME_FILES = [
+    "paopao_run.py",
+    "SKILL.md",
+    "SYSTEM_PROMPT.md",
+    "direct_pptx_guide.md",
+    "deck_frame.py",
+    "renderer_guide.md",
+    "renderer.py",
+]
 
 
 def _load_sibling(name: str):
@@ -48,19 +57,37 @@ def fetch_workflow_file(name: str, destination: Path) -> None:
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
+    runtime = PLUGIN_ROOT / "scripts" / "deck_frame.py"
+    fetched: list[str] = []
+    error = ""
+    if not runtime.exists():
+        try:
+            for name in LICENSED_RUNTIME_FILES:
+                target = workflow_destinations()[name]
+                fetch_workflow_file(name, target)
+                fetched.append(str(target.relative_to(PLUGIN_ROOT)))
+        except SystemExit as exc:
+            error = str(exc)
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
         "public_bootstrap": True,
-        "licensed_runtime_present": (PLUGIN_ROOT / "scripts" / "deck_frame.py").exists(),
-        "next_step": "Run fetch-workflow --all after activation to install the licensed runtime.",
+        "licensed_runtime_present": runtime.exists(),
+        "fetched": fetched,
+        "next_step": (
+            "Licensed runtime installed. Restart the paopao task."
+            if runtime.exists()
+            else "Activate paopao, then run: python3 scripts/paopao_run.py fetch-workflow --all"
+        ),
     }
+    if error:
+        checks["error"] = error
     print(json.dumps(checks, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if runtime.exists() else 1
 
 
 def cmd_fetch_workflow(args: argparse.Namespace) -> int:
     destinations = workflow_destinations()
-    names = list(destinations) if args.all else [args.name]
+    names = LICENSED_RUNTIME_FILES if args.all else [args.name]
     written: list[str] = []
     for name in names:
         if name not in destinations:

@@ -38,6 +38,26 @@ MANAGED_FILES = [
     "skills/paopao-ppt/SKILL.md",
 ]
 
+LICENSED_RUNTIME_FILES = [
+    "paopao_run.py",
+    "SKILL.md",
+    "SYSTEM_PROMPT.md",
+    "direct_pptx_guide.md",
+    "deck_frame.py",
+    "renderer_guide.md",
+    "renderer.py",
+]
+
+WORKFLOW_DESTINATIONS = {
+    "paopao_run.py": ROOT / "scripts" / "paopao_run.py",
+    "SKILL.md": ROOT / "skills" / "paopao-ppt" / "SKILL.md",
+    "SYSTEM_PROMPT.md": ROOT / "prompts" / "SYSTEM_PROMPT.md",
+    "direct_pptx_guide.md": ROOT / "reference" / "direct_pptx_guide.md",
+    "deck_frame.py": ROOT / "scripts" / "deck_frame.py",
+    "renderer_guide.md": ROOT / "reference" / "renderer_guide.md",
+    "renderer.py": ROOT / "scripts" / "renderer.py",
+}
+
 
 def ssl_context() -> ssl.SSLContext:
     try:
@@ -83,10 +103,35 @@ def fetch(path: str, ref: str) -> bytes:
         return resp.read()
 
 
+def fetch_licensed_runtime() -> tuple[list[str], str]:
+    try:
+        import paopao_auth
+    except Exception as exc:
+        return [], f"paopao_auth unavailable: {exc}"
+    if not paopao_auth.auth_token():
+        return [], "No active license token; run paopao_auth.py activate, then paopao_run.py fetch-workflow --all."
+    written: list[str] = []
+    for name in LICENSED_RUNTIME_FILES:
+        try:
+            result = paopao_auth.fetch_workflow_file(name)
+            content = str(result.get("content", "")).strip()
+            if not content:
+                return written, f"Licensed runtime file is empty: {name}"
+            target = WORKFLOW_DESTINATIONS[name]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content + "\n", encoding="utf-8")
+            written.append(str(target.relative_to(ROOT)))
+        except Exception as exc:
+            return written, str(exc)
+    return written, ""
+
+
 def main() -> int:
     updated: list[str] = []
     unchanged: list[str] = []
     failed: list[str] = []
+    runtime_written: list[str] = []
+    runtime_error = ""
     ref = remote_ref()
 
     for rel in MANAGED_FILES:
@@ -103,17 +148,31 @@ def main() -> int:
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             failed.append(f"{rel}: {exc}")
 
+    if not failed:
+        runtime_written, runtime_error = fetch_licensed_runtime()
+
     result = {
-        "ok": not failed,
+        "ok": not failed and not runtime_error,
+        "public_files_ok": not failed,
         "plugin_root": str(ROOT),
         "remote_ref": ref,
         "updated": updated,
         "unchanged_count": len(unchanged),
         "failed": failed,
-        "next_step": "Restart the paopao task." if not failed else "Check network access, then run this updater again.",
+        "licensed_runtime_updated": runtime_written,
+        "licensed_runtime_error": runtime_error,
+        "next_step": (
+            "Restart the paopao task."
+            if not failed and not runtime_error
+            else (
+                "Activate paopao, then run: python3 scripts/paopao_run.py fetch-workflow --all"
+                if not failed
+                else "Check network access, then run this updater again."
+            )
+        ),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if not failed else 1
+    return 0 if not failed and not runtime_error else 1
 
 
 if __name__ == "__main__":
