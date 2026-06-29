@@ -44,7 +44,7 @@ Free preview mode:
 
 - First run automatically creates a `free_preview` token while `PAOPAO_OPEN_PREVIEW=1`.
 - Free preview users do not enter an activation code.
-- The free preview includes 10 pages and 5 prompts.
+- The free preview includes 5 pages and 5 prompts.
 - Set `PAOPAO_OPEN_PREVIEW=0` only if you want to disable automatic free preview issuance.
 
 Paid upgrades:

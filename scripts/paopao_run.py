@@ -79,7 +79,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "free_preview_available": True,
         "fetched": fetched,
         "next_step": (
-            "Paopao runtime is ready. Free preview includes 10 pages and 5 prompts; use an activation code only when upgrading."
+            "Paopao runtime is ready. Free preview includes 5 pages and 5 prompts; use an activation code only when upgrading."
             if runtime.exists()
             else "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
         ),
