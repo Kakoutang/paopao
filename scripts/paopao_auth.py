@@ -3,8 +3,8 @@
 
 The plugin stores only a signed token and public access summary locally.
 Source files remain on the user's machine. The public plugin automatically
-creates a free-preview token on first use, then fetches only the runtime and
-prompt files available to that token or paid plan.
+creates a starter token on first use, then fetches only the runtime and
+prompt files available to that token or access code.
 """
 
 from __future__ import annotations
@@ -190,8 +190,8 @@ def ensure_preview_access() -> dict[str, Any]:
         return data
     if not open_preview_enabled():
         raise AuthError(
-            "Free preview is disabled (PAOPAO_OPEN_PREVIEW=0). "
-            "Enable it or use scripts/paopao_auth.py activate --code <code> for a paid plan."
+            "Paopao starter access is disabled (PAOPAO_OPEN_PREVIEW=0). "
+            "Enable it or activate an access code with scripts/paopao_auth.py activate --code <code>."
         )
     return activate_preview()
 
@@ -303,11 +303,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paopao access client")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    activate_cmd = sub.add_parser("activate", help="Activate a paid plan for this installation")
+    activate_cmd = sub.add_parser("activate", help="Activate an access code for this installation")
     activate_cmd.add_argument("--code", required=True)
     activate_cmd.add_argument("--server-url", default="")
 
-    preview_cmd = sub.add_parser("preview", help="Enable the free preview for this installation")
+    preview_cmd = sub.add_parser("preview", help="Enable starter access for this installation")
     preview_cmd.add_argument("--server-url", default="")
 
     sub.add_parser("status", help="Check paopao access status")

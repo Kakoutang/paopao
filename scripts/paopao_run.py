@@ -3,7 +3,7 @@
 
 The public package intentionally does not ship private prompts, layout catalogs,
 or the direct PPTX runtime. Installations fetch authorized files at runtime;
-free-preview access is created automatically on first use.
+starter access is created automatically on first use.
 """
 
 from __future__ import annotations
@@ -76,10 +76,10 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "plugin_root": str(PLUGIN_ROOT),
         "public_bootstrap": True,
         "runtime_present": runtime.exists(),
-        "free_preview_available": True,
+        "access_ready": True,
         "fetched": fetched,
         "next_step": (
-            "Paopao runtime is ready. Free preview includes 5 pages and 5 prompts; use an activation code only when upgrading."
+            "Paopao is ready. You can start creating the deck."
             if runtime.exists()
             else "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
         ),
@@ -115,7 +115,6 @@ def cmd_runtime_required(args: argparse.Namespace) -> int:
     raise SystemExit(
         "This public package needs the Paopao runtime before generation.\n"
         "Run: python3 scripts/paopao_run.py fetch-workflow --all\n"
-        "Free preview access is created automatically; no activation code is needed for the free version.\n"
         f"Then rerun your command: {' '.join(['paopao_run.py', *sys.argv[1:]])}"
     )
 

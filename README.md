@@ -5,7 +5,7 @@ PPTX decks from PDFs, papers, reports, and reference images.
 
 This MVP does not run a web app and does not call Paopao-owned model APIs. The
 user's local AI workspace performs the reasoning workflow, while Paopao's
-service gates the private runtime, prompt access, and page quota.
+service gates the private runtime and prompt access.
 
 ## What Is Included
 
@@ -34,24 +34,23 @@ python3 scripts/paopao_run.py init --name demo --pages 3 --language English --pi
 python3 scripts/paopao_run.py next --task-dir output/demo
 ```
 
-## Free Preview And Paid Upgrades
+## Access
 
-Paopao can be used in free preview mode without entering an activation code.
-The service creates access automatically, then fetches the runtime,
-prompt access, and page quota available to that preview account.
+Paopao can be used immediately without entering an activation code. The service
+creates starter access automatically, then fetches the runtime and prompt access
+available to that installation.
 
-Free preview mode:
+Starter access:
 
-- First run automatically creates a `free_preview` token while `PAOPAO_OPEN_PREVIEW=1`.
-- Free preview users do not enter an activation code.
-- The free preview includes 5 pages and 5 prompts.
-- Set `PAOPAO_OPEN_PREVIEW=0` only if you want to disable automatic free preview issuance.
+- First run automatically creates an access token while `PAOPAO_OPEN_PREVIEW=1`.
+- Users do not enter an activation code to start.
+- Set `PAOPAO_OPEN_PREVIEW=0` only if you want to disable automatic starter access.
 
-Paid upgrades:
+Access codes:
 
-- Larger decks or larger prompt pools require a paid activation code and page quota.
+- Private deployments can use an activation code.
 
-Activate a paid plan:
+Activate an access code:
 
 ```bash
 PAOPAO_AUTH_URL=https://your-render-service.onrender.com \
@@ -64,9 +63,8 @@ Check status:
 python3 scripts/paopao_auth.py status
 ```
 
-When `PAOPAO_AUTH_REQUIRED=1` is enabled, rendering reserves page quota before
-generation. Successful jobs commit the quota; failed jobs cancel the reservation
-so users are not charged for failed output.
+When `PAOPAO_AUTH_REQUIRED=1` is enabled, rendering reserves access before
+generation. Successful jobs commit the reservation; failed jobs cancel it.
 
 For local development only, set:
 

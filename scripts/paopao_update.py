@@ -146,7 +146,7 @@ def main() -> int:
         "authorized_runtime_updated": runtime_written,
         "authorized_runtime_error": runtime_error,
         "next_step": (
-            "Restart the paopao task. Free preview includes 5 pages and 5 prompts; use an activation code only when upgrading."
+            "Restart the paopao task. Paopao is ready to create decks."
             if not failed and not runtime_error
             else (
                 "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
