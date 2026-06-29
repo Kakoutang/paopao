@@ -34,10 +34,11 @@ python3 scripts/paopao_run.py init --name demo --pages 3 --language English --pi
 python3 scripts/paopao_run.py next --task-dir output/demo
 ```
 
-## Free Preview And Licensing
+## Free Preview And Paid Upgrades
 
-The commercial plugin supports activation-code licensing through the companion
-license API in `auth_server/`.
+Paopao can be used in free preview mode without entering an activation code.
+The service creates access automatically, then fetches the runtime,
+prompt access, and page quota available to that preview account.
 
 Free preview mode:
 
@@ -46,11 +47,11 @@ Free preview mode:
 - The free preview includes 10 pages and 5 prompts.
 - Set `PAOPAO_OPEN_PREVIEW=0` only if you want to disable automatic free preview issuance.
 
-Paid mode:
+Paid upgrades:
 
 - Larger decks or larger prompt pools require a paid activation code and page quota.
 
-Activate a paid installation:
+Activate a paid plan:
 
 ```bash
 PAOPAO_AUTH_URL=https://your-render-service.onrender.com \
@@ -63,21 +64,9 @@ Check status:
 python3 scripts/paopao_auth.py status
 ```
 
-When `PAOPAO_AUTH_REQUIRED=1` is set in a commercial package, rendering reserves
-page quota before generation. Successful jobs commit the quota; failed jobs
-cancel the reservation so users are not charged for failed output.
-
-Manual license fulfillment:
-
-```bash
-python3 ../../scripts/issue_paopao_license.py \
-  --server-url "$PAOPAO_AUTH_URL" \
-  --admin-key-id "$PAOPAO_ADMIN_KEY_ID" \
-  --admin-private-key "$PAOPAO_ADMIN_PRIVATE_KEY" \
-  --email user@example.com \
-  --plan pro_monthly \
-  --price-code early_bird_19_usd_monthly
-```
+When `PAOPAO_AUTH_REQUIRED=1` is enabled, rendering reserves page quota before
+generation. Successful jobs commit the quota; failed jobs cancel the reservation
+so users are not charged for failed output.
 
 For local development only, set:
 

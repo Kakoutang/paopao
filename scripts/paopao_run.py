@@ -14,10 +14,10 @@ import os
 import sys
 from pathlib import Path
 
-from paopao_file_manifest import LICENSED_DIRECT_RUNTIME_FILES, WORKFLOW_DESTINATION_RELS
+from paopao_file_manifest import AUTHORIZED_RUNTIME_FILES, WORKFLOW_DESTINATION_RELS
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-LICENSED_RUNTIME_FILES = LICENSED_DIRECT_RUNTIME_FILES
+AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 
 
 def _load_sibling(name: str):
@@ -65,7 +65,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     error = ""
     if not runtime.exists():
         try:
-            for name in LICENSED_RUNTIME_FILES:
+            for name in AUTHORIZED_WORKFLOW_FILES:
                 target = workflow_destinations()[name]
                 fetch_workflow_file(name, target)
                 fetched.append(str(target.relative_to(PLUGIN_ROOT)))
@@ -75,7 +75,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     checks = {
         "plugin_root": str(PLUGIN_ROOT),
         "public_bootstrap": True,
-        "licensed_runtime_present": runtime.exists(),
+        "runtime_present": runtime.exists(),
+        "free_preview_available": True,
         "fetched": fetched,
         "next_step": (
             "Paopao runtime is ready. Free preview includes 10 pages and 5 prompts; use an activation code only when upgrading."
@@ -91,7 +92,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
 def cmd_fetch_workflow(args: argparse.Namespace) -> int:
     destinations = workflow_destinations()
-    names = LICENSED_RUNTIME_FILES if args.all else [args.name]
+    names = AUTHORIZED_WORKFLOW_FILES if args.all else [args.name]
     written: list[str] = []
     for name in names:
         if name not in destinations:
@@ -112,8 +113,9 @@ def cmd_update(_: argparse.Namespace) -> int:
 
 def cmd_runtime_required(args: argparse.Namespace) -> int:
     raise SystemExit(
-        "This public package needs the licensed Paopao runtime before generation.\n"
+        "This public package needs the Paopao runtime before generation.\n"
         "Run: python3 scripts/paopao_run.py fetch-workflow --all\n"
+        "Free preview access is created automatically; no activation code is needed for the free version.\n"
         f"Then rerun your command: {' '.join(['paopao_run.py', *sys.argv[1:]])}"
     )
 

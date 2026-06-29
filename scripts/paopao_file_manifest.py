@@ -17,7 +17,7 @@ PUBLIC_SHELL_FILES = [
 ]
 
 
-LICENSED_DIRECT_RUNTIME_FILES = [
+AUTHORIZED_RUNTIME_FILES = [
     "paopao_run.py",
     "paopao_delivery_commands.py",
     "paopao_pipeline_state.py",

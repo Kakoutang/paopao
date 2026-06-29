@@ -4,7 +4,7 @@
 The plugin stores only a signed token and public access summary locally.
 Source files remain on the user's machine. The public plugin automatically
 creates a free-preview token on first use, then fetches only the runtime and
-prompt files available to that token or paid license.
+prompt files available to that token or paid plan.
 """
 
 from __future__ import annotations
@@ -189,7 +189,10 @@ def ensure_preview_access() -> dict[str, Any]:
     if data.get("token") and data.get("server_url"):
         return data
     if not open_preview_enabled():
-        raise AuthError("paopao access is not active yet. Activate with scripts/paopao_auth.py activate --code <code>.")
+        raise AuthError(
+            "Free preview is disabled (PAOPAO_OPEN_PREVIEW=0). "
+            "Enable it or use scripts/paopao_auth.py activate --code <code> for a paid plan."
+        )
     return activate_preview()
 
 
@@ -209,7 +212,7 @@ def status(allow_dev: bool = True) -> dict[str, Any]:
             token = data.get("token", "")
             base = server_url()
         if not token or not base:
-            raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
+            raise AuthError("paopao access is unavailable. Please update paopao or contact support if this keeps happening.")
     result = request_json("GET", f"{base}/license/status", token=token)
     data["license"] = result.get("license", data.get("license", {}))
     data["last_status_at"] = int(time.time())
@@ -233,7 +236,7 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
             token = data.get("token", "")
             base = server_url()
     if not token or not base:
-        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
+        raise AuthError("paopao access is unavailable. Please update paopao or contact support if this keeps happening.")
     result = request_json(
         "POST",
         f"{base}/usage/reserve",
@@ -275,7 +278,7 @@ def finish_reservation(command: str, reservation_id: str) -> dict[str, Any]:
     token = data.get("token", "")
     base = server_url()
     if not token or not base:
-        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
+        raise AuthError("paopao access is unavailable. Please update paopao or contact support if this keeps happening.")
     result = request_json(
         "POST",
         f"{base}/usage/{command}",
@@ -300,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paopao access client")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    activate_cmd = sub.add_parser("activate", help="Activate this plugin installation")
+    activate_cmd = sub.add_parser("activate", help="Activate a paid plan for this installation")
     activate_cmd.add_argument("--code", required=True)
     activate_cmd.add_argument("--server-url", default="")
 

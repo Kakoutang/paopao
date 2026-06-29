@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 from paopao_file_manifest import (
-    LICENSED_DIRECT_RUNTIME_FILES,
+    AUTHORIZED_RUNTIME_FILES,
     PUBLIC_SHELL_FILES,
     WORKFLOW_DESTINATION_RELS,
 )
@@ -25,7 +25,7 @@ from paopao_file_manifest import (
 ROOT = Path(__file__).resolve().parents[1]
 RAW_BASE_TEMPLATE = "https://raw.githubusercontent.com/Kakoutang/paopao/{ref}"
 MANAGED_FILES = PUBLIC_SHELL_FILES
-LICENSED_RUNTIME_FILES = LICENSED_DIRECT_RUNTIME_FILES
+AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 WORKFLOW_DESTINATIONS = {name: ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
 
 
@@ -73,18 +73,18 @@ def fetch(path: str, ref: str) -> bytes:
         return resp.read()
 
 
-def fetch_licensed_runtime() -> tuple[list[str], str]:
+def fetch_authorized_runtime() -> tuple[list[str], str]:
     try:
         import paopao_auth
     except Exception as exc:
         return [], f"paopao_auth unavailable: {exc}"
     written: list[str] = []
-    for name in LICENSED_RUNTIME_FILES:
+    for name in AUTHORIZED_WORKFLOW_FILES:
         try:
             result = paopao_auth.fetch_workflow_file(name)
             content = str(result.get("content", "")).strip()
             if not content:
-                return written, f"Licensed runtime file is empty: {name}"
+                return written, f"Runtime file is empty: {name}"
             target = WORKFLOW_DESTINATIONS[name]
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content + "\n", encoding="utf-8")
@@ -133,7 +133,7 @@ def main() -> int:
             failed.append(f"{rel}: {exc}")
 
     if not failed:
-        runtime_written, runtime_error = fetch_licensed_runtime()
+        runtime_written, runtime_error = fetch_authorized_runtime()
 
     result = {
         "ok": not failed and not runtime_error,
