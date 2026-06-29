@@ -108,8 +108,6 @@ def fetch_licensed_runtime() -> tuple[list[str], str]:
         import paopao_auth
     except Exception as exc:
         return [], f"paopao_auth unavailable: {exc}"
-    if not paopao_auth.auth_token():
-        return [], "No active license token; run paopao_auth.py activate, then paopao_run.py fetch-workflow --all."
     written: list[str] = []
     for name in LICENSED_RUNTIME_FILES:
         try:
@@ -123,6 +121,22 @@ def fetch_licensed_runtime() -> tuple[list[str], str]:
             written.append(str(target.relative_to(ROOT)))
         except Exception as exc:
             return written, str(exc)
+    try:
+        catalog = paopao_auth.fetch_prompt_catalog()
+        for item in catalog.get("prompts", []):
+            name = str(item.get("template", "")).strip()
+            if not name.endswith(".md") or "/" in name or "\\" in name or ".." in name:
+                continue
+            result = paopao_auth.fetch_workflow_file(name)
+            content = str(result.get("content", "")).strip()
+            if not content:
+                return written, f"Prompt file is empty: {name}"
+            target = ROOT / "prompts" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content + "\n", encoding="utf-8")
+            written.append(str(target.relative_to(ROOT)))
+    except Exception as exc:
+        return written, str(exc)
     return written, ""
 
 
@@ -159,13 +173,13 @@ def main() -> int:
         "updated": updated,
         "unchanged_count": len(unchanged),
         "failed": failed,
-        "licensed_runtime_updated": runtime_written,
-        "licensed_runtime_error": runtime_error,
+        "authorized_runtime_updated": runtime_written,
+        "authorized_runtime_error": runtime_error,
         "next_step": (
-            "Restart the paopao task."
+            "Restart the paopao task. Free preview includes 10 pages and 5 prompts; use an activation code only when upgrading."
             if not failed and not runtime_error
             else (
-                "Activate paopao, then run: python3 scripts/paopao_run.py fetch-workflow --all"
+                "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
                 if not failed
                 else "Check network access, then run this updater again."
             )

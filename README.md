@@ -4,14 +4,15 @@ paopao is a local plugin for creating editable consulting-style
 PPTX decks from PDFs, papers, reports, and reference images.
 
 This MVP does not run a web app and does not call Paopao-owned model APIs. The
-user's local AI workspace performs the reasoning workflow.
+user's local AI workspace performs the reasoning workflow, while Paopao's
+service gates the private runtime, prompt access, and page quota.
 
 ## What Is Included
 
 - `skills/paopao-ppt/SKILL.md`: the local deck workflow.
 - `scripts/paopao_run.py`: task initialization, workflow validation, rendering, and packaging helper.
 - `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
-- `prompts/INDEX.md`: public prompt catalog index. Full templates and runtime files are fetched through the licensed workflow service.
+- `prompts/INDEX.md`: public prompt catalog index. Full templates and runtime files are fetched through the authorized workflow service.
 
 ## Quality Gates
 
@@ -33,21 +34,21 @@ python3 scripts/paopao_run.py init --name demo --pages 3 --language English --pi
 python3 scripts/paopao_run.py next --task-dir output/demo
 ```
 
-## Open Preview And Licensing
+## Free Preview And Licensing
 
 The commercial plugin supports activation-code licensing through the companion
 license API in `auth_server/`.
 
-Open preview mode:
+Free preview mode:
 
-- Early users can render without activation while `PAOPAO_OPEN_PREVIEW=1`.
-- This is the default during the initial feedback window.
-- Set `PAOPAO_OPEN_PREVIEW=0` when you are ready to turn paid licensing back on.
+- First run automatically creates a `free_preview` token while `PAOPAO_OPEN_PREVIEW=1`.
+- Free preview users do not enter an activation code.
+- The free preview includes 10 pages and 5 prompts.
+- Set `PAOPAO_OPEN_PREVIEW=0` only if you want to disable automatic free preview issuance.
 
 Paid mode:
 
-- Set `PAOPAO_FREE_MAX_SLIDES=10` to allow 10 slides without activation.
-- Larger decks require a paid license and page quota.
+- Larger decks or larger prompt pools require a paid activation code and page quota.
 
 Activate a paid installation:
 

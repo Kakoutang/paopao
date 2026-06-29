@@ -2,9 +2,9 @@
 """Access and design-service client for paopao.
 
 The plugin stores only a signed token and public access summary locally.
-Source files remain on the user's machine. During prompt filling, the design
-server receives only the per-slide content the agent submits for the selected
-template zones; raw template downloads are not supported.
+Source files remain on the user's machine. The public plugin automatically
+creates a free-preview token on first use, then fetches only the runtime and
+prompt files available to that token or paid license.
 """
 
 from __future__ import annotations
@@ -156,6 +156,43 @@ def activate(code: str, url: str) -> dict[str, Any]:
     return data
 
 
+def open_preview_enabled() -> bool:
+    return os.getenv("PAOPAO_OPEN_PREVIEW", "1") != "0"
+
+
+def activate_preview(url: str = "") -> dict[str, Any]:
+    base = server_url(url)
+    if not base:
+        raise AuthError("missing paopao service URL. Set PAOPAO_AUTH_URL or pass --server-url.")
+    result = request_json(
+        "POST",
+        f"{base}/preview/activate",
+        {
+            "device_id": device_id(),
+            "plugin_version": PLUGIN_VERSION,
+        },
+    )
+    data = {
+        "server_url": base,
+        "token": result["token"],
+        "device_id": device_id(),
+        "activated_at": int(time.time()),
+        "access_mode": "free_preview",
+        "license": result.get("license", {}),
+    }
+    write_license(data)
+    return data
+
+
+def ensure_preview_access() -> dict[str, Any]:
+    data = read_license()
+    if data.get("token") and data.get("server_url"):
+        return data
+    if not open_preview_enabled():
+        raise AuthError("paopao access is not active yet. Activate with scripts/paopao_auth.py activate --code <code>.")
+    return activate_preview()
+
+
 def status(allow_dev: bool = True) -> dict[str, Any]:
     data = read_license()
     token = data.get("token", "")
@@ -167,7 +204,12 @@ def status(allow_dev: bool = True) -> dict[str, Any]:
                 "mode": "local-dev",
                 "message": "PAOPAO_LOCAL_DEV=1 bypass is enabled.",
             }
-        raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
+        if open_preview_enabled():
+            data = ensure_preview_access()
+            token = data.get("token", "")
+            base = server_url()
+        if not token or not base:
+            raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
     result = request_json("GET", f"{base}/license/status", token=token)
     data["license"] = result.get("license", data.get("license", {}))
     data["last_status_at"] = int(time.time())
@@ -186,6 +228,11 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
     if os.getenv("PAOPAO_LOCAL_DEV") == "1" and (not token or not base):
         return {"reservation_id": "local-dev", "license": {"remaining_pages": 999999}}
     if not token or not base:
+        if open_preview_enabled():
+            data = ensure_preview_access()
+            token = data.get("token", "")
+            base = server_url()
+    if not token or not base:
         raise AuthError("paopao access is not active yet. Please update paopao or contact support if this keeps happening.")
     result = request_json(
         "POST",
@@ -199,10 +246,14 @@ def reserve(job_id: str, pages: int) -> dict[str, Any]:
 
 
 def fetch_prompt_catalog() -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
     return request_json("GET", f"{server_url()}/prompts/catalog", token=auth_token())
 
 
 def fill_prompt_template(template: str, fills: dict[str, str]) -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
     return request_json(
         "POST",
         f"{server_url()}/prompts/fill",
@@ -212,6 +263,8 @@ def fill_prompt_template(template: str, fills: dict[str, str]) -> dict[str, Any]
 
 
 def fetch_workflow_file(name: str) -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
     return request_json("GET", f"{server_url()}/workflow/{name}", token=auth_token())
 
 
@@ -251,6 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
     activate_cmd.add_argument("--code", required=True)
     activate_cmd.add_argument("--server-url", default="")
 
+    preview_cmd = sub.add_parser("preview", help="Enable the free preview for this installation")
+    preview_cmd.add_argument("--server-url", default="")
+
     sub.add_parser("status", help="Check paopao access status")
     sub.add_parser("require", help="Fail if paopao access is unavailable")
 
@@ -272,6 +328,8 @@ def main() -> int:
     try:
         if args.command == "activate":
             print_json(activate(args.code, args.server_url))
+        elif args.command == "preview":
+            print_json(activate_preview(args.server_url))
         elif args.command == "status":
             print_json(status())
         elif args.command == "require":

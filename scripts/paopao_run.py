@@ -2,7 +2,8 @@
 """Thin public bootstrap for Paopao.
 
 The public package intentionally does not ship private prompts, layout catalogs,
-or the direct PPTX runtime. Licensed installations fetch those files at runtime.
+or the direct PPTX runtime. Installations fetch authorized files at runtime;
+free-preview access is created automatically on first use.
 """
 
 from __future__ import annotations
@@ -56,6 +57,23 @@ def fetch_workflow_file(name: str, destination: Path) -> None:
     destination.write_text(content + "\n", encoding="utf-8")
 
 
+def fetch_prompt_templates() -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        catalog = paopao_auth.fetch_prompt_catalog()
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    written: list[str] = []
+    for item in catalog.get("prompts", []):
+        name = str(item.get("template", "")).strip()
+        if not name.endswith(".md") or "/" in name or "\\" in name or ".." in name:
+            continue
+        target = PLUGIN_ROOT / "prompts" / name
+        fetch_workflow_file(name, target)
+        written.append(str(target.relative_to(PLUGIN_ROOT)))
+    return written
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     runtime = PLUGIN_ROOT / "scripts" / "deck_frame.py"
     fetched: list[str] = []
@@ -66,6 +84,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
                 target = workflow_destinations()[name]
                 fetch_workflow_file(name, target)
                 fetched.append(str(target.relative_to(PLUGIN_ROOT)))
+            fetched.extend(fetch_prompt_templates())
         except SystemExit as exc:
             error = str(exc)
     checks = {
@@ -74,9 +93,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "licensed_runtime_present": runtime.exists(),
         "fetched": fetched,
         "next_step": (
-            "Licensed runtime installed. Restart the paopao task."
+            "Paopao runtime is ready. Free preview includes 10 pages and 5 prompts; use an activation code only when upgrading."
             if runtime.exists()
-            else "Activate paopao, then run: python3 scripts/paopao_run.py fetch-workflow --all"
+            else "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
         ),
     }
     if error:
@@ -95,6 +114,8 @@ def cmd_fetch_workflow(args: argparse.Namespace) -> int:
         target = destinations[name]
         fetch_workflow_file(name, target)
         written.append(str(target.relative_to(PLUGIN_ROOT)))
+    if args.all:
+        written.extend(fetch_prompt_templates())
     print(json.dumps({"ok": True, "written": written}, ensure_ascii=False, indent=2))
     return 0
 
@@ -122,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     update = sub.add_parser("update", help="Update public bootstrap files")
     update.set_defaults(func=cmd_update)
 
-    fetch = sub.add_parser("fetch-workflow", help="Fetch licensed Paopao runtime files")
+    fetch = sub.add_parser("fetch-workflow", help="Fetch authorized Paopao runtime files")
     fetch.add_argument("--all", action="store_true")
     fetch.add_argument("--name", default="paopao_run.py", choices=sorted(workflow_destinations().keys()))
     fetch.set_defaults(func=cmd_fetch_workflow)
