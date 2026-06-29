@@ -30,6 +30,7 @@ CONFIG_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao"))
 LICENSE_PATH = CONFIG_DIR / "license.json"
 DEFAULT_SERVER_URL = "https://paopao-license-api.onrender.com"
 DEFAULT_TIMEOUT = 20
+REQUEST_RETRIES = 3
 UPDATE_INSTRUCTION_ZH = "请先运行 paopao 的增量更新脚本：python3 scripts/paopao_update.py，然后重新开始生成 PPT；如果没有这个脚本，再重新下载安装最新版 paopao 插件。"
 UPDATE_INSTRUCTION_EN = "Please run the paopao incremental updater first: python3 scripts/paopao_update.py, then restart PPT generation. If the updater is unavailable, reinstall the latest paopao plugin."
 
@@ -95,46 +96,55 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
         headers["Authorization"] = f"Bearer {token}"
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=ssl_context()) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 426:
+
+    for attempt in range(REQUEST_RETRIES):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=ssl_context()) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in {502, 503, 504} and attempt < REQUEST_RETRIES - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            if exc.code == 426:
+                message = ""
+                try:
+                    parsed = json.loads(detail)
+                    message = str(parsed.get("detail", "")).strip()
+                except Exception:
+                    message = detail.strip()
+                raise AuthError(
+                    "paopao 插件需要更新后才能继续生成。\n"
+                    f"{message}\n"
+                    "如果你不熟悉操作，请直接把这句话发给 Codex：\n"
+                    f"{UPDATE_INSTRUCTION_ZH}\n"
+                    f"English: {UPDATE_INSTRUCTION_EN}"
+                ) from exc
             message = ""
             try:
                 parsed = json.loads(detail)
                 message = str(parsed.get("detail", "")).strip()
             except Exception:
-                message = detail.strip()
+                message = ""
+            if not message:
+                if "<html" in detail.lower() or "<!doctype html" in detail.lower():
+                    message = "paopao 服务暂时不可用，请稍后重试。"
+                else:
+                    message = detail.strip()
+            if len(message) > 500:
+                message = message[:500].rstrip() + "..."
+            raise AuthError(f"paopao service rejected request: HTTP {exc.code} {message}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
             raise AuthError(
-                "paopao 插件需要更新后才能继续生成。\n"
-                f"{message}\n"
-                "如果你不熟悉操作，请直接把这句话发给 Codex：\n"
-                f"{UPDATE_INSTRUCTION_ZH}\n"
-                f"English: {UPDATE_INSTRUCTION_EN}"
+                "无法连接 paopao 服务，请检查网络后重试。"
+                f"English: cannot reach paopao service: {exc}"
             ) from exc
-        message = ""
-        try:
-            parsed = json.loads(detail)
-            message = str(parsed.get("detail", "")).strip()
-        except Exception:
-            message = ""
-        if not message:
-            if "<html" in detail.lower() or "<!doctype html" in detail.lower():
-                message = "paopao 服务暂时不可用，请稍后重试。"
-            else:
-                message = detail.strip()
-        if len(message) > 500:
-            message = message[:500].rstrip() + "..."
-        raise AuthError(f"paopao service rejected request: HTTP {exc.code} {message}") from exc
-    except urllib.error.URLError as exc:
-        raise AuthError(
-            "无法连接 paopao 服务，请检查网络后重试。"
-            f"English: cannot reach paopao service: {exc}"
-        ) from exc
+    raise AuthError("无法连接 paopao 服务，请检查网络后重试。English: cannot reach paopao service.")
 
 
 def activate(code: str, url: str) -> dict[str, Any]:
