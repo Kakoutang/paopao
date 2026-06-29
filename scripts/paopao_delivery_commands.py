@@ -11,7 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'final_delivery_pass_path', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path', 'write_html_prompt_attestation']
+_CTX_NAMES = ['Path', 'json', 'time', 'shutil', 'argparse', 'os', 'PROMPT_ARCHIVE_ENV', 'PROMPT_ARCHIVE_DEV_ENV', 'PROMPT_PRIVATE_DIR', 'internal_prompt_files', 'prompt_private_path', 'delivery_temp_files', 'expected_pages_from_task', 'pipeline_pass_issues', 'check_pipeline_contract', 'write_pipeline_pass', 'check_delivery_files', 'write_final_delivery_pass', 'final_delivery_pass_path', 'check_pptx_file', 'sha256_file', 'user_visible_quality_summary', 'commercial_render_path', 'commercial_source_of_truth', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'image2_reference_path', 'write_html_prompt_attestation', 'is_direct_pptx_task']
 
 
 def _bind(ctx: object) -> None:
@@ -157,8 +157,9 @@ def _cmd_publish_delivery_impl(ctx: object, args: object) -> int:
 
     target = delivery_dir / pptx.name
     shutil.copy2(pptx, target)
-    render_path = commercial_render_path(task_dir)
-    source_of_truth = commercial_source_of_truth(task_dir)
+    direct_pptx = is_direct_pptx_task(task_dir)
+    render_path = "direct_pptx" if direct_pptx else commercial_render_path(task_dir)
+    source_of_truth = "direct_pptx" if direct_pptx else commercial_source_of_truth(task_dir)
 
     copied_images: list[str] = []
     if expected and bool(getattr(args, "include_slide_images", False)):
@@ -235,6 +236,18 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
         try:
             cached = json.loads(existing_pass.read_text(encoding="utf-8"))
             if cached.get("pptx_sha256") == sha256_file(pptx):
+                pipeline_issues: list[str] = []
+                pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
+                if pipeline_issues:
+                    print(json.dumps({
+                        "task_dir": str(task_dir),
+                        "stage": "finalize-pipeline",
+                        "ok": False,
+                        "issues": pipeline_issues,
+                        "counts": pipeline_counts,
+                        "idempotent_cache_rejected": True,
+                    }, indent=2, ensure_ascii=False))
+                    return 1
                 cached["idempotent_cache_hit"] = True
                 print(json.dumps(cached, indent=2, ensure_ascii=False))
                 return 0
@@ -262,7 +275,7 @@ def _cmd_finalize_delivery_impl(ctx: object, args: object) -> int:
         include_html=bool(getattr(args, "include_html", False)),
     )
     _cmd_publish_delivery_impl(ctx, publish_args)
-    attestation = write_html_prompt_attestation(task_dir, expected)
+    attestation = None if is_direct_pptx_task(task_dir) else write_html_prompt_attestation(task_dir, expected)
 
     delivery_issues: list[str] = []
     delivery_counts = check_delivery_files(

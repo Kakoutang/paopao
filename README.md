@@ -9,21 +9,18 @@ user's local AI workspace performs the reasoning workflow.
 ## What Is Included
 
 - `skills/paopao-ppt/SKILL.md`: the local deck workflow.
-- `scripts/renderer.py`: HTML to editable PPTX renderer for the HTML commercial path.
+- `scripts/paopao_run.py`: task initialization, workflow validation, rendering, and packaging helper.
 - `scripts/pptx_qa.py`: mechanical PPTX validation and renderer-safety checks.
-- `scripts/paopao_run.py`: task initialization, commercial path validation, rendering, and packaging helper.
-- `prompts/`: layout annotation library.
-- `reference/renderer_guide.md`: HTML/PPTX stability rules for the HTML path.
+- `prompts/INDEX.md`: public prompt catalog index. Full templates and runtime files are fetched through the licensed workflow service.
 
 ## Quality Gates
 
 The plugin enforces the commercial delivery path with local checks:
 
-- A commercial render contract must declare either `html` or `direct_pptx` as the editable reconstruction path, with Image2 as the source of truth.
-- Direct PPTX output is allowed only when it is built from image-derived measurement/visual contracts and passes the real PowerPoint preview gate.
-- HTML cannot use short text placeholders as icons inside icon containers when HTML is the declared path.
+- The default production path is direct editable PPTX built from locked workflow packets and the authorized runtime.
+- HTML rendering is a legacy path for explicit browser/HTML requests, not the default PPTX path.
 - Screenshot-cropped icon PNGs are checked for opaque corner backgrounds. Use `python3 scripts/paopao_run.py clean-icon-crop --image <reference> --box x,y,w,h --output <asset.png>` to expand the crop, remove the detected background, trim to the real icon, and export a transparent PNG.
-- Final QA must explicitly compare title, module geometry, icons, takeaway, and color hierarchy against the generated visual reference, using real PPTX previews rather than HTML/browser previews.
+- Final QA must inspect real PPTX previews rather than relying on code success alone.
 - PowerPoint QA must confirm actual PPTX opening, visible text/numbers/icons, layout match, and no overlap.
 - Delivery cleanup rejects exposed prompt Markdown files.
 - Delivery cleanup rejects multiple top-level PPTX drafts; only the final PPTX should remain visible.
@@ -32,16 +29,8 @@ The plugin enforces the commercial delivery path with local checks:
 
 ```bash
 python3 scripts/paopao_run.py doctor
-python3 scripts/paopao_run.py init --name demo --pages 3 --language English
-python3 scripts/paopao_run.py check --task-dir output/demo
-```
-
-If Codex declares the HTML commercial path and creates `output/demo/html/slide01.html` and other slide HTML files:
-
-```bash
-python3 scripts/paopao_run.py render \
-  --task-dir output/demo \
-  --pptx output/demo/pptx/demo.pptx
+python3 scripts/paopao_run.py init --name demo --pages 3 --language English --pipeline-mode direct_pptx
+python3 scripts/paopao_run.py next --task-dir output/demo
 ```
 
 ## Open Preview And Licensing

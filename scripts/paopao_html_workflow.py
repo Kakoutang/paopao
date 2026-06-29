@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from html import escape
 from pathlib import Path
 
 _CTX_NAMES = ['Path', 'json', 're', 'time', 'os', 'subprocess', 'sys', 'expected_pages_from_task', 'COMMERCIAL_RENDER_PATHS', 'COMMERCIAL_SOURCE_OF_TRUTH_VALUES', 'render_manifest_source_of_truth', 'IMAGE2_SOURCE_OF_TRUTH', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'check_image2_files', 'post_image_memory_boundary_issues', 'check_visual_inventory_files', 'check_powerpoint_layout_plan_files', 'check_html_files', 'check_html_generation_manifest', 'check_render_manifest', 'commercial_render_contract_path', 'COMMERCIAL_RENDER_CONTRACT_SCHEMA', 'COMMERCIAL_SIMILARITY_MIN', '_relative_to_task_or_abs', 'sha256_file', 'is_html_source_only_task', 'check_html_source_analysis_files', 'ensure_workflow_file', 'SYSTEM_PROMPT', 'HTML_GENERATION_MANIFEST_SCHEMA', 'HTML_GENERATION_SOURCE', 'html_generation_manifest_path', '_read_json_file', 'read_task_manifest', 'read_text', 'verify_fill_origin', 'html_generation_request_path', 'sha256_text', 'HTML_PROMPT_PACKET_META', 'prompt_zone_contract_for_slide', 'HTML_ZONE_ATTR', 'build_deck_navigation_contract', 'html_compact_packet_path', 'html_compact_provenance_path', 'html_compact_renderer_guide_path', 'compact_deck_navigation_contract', 'html_files_from_task', 'RENDERER', 'render_manifest_path', 'PIPELINE_MODE_HTML_SOURCE_ONLY', 'check_html_reference_fidelity', 'reserve_quota', 'finish_quota', 'PLUGIN_ROOT', 'capture_html_preview']
@@ -30,8 +31,6 @@ def _cmd_record_commercial_render_impl(ctx: object, args: object) -> int:
     render_path = str(args.render_path).strip()
     if render_path not in COMMERCIAL_RENDER_PATHS:
         raise SystemExit("--render-path must be html or direct_pptx")
-    if render_path != "html" and os.getenv("PAOPAO_ALLOW_LEGACY_DIRECT_PPTX") != "1":
-        raise SystemExit("--render-path must be html for production. Set PAOPAO_ALLOW_LEGACY_DIRECT_PPTX=1 only for local legacy experiments.")
     source_of_truth = str(args.source_of_truth or "").strip() or render_manifest_source_of_truth(task_dir)
     if source_of_truth not in COMMERCIAL_SOURCE_OF_TRUTH_VALUES:
         raise SystemExit("--source-of-truth must be image2_reference or html_browser_render")
@@ -159,7 +158,8 @@ def _cmd_generate_html_impl(ctx: object, args: object) -> int:
             "HARD_RULE: Generate exactly one complete 16:9 production HTML slide from the SYSTEM_PROMPT and FINAL_PROMPT below. Do not use any other prompt, memory, image reference, template prose, or handwritten substitute.",
             "HARD_RULE: The HTML <head> must include the exact REQUIRED_HTML_MARKER above. This marker binds the HTML to this locked Paopao prompt packet.",
             "HARD_RULE: Return/write only complete HTML. Use real text, CSS boxes, tables, native data-chart blocks, and CSS shapes. No SVG, no whole-slide screenshot background.",
-            "HARD_RULE: Do not default to blue-filled cards or panels. Use white/near-white as the normal page/card fill; use blue fills only when the final prompt/HTML design intentionally calls for a filled band, chevron, highlight, or semantic emphasis. Preserve intentional HTML colors in render.",
+            "HARD_RULE: Follow the reference-style area budget: white/near-white surfaces >=80% of slide area; pale-blue fills (#D9EAF7/#EAF1F8) <=12%; deep-blue fills (#305496/#4472C4) <=8%. Normal modules, cards, tables, and chart panels must default to white.",
+            "HARD_RULE: Do not default to blue-filled cards or panels. Pale-blue is only for table headers, one selected row, one focus callout, or a template-required grouped object. Deep-blue is only for narrow functional emphasis such as nav, title rule, small badges, selected bars, or a slim takeaway strip.",
             "HARD_RULE: Reserve a clear bottom safe area for the takeaway/source strip. Main content must end above the takeaway region; do not let tables, cards, arrows, labels, or charts overlap the bottom strip.",
             "PROMPT_ZONE_EXECUTION_CONTRACT:\n" + json.dumps(prompt_zone_contract_for_slide(task_dir, idx), ensure_ascii=False, indent=2, sort_keys=True),
             f"HARD_RULE: Every zone listed in PROMPT_ZONE_EXECUTION_CONTRACT.zones must appear in the HTML as an element with {HTML_ZONE_ATTR}=\"<exact zone name>\".",
@@ -194,23 +194,30 @@ def _cmd_generate_html_impl(ctx: object, args: object) -> int:
         nav_contract = compact_deck_navigation_contract(task_dir, idx, expected)
         nav_labels = [e["label"] for e in nav_contract.get("labels", []) if e.get("label")]
         agent_prompt_text = "\n\n".join([
-            "# Paopao HTML Slide Generation — Self-Contained Agent Prompt",
-            f"Write exactly one complete 1920x1080 HTML slide to: `{html_path.relative_to(task_dir)}`",
-            f"Include this exact marker in the HTML `<head>`: `{required_marker}`",
-            "DO NOT read any other files. Everything you need is in this document.",
+            "# Paopao HTML Slide Generation — Final Prompt First",
+            "",
+            "Generate the slide from the design brief first. Treat it as the source of truth for layout, density, hierarchy, and content. The constraints after the brief are guardrails only; do not let them simplify, shrink, or template-fill the design.",
+            "",
+            "## Design Brief",
+            final_prompt_text,
             "---",
-            "## Zone Contract (MUST match exactly)",
-            "Every zone below MUST appear in your HTML as `data-paopao-zone=\"EXACT_NAME\"` where EXACT_NAME is the zone string from the list. Copy the zone name character-for-character including uppercase.",
+            "## Guardrails After Design",
+            f"Write exactly one complete 1920x1080 HTML slide to `{html_path.relative_to(task_dir)}`.",
+            f"Include this exact marker in the HTML `<head>`: `{required_marker}`.",
+            "Do not read any other files. Do not use memory, old drafts, source PDFs, analysis files, or compact packets.",
+            "Keep all visible content editable HTML/CSS: real text, divs, tables, CSS boxes, and native data-chart blocks only. No SVG, canvas, CSS background-image, or whole-slide screenshot background.",
+            "Use the final prompt's information density. Do not omit bullets, metrics, stage chips, rows, evidence, or commentary to make layout easier.",
+            "Use the reference-style consulting visual language within the locked system palette: dominant white surfaces, black title/body, thin grey/blue rules, compact tables, and only small/narrow blue emphasis. Do not create large pale-blue panels, full-width blue washes, or equal-width blue nav buttons.",
+            "Area budget: white/near-white >=80% of slide; pale-blue fills <=12%; deep-blue fills <=8%. Normal sections/cards/panels/tables/chart containers are white by default.",
+            "Build a consulting report exhibit, not a UI dashboard: prefer tables, matrices, scorecards, charts, process lanes, value chains, and annotated evidence blocks over equal rounded card grids.",
+            "Keep deck chrome stable: top nav, title rule, page number, source, and takeaway style must be consistent; only the active nav state changes.",
+            "Reserve a bottom safe area for takeaway/source. No card, table, chart, label, connector, or flow element may overlap or be clipped by the bottom strip.",
+            "Use CSS grid/flex for main layout. Avoid absolute positioning for content; absolute is allowed only for fixed chrome such as nav or slide background accents.",
+            "Every required zone below must appear once as `data-paopao-zone=\"EXACT_NAME\"`:",
             "ZONES: " + json.dumps(zone_contract.get("zones", []), ensure_ascii=False),
-            "The nav bar element (`data-paopao-zone=\"nav\"`) MUST contain visible navigation text — never leave it empty. Use the section labels below.",
+            "The nav bar element (`data-paopao-zone=\"nav\"`) must contain visible navigation labels:",
             "NAV_LABELS: " + json.dumps(nav_labels, ensure_ascii=False),
             f"ACTIVE_SLIDE: {idx} / {expected}",
-            "---",
-            "## Output Contract (renderer requirements)",
-            compact_renderer_guide_text(read_text(SYSTEM_PROMPT)),
-            "---",
-            "## Slide Specification (design brief)",
-            final_prompt_text,
         ])
         agent_prompt_path.write_text(agent_prompt_text, encoding="utf-8")
 
@@ -257,6 +264,309 @@ def _html_manifest_existing(manifest: dict[str, object]) -> dict[int, dict[str, 
             if isinstance(item, dict) and isinstance(item.get("slide"), int):
                 existing[int(item["slide"])] = item
     return existing
+
+
+_ALLOWED_HTML_CHART_TYPES = {"column", "bar", "line", "doughnut", "scatter"}
+_ALLOWED_PAOPAO_COLORS = [
+    "#305496",
+    "#4472C4",
+    "#5B9BD5",
+    "#D9EAF7",
+    "#EAF1F8",
+    "#B4C7E7",
+    "#FFFFFF",
+    "#1C1917",
+    "#666666",
+]
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    value = color.strip().lstrip("#")
+    if len(value) == 3:
+        value = "".join(ch * 2 for ch in value)
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _nearest_paopao_color(color: str) -> str:
+    rgb = _hex_to_rgb(color)
+    return min(
+        _ALLOWED_PAOPAO_COLORS,
+        key=lambda allowed: sum((a - b) ** 2 for a, b in zip(rgb, _hex_to_rgb(allowed))),
+    )
+
+
+def _normalize_chart_type(value: str) -> str:
+    raw = value.strip().lower().replace("_", "-")
+    if raw in _ALLOWED_HTML_CHART_TYPES:
+        return raw
+    if "line" in raw:
+        return "line"
+    if "scatter" in raw or "bubble" in raw:
+        return "scatter"
+    if "doughnut" in raw or "donut" in raw or "pie" in raw:
+        return "doughnut"
+    if "column" in raw:
+        return "column"
+    return "bar"
+
+
+def _reference_nav_labels(task_dir: Path, expected: int) -> list[str]:
+    story_path = task_dir / "analysis" / "slide_story.json"
+    labels: list[str] = []
+    try:
+        story = json.loads(read_text(story_path)) if story_path.exists() else {}
+    except Exception:
+        story = {}
+    raw_slides = story.get("slides") if isinstance(story, dict) else None
+    if isinstance(raw_slides, list):
+        by_slide = {
+            int(item.get("slide")): str(item.get("section_name") or "").strip()
+            for item in raw_slides
+            if isinstance(item, dict) and isinstance(item.get("slide"), int)
+        }
+        labels = [by_slide.get(pos, "") for pos in range(1, expected + 1)]
+    return [label or f"Section {pos}" for pos, label in enumerate(labels or [], 1)] or [
+        f"Section {pos}" for pos in range(1, expected + 1)
+    ]
+
+
+def _reference_nav_html(task_dir: Path, idx: int, expected: int) -> str:
+    labels = _reference_nav_labels(task_dir, expected)
+    items = []
+    for pos, label in enumerate(labels, 1):
+        active = ' class="active"' if pos == idx else ""
+        items.append(
+            f'<span{active}><b>{pos:02d}</b><em>{escape(label)}</em></span>'
+        )
+    return (
+        '<div class="paopao-reference-nav-slot" data-paopao-zone="nav">'
+        '<nav class="paopao-reference-nav">' + "".join(items) + "</nav>"
+        "</div>"
+    )
+
+
+def _reference_nav_css() -> str:
+    return """
+
+/* PAOPAO_REFERENCE_NAV_START */
+/* Based on the supplied consulting decks. The page header is a system component. */
+.slide {
+  position: relative !important;
+}
+.paopao-reference-nav-slot {
+  height: 38px !important;
+  min-height: 38px !important;
+  width: 100% !important;
+  display: block !important;
+  padding: 0 !important;
+  margin: 0 0 10px 0 !important;
+  background: transparent !important;
+  border: 0 !important;
+}
+.paopao-reference-nav {
+  position: relative !important;
+  height: 38px !important;
+  min-height: 38px !important;
+  width: 100% !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 18px !important;
+  padding: 0 18px !important;
+  margin: 0 !important;
+  background: #305496 !important;
+  color: #FFFFFF !important;
+  border: 0 !important;
+  font-family: Arial, Helvetica, sans-serif !important;
+  font-size: 16px !important;
+  line-height: 1.05 !important;
+  font-weight: 700 !important;
+  letter-spacing: 0 !important;
+}
+.paopao-reference-nav span {
+  height: 38px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 7px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  background: transparent !important;
+  color: rgba(255,255,255,.68) !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  max-width: none !important;
+}
+.paopao-reference-nav span:not(:last-child)::after {
+  content: "·" !important;
+  margin-left: 18px !important;
+  color: rgba(255,255,255,.45) !important;
+}
+.paopao-reference-nav b {
+  font-style: normal !important;
+  font-size: 16px !important;
+  font-weight: 800 !important;
+  flex: 0 0 auto !important;
+}
+.paopao-reference-nav em {
+  font-style: normal !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  min-width: 0 !important;
+}
+.paopao-reference-nav span.active {
+  background: transparent !important;
+  color: #FFFFFF !important;
+  font-weight: 900 !important;
+  border-bottom: 3px solid #FFFFFF !important;
+}
+.paopao-reference-nav span.active b,
+.paopao-reference-nav span.active em {
+  color: #FFFFFF !important;
+}
+.paopao-reference-nav span:not(.active) b {
+  color: rgba(255,255,255,.82) !important;
+}
+/* PAOPAO_REFERENCE_NAV_END */
+"""
+
+
+def _replace_first_nav_zone_html(text: str, nav_html: str) -> tuple[str, bool]:
+    open_match = re.search(
+        r"<(?P<tag>nav|div|section|header)\b(?P<attrs>[^>]*)\bdata-paopao-zone\s*=\s*['\"]nav['\"][^>]*>",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not open_match:
+        return text, False
+    tag = open_match.group("tag")
+    pattern = re.compile(rf"</?{re.escape(tag)}\b[^>]*>", flags=re.IGNORECASE | re.DOTALL)
+    depth = 0
+    for match in pattern.finditer(text, open_match.start()):
+        token = match.group(0)
+        if token.startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return text[:open_match.start()] + nav_html + text[match.end():], True
+        else:
+            depth += 1
+    return text, False
+
+
+def _inject_reference_nav(task_dir: Path, text: str, idx: int, expected: int) -> str:
+    nav_html = _reference_nav_html(task_dir, idx, expected)
+    text = re.sub(
+        r"\s*/\*\s*PAOPAO_REFERENCE_NAV_START\s*\*/.*?/\*\s*PAOPAO_REFERENCE_NAV_END\s*\*/",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"\s*/\*\s*Paopao reference chrome:.*?\.paopao-reference-nav span\.active\s*\{.*?\}\s*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"\s*/\*\s*Based on the supplied consulting decks\..*?/\*\s*PAOPAO_REFERENCE_NAV_END\s*\*/",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text, replaced_nav = _replace_first_nav_zone_html(text, nav_html)
+    if not replaced_nav:
+        text = re.sub(r"(<body\b[^>]*>)", r"\1\n" + nav_html, text, count=1, flags=re.IGNORECASE)
+
+    style_vars = f"--paopao-slide-count: {max(1, expected)};"
+    text = re.sub(
+        r"(<(?:main|div|section)\b[^>]*\bclass\s*=\s*['\"][^'\"]*\bslide\b[^'\"]*['\"][^>]*style\s*=\s*['\"])([^'\"]*)(['\"])",
+        lambda m: m.group(1) + m.group(2).rstrip("; ") + "; " + style_vars + m.group(3),
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if "--paopao-slide-count" not in text:
+        text = re.sub(
+            r"(<(?:main|div|section)\b[^>]*\bclass\s*=\s*['\"][^'\"]*\bslide\b[^'\"]*['\"])",
+            r'\1 style="' + escape(style_vars, quote=True) + '"',
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    css = _reference_nav_css()
+    if ".paopao-reference-nav" not in text:
+        if re.search(r"</style>", text, flags=re.IGNORECASE):
+            text = re.sub(r"</style>", css + "\n</style>", text, count=1, flags=re.IGNORECASE)
+        else:
+            text = re.sub(r"</head>", "<style>" + css + "</style>\n</head>", text, count=1, flags=re.IGNORECASE)
+    return text
+
+
+def _normalize_html_for_register(task_dir: Path, idx: int, html_path: Path, required_marker: str) -> bool:
+    text = read_text(html_path)
+    original = text
+    expected = expected_pages_from_task(task_dir) or idx
+
+    text = re.sub(
+        rf"\s*<meta\s+name\s*=\s*['\"]{re.escape(HTML_PROMPT_PACKET_META)}['\"]\s+content\s*=\s*['\"][^'\"]*['\"]\s*/?>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if required_marker not in text:
+        if re.search(r"<head\b[^>]*>", text, flags=re.IGNORECASE):
+            text = re.sub(r"(<head\b[^>]*>)", r"\1\n  " + required_marker, text, count=1, flags=re.IGNORECASE)
+        else:
+            text = re.sub(r"(<html\b[^>]*>)", r"\1\n<head>\n  " + required_marker + "\n</head>", text, count=1, flags=re.IGNORECASE)
+
+    def color_repl(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        normalized = raw.upper()
+        if len(normalized) == 4:
+            normalized = "#" + "".join(ch * 2 for ch in normalized[1:])
+        if normalized in _ALLOWED_PAOPAO_COLORS:
+            return normalized
+        return _nearest_paopao_color(normalized)
+
+    text = re.sub(r"#[0-9A-Fa-f]{3,6}\b", color_repl, text)
+
+    language = str(read_task_manifest(task_dir).get("language", "") or "").lower()
+    if any(token in language for token in ["中文", "汉语", "chinese", "mandarin", "zh", "cn"]):
+        replacements = {
+            "Key takeaway:": "关键结论：",
+            "Key Takeaway:": "关键结论：",
+            "key takeaway:": "关键结论：",
+            "Source:": "来源：",
+            "source:": "来源：",
+            "Situation": "现状",
+            "Complication": "矛盾",
+            "Resolution": "行动",
+            "Executive summary": "执行摘要",
+            "Agenda": "目录",
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+
+    def chart_repl(match: re.Match[str]) -> str:
+        quote = match.group("quote")
+        normalized = _normalize_chart_type(match.group("value"))
+        return f"data-chart={quote}{normalized}{quote}"
+
+    text = re.sub(
+        r"data-chart\s*=\s*(?P<quote>['\"])(?P<value>[^'\"]+)(?P=quote)",
+        chart_repl,
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = _inject_reference_nav(task_dir, text, idx, expected)
+
+    if text != original:
+        html_path.write_text(text, encoding="utf-8")
+        return True
+    return False
 
 
 def _cmd_register_html_impl(ctx: object, args: object) -> int:
@@ -309,6 +619,7 @@ def _cmd_register_html_impl(ctx: object, args: object) -> int:
             HTML_GENERATION_SOURCE,
         ]))
         required_marker = f'<meta name="{HTML_PROMPT_PACKET_META}" content="{prompt_packet_id}">'
+        _normalize_html_for_register(task_dir, idx, html_path, required_marker)
         html_text = read_text(html_path)
         if required_marker not in html_text:
             raise SystemExit(f"html/slide{idx:02d}.html missing required prompt packet marker: {required_marker}")
@@ -402,7 +713,10 @@ def compact_renderer_guide_text(system_prompt_text: str = "") -> str:
         "5. No whole-slide image or screenshot background. No inline SVG, canvas, CSS background-image, or unmarked <img>.",
         "6. Keep takeaway and source visible; no content may overlap or be clipped.",
         "7. Reserve a clear bottom safe area for takeaway/source. Main content must end above the takeaway region.",
-        "8. Do not default to blue-filled cards or panels. Use white/near-white as normal fills; use blue fills only when the final prompt intentionally asks for a filled band, chevron, highlight, or semantic emphasis.",
+        "8. Follow the reference-style area budget: white/near-white surfaces >=80% of slide area; pale-blue fills (#D9EAF7/#EAF1F8) <=12%; deep-blue fills (#305496/#4472C4) <=8%.",
+        "9. Do not default to blue-filled cards or panels. Normal modules, tables, charts, and cards are white; pale-blue is only for table headers, one selected row, one focus callout, or a template-required grouped object. Deep-blue is only for narrow emphasis.",
+        "10. Prefer consulting report exhibits: tables, matrices, scorecards, charts, process lanes, value chains, and annotated evidence blocks. Avoid UI-dashboard card grids unless explicitly requested.",
+        "11. Nav must be a thin directory row or breadcrumb, not equal-width blue buttons. Takeaway must be slim, not a large banner. Deck chrome must be stable across slides.",
         "",
         "## Semantic Markers",
         "",

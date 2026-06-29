@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-_CTX_NAMES = ['Path', 'json', 're', 'is_html_source_only_task', 'check_html_source_analysis_files', 'check_analysis_files', 'check_image2_files', 'post_image_memory_boundary_issues', 'check_render_path_profile', 'commercial_render_path', 'check_pptx_file', 'check_commercial_render_contract', 'check_pipeline_contract', 'check_delivery_files', 'expected_pages_from_task', 'task_pipeline_mode', 'final_delivery_pass_path', 'check_html_files', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'check_render_manifest', 'commercial_render_contract_path', 'IMAGE2_SOURCE_OF_TRUTH', 'DELIVERY_REVIEW_ACCEPTED_STATUSES', 'paopao_auth']
+_CTX_NAMES = ['Path', 'json', 're', 'is_html_source_only_task', 'check_html_source_analysis_files', 'check_direct_pptx_analysis_files', 'check_analysis_files', 'check_image2_files', 'post_image_memory_boundary_issues', 'check_render_path_profile', 'commercial_render_path', 'check_pptx_file', 'check_commercial_render_contract', 'check_pipeline_contract', 'check_delivery_files', 'expected_pages_from_task', 'task_pipeline_mode', 'final_delivery_pass_path', 'check_html_files', 'HTML_BROWSER_SOURCE_OF_TRUTH', 'check_render_manifest', 'commercial_render_contract_path', 'IMAGE2_SOURCE_OF_TRUTH', 'DELIVERY_REVIEW_ACCEPTED_STATUSES', 'paopao_auth']
 
 
 def _bind(ctx: object) -> None:
@@ -15,6 +15,14 @@ def _bind(ctx: object) -> None:
         if name in {"Path", "json", "re"}:
             continue
         globals()[name] = getattr(ctx, name)
+
+
+def _task_language(task_dir: Path) -> str:
+    try:
+        data = json.loads((task_dir / "paopao_task.json").read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    return str(data.get("language", "") or "").strip() or "the requested output language"
 
 
 def _task_stage_issues_impl(
@@ -31,6 +39,8 @@ def _task_stage_issues_impl(
     if stage == "analysis":
         if html_source_only:
             check_html_source_analysis_files(task_dir, expected, issues)
+        elif task_pipeline_mode(task_dir) == "direct_pptx":
+            check_direct_pptx_analysis_files(task_dir, expected, issues)
         else:
             check_analysis_files(task_dir, expected, issues)
     elif stage == "image2":
@@ -95,7 +105,25 @@ def _task_controller_status_impl(
     pptx: Path | None = None,
 ) -> dict[str, object]:
     _bind(ctx)
-    if is_html_source_only_task(task_dir):
+    if task_pipeline_mode(task_dir) == "direct_pptx":
+        stages = [
+            {
+                "id": "analysis",
+                "label": "Analysis and full-prompt selection",
+                "next_action": "Read the source, form the editorial storyline, run plan-prompts, then write the prompt selection audit. Direct PPTX uses selected full local prompt templates; do not run fill-prompt-template. Run check --stage analysis.",
+            },
+            {
+                "id": "pptx",
+                "label": "Direct PPTX structural QA",
+                "next_action": "Run prepare-direct-build-packets, build only from locked packets with deck_frame, then render-pptx-previews. Read every qa/pptx_actual/slide-*.jpg, fix at least one review round if needed, and complete qa/powerpoint_review.json with per-slide evidence.",
+            },
+            {
+                "id": "delivery",
+                "label": "Final delivery",
+                "next_action": "Run finalize-delivery after the direct PPTX structural checks pass.",
+            },
+        ]
+    elif is_html_source_only_task(task_dir):
         stages = [
             {
                 "id": "analysis",
@@ -122,8 +150,8 @@ def _task_controller_status_impl(
         stages = [
         {
             "id": "analysis",
-            "label": "Analysis and slide story",
-            "next_action": "Complete analysis_report.md, slide_story.json, prompt_selection_plan.json, final_prompt_XX.md, then run check --stage analysis.",
+            "label": "Analysis, prompt selection, and final prompts",
+            "next_action": "Complete analysis_report.md, slide_story.json, prompt_selection_plan.json, prompt_selection_audit.md, and final_prompt_XX.md for each slide; then run check --stage analysis.",
         },
         {
             "id": "image2",
@@ -216,21 +244,119 @@ def _pipeline_step_state_impl(ctx: object, task_dir: Path, expected: int) -> dic
 
     delivery_dir = task_dir / "delivery"
     delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
-    if final_delivery_pass_path(task_dir).exists() and delivery_pptx:
+    if task_pipeline_mode(task_dir) != "direct_pptx" and final_delivery_pass_path(task_dir).exists() and delivery_pptx:
         state["step"] = "finalize"
         state["step_number"] = 99
         state["instruction"] = "All checks passed. Delivery is ready."
+        return state
+
+    if task_pipeline_mode(task_dir) == "direct_pptx":
+        analysis_issues: list[str] = []
+        check_direct_pptx_analysis_files(task_dir, expected, analysis_issues)
+        if analysis_issues:
+            task_language = _task_language(task_dir)
+            state["step"] = "analysis"
+            state["step_number"] = 1
+            state["instruction"] = (
+                "Research + prompt/layout selection boundary: you may read PDF/source files and analysis/evidence_pool.json. "
+                "Downstream build must not reopen PDF/source.\n"
+                f"Language contract: write analysis_report.md, slide_story.json, and prompt_selection_audit.md in {task_language}. The local prompt templates stay as full template prompts.\n"
+                "Produce direct PPTX full-template artifacts:\n"
+                "  0. Run: paopao_run.py extract-evidence-pool --task-dir <dir>\n"
+                "  1. analysis/analysis_report.md — synthesized report and source-backed conclusions\n"
+                "  2. analysis/slide_story.json — one role/brief per slide\n"
+                "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
+                "     This records the selected local full prompt template for each page. Do not fill zones and do not create final_prompt_XX.md.\n"
+                "  4. analysis/prompt_selection_audit.md — brief, source-backed note on the selected full prompt for each page\n"
+                "When done, run: paopao_run.py next --task-dir <dir>"
+            )
+            state["issues"] = analysis_issues
+            return state
+
+        packet_manifest = task_dir / "qa" / "direct_build_prompt_manifest.json"
+        if not packet_manifest.exists():
+            state["step"] = "prepare_direct_build_packets"
+            state["step_number"] = 2
+            state["instruction"] = (
+                "Run: paopao_run.py prepare-direct-build-packets --task-dir <dir>\n"
+                "This locks SYSTEM_PROMPT.md + each selected full local prompt template + analysis context + the deck_frame output contract into "
+                "qa/direct_build_prompt_packets/direct_build_packet_XX.md. "
+                "Build must use those packets as the only page-generation input."
+            )
+            return state
+
+        pptx_dir = task_dir / "pptx"
+        pptx_files = sorted(p for p in pptx_dir.glob("*.pptx") if p.is_file() and not p.name.startswith("~$"))
+        pptx = pptx_files[-1] if pptx_files else pptx_dir / "deck.pptx"
+        if not pptx.exists():
+            state["step"] = "build_direct_pptx"
+            state["step_number"] = 3
+            state["instruction"] = (
+                "Build employee context boundary: read only qa/direct_build_prompt_packets/direct_build_packet_XX.md "
+                "and deck_frame.py. Do not read PDF/source, analysis_report, SYSTEM_PROMPT.md, raw prompt templates, "
+                "old build scripts, HTML, Image2, or prior drafts.\n"
+                "Each packet already contains SYSTEM_PROMPT.md + the selected full prompt template + analysis context + the deck_frame output contract. "
+                "Execute the packet directly. build_deck.py must bind packet hashes from qa/direct_build_prompt_manifest.json. "
+                "Fallback slides must use dense_exhibit_mosaic(); do not hand-build loose equal cards. Sparse slides must add evidence_bar, metric_strip, note_band, native chart/table, or another secondary information layer. "
+                "Save the result to pptx/deck.pptx.\n"
+                "Then run: paopao_run.py render-pptx-previews --task-dir <dir> --pptx pptx/deck.pptx"
+            )
+            return state
+
+        pptx_issues: list[str] = []
+        check_pptx_file(pptx, expected, pptx_issues)
+        if pptx_issues:
+            state["step"] = "pptx_fix"
+            state["step_number"] = 3
+            state["instruction"] = "Fix the direct PPTX structural issues below, then run next again."
+            state["issues"] = pptx_issues
+            return state
+
+        pipeline_issues: list[str] = []
+        pipeline_counts = check_pipeline_contract(task_dir, expected, pptx, pipeline_issues)
+        if pipeline_issues:
+            state["step"] = "powerpoint_review"
+            state["step_number"] = 3
+            state["instruction"] = (
+                "Co work pixel loop is mandatory. Run render-pptx-previews if qa/pptx_actual_manifest.json or slide JPGs are missing/stale. "
+                "Read every qa/pptx_actual/slide-*.jpg, assume defects until checked, and inspect overlap, overflow, safe-band intrusion, spacing, contrast, residual placeholders, and large whitespace. "
+                "Complete at least one revise-and-rerender round if anything is off. Then open the current PPTX in PowerPoint once and complete qa/powerpoint_review.json with "
+                "pixel_review_completed=true, reviewed_all_slides=true, revision_rounds_completed>=1, and concrete per-slide evidence. "
+                "If a slide feels sparse, add proof or secondary information; if crowded, trim content or shrink one font step.\n"
+                "Then run: paopao_run.py check --task-dir <dir> --stage pptx --pptx pptx/deck.pptx"
+            )
+            state["issues"] = pipeline_issues
+            state["counts"] = pipeline_counts
+            return state
+
+        delivery_dir = task_dir / "delivery"
+        delivery_pptx = sorted(delivery_dir.glob("*.pptx")) if delivery_dir.exists() else []
+        if delivery_pptx:
+            state["step"] = "finalize"
+            state["step_number"] = 99
+            state["instruction"] = "All checks passed. Delivery is ready."
+            return state
+
+        state["step"] = "finalize"
+        state["step_number"] = 4
+        state["instruction"] = (
+            "Direct PPTX checks passed. Run:\n"
+            "  paopao_run.py finalize-delivery --task-dir <dir> --pptx pptx/deck.pptx"
+        )
         return state
 
     if is_html_source_only_task(task_dir):
         analysis_issues: list[str] = []
         check_html_source_analysis_files(task_dir, expected, analysis_issues)
         if analysis_issues:
+            task_language = _task_language(task_dir)
             state["step"] = "analysis"
             state["step_number"] = 1
             state["instruction"] = (
                 "Analysis employee context boundary: you may read PDF/source files and analysis/evidence_pool.json. "
                 "Downstream employees must not reopen PDF/source.\n"
+                f"Language contract: write analysis_report.md, slide_story.json, prompt_selection_audit.md, every --fills JSON value, and every final_prompt_XX.md in {task_language}. "
+                "If the source is in another language, translate and synthesize during analysis; do not defer translation to HTML or register steps.\n"
                 "Produce Paopao prompt-library artifacts:\n"
                 "  0. Run: paopao_run.py extract-evidence-pool --task-dir <dir>\n"
                 "  1. analysis/analysis_report.md — synthesized report and source-backed conclusions; cite evidence_pool facts where possible\n"
@@ -347,23 +473,18 @@ def _pipeline_step_state_impl(ctx: object, task_dir: Path, expected: int) -> dic
     analysis_issues: list[str] = []
     check_analysis_files(task_dir, expected, analysis_issues)
     if analysis_issues:
+        task_language = _task_language(task_dir)
         state["step"] = "analysis"
         state["step_number"] = 1
         state["instruction"] = (
             "Read source materials and produce:\n"
+            f"  0. Language contract: write analysis_report.md, slide_story.json, prompt_selection_audit.md, every --fills JSON value, and every final_prompt_XX.md in {task_language}. Translate source material during analysis; do not defer translation downstream.\n"
             "  1. analysis/analysis_report.md — key data with sources\n"
             "  2. analysis/slide_story.json — arc + per-page conclusions\n"
             "  3. Run: paopao_run.py plan-prompts --task-dir <dir>\n"
-            "     This selects a prompt template for each page and outputs fill_zones for each.\n"
-            "  4. For EACH page, read that page's fill_zones from prompt_selection_plan.json.\n"
-            "     Each zone has a name and instructions describing what data to fill.\n"
-            "     Extract matching data from analysis_report.md for EVERY zone — not just TITLE.\n"
-            "     Then run:\n"
-            "     paopao_run.py fill-prompt-template --template <selected_template.md> "
-            "--fills '<zone JSON>' --output analysis/final_prompt_XX.md\n"
-            "     The --fills JSON must include ALL zones listed in fill_zones.\n"
-            "     Do NOT write final_prompt_XX.md by hand.\n"
-            "  5. analysis/prompt_selection_audit.md\n"
+            "     This selects a prompt/layout template for each page and records visual grammar.\n"
+            "  4. For EACH page, read that page's fill_zones from prompt_selection_plan.json and run fill-prompt-template to write analysis/final_prompt_XX.md.\n"
+            "  5. analysis/prompt_selection_audit.md — why each prompt/layout was selected\n"
             "When done, run: paopao_run.py next --task-dir <dir>"
         )
         state["issues"] = analysis_issues

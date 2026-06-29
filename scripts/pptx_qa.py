@@ -2,7 +2,7 @@
 pptx_qa.py — Post-render PPTX inspection.
 
 Catches mechanical bugs that escape composer + render:
-  - Shape with opaque fill covering chart/table (z-order bug, Jenny 2026-05-04 slide 4 donut)
+  - Shape with opaque fill covering chart/table (z-order bug, 2026-05-04 slide 4 donut)
   - Shape extending past canvas (1920×1080 / 13.33"×7.5")
   - Shape extending into the detected bottom takeaway band
   - Chart with 0 dimension or invalid data

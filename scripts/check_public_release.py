@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if private Paopao assets are present in the public plugin."""
+"""Fail if private Paopao assets are present in the public plugin shell."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ ALLOWED_TRACKED = {
     ".gitignore",
     "CLAUDE.md",
     "README.md",
+    "prompts/INDEX.md",
     "scripts/check_public_release.py",
     "scripts/paopao_auth.py",
     "scripts/paopao_lab.py",
@@ -29,11 +30,11 @@ ALLOWED_TRACKED = {
     "scripts/pptx_qa.py",
     "scripts/renderer.py",
     "skills/paopao-ppt/SKILL.md",
-    "prompts/INDEX.md",
     ".github/workflows/public-release-guard.yml",
 }
 
 FORBIDDEN_PATTERNS = [
+    "auth_server/**",
     "docs/**",
     "memory/**",
     "output/**",
@@ -43,6 +44,11 @@ FORBIDDEN_PATTERNS = [
     "image2/**",
     "html/**",
     "spec/**",
+    "reference/**",
+    "scripts/deck_frame.py",
+    "scripts/issue_paopao_license.py",
+    "scripts/update_paopao_license.py",
+    "prompts/*.md",
     "**/__pycache__/**",
     "**/*.pyc",
     "**/*.pyo",
@@ -66,7 +72,20 @@ FORBIDDEN_TEXT = [
     "SPARK_DATA_DIR",
     "SPARK_PRESERVED_ASSET",
     "SPARK_CHROMIUM_EXECUTABLE",
+    "PAGE_RENDERER_ARCHETYPES",
+    "ACTIVE_REFERENCE_BOUND_LAYOUTS",
+    "NATIVE_COMPONENT_VARIANTS",
+    "IMAGE_DERIVED_NATIVE_MOLD_SOURCES",
+    "DELETED_LAYOUT_FAMILIES",
+    "render_ref_",
+    "render_user_reference_",
+    "reference:output/",
+    "user_supplied_references",
 ]
+
+TEXT_EXEMPTIONS = {
+    "scripts/check_public_release.py",
+}
 
 
 def rel(path: Path) -> str:
@@ -74,6 +93,8 @@ def rel(path: Path) -> str:
 
 
 def matches_forbidden(path: str) -> str | None:
+    if path == "prompts/INDEX.md":
+        return None
     for pattern in FORBIDDEN_PATTERNS:
         if fnmatch.fnmatch(path, pattern):
             return pattern
@@ -97,25 +118,8 @@ def all_worktree_files() -> list[str]:
 
 
 def text_issues(path: str) -> list[str]:
-    if path == "scripts/check_public_release.py":
+    if path in TEXT_EXEMPTIONS:
         return []
-    if path in {
-        "CLAUDE.md",
-        "scripts/paopao_run.py",
-        "scripts/pptx_qa.py",
-        "prompts/SYSTEM_PROMPT.md",
-        "skills/paopao-ppt/SKILL.md",
-    }:
-        text_forbidden = [
-            "paopao-internal",
-            "/Users/jennytang",
-            "SparkDeck",
-            "SPARK_DATA_DIR",
-            "SPARK_PRESERVED_ASSET",
-            "SPARK_CHROMIUM_EXECUTABLE",
-        ]
-    else:
-        text_forbidden = FORBIDDEN_TEXT
     full = ROOT / path
     if full.suffix.lower() not in {".md", ".py", ".json", ".yml", ".yaml", ".txt"}:
         return []
@@ -123,8 +127,8 @@ def text_issues(path: str) -> list[str]:
         text = full.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return [f"{path}: non-text bytes in a text-like file"]
-    issues = []
-    for needle in text_forbidden:
+    issues: list[str] = []
+    for needle in FORBIDDEN_TEXT:
         if needle in text:
             issues.append(f"{path}: contains forbidden internal marker {needle!r}")
     return issues
@@ -145,8 +149,7 @@ def main() -> int:
     renderer = ROOT / "scripts" / "renderer.py"
     if renderer.exists() and renderer.stat().st_size > 5000:
         issues.append(
-            f"scripts/renderer.py is {renderer.stat().st_size} bytes — looks like the full engine, not the bootstrap stub. "
-            "Only the thin bootstrap (<5KB) is allowed in the public repo."
+            f"scripts/renderer.py is {renderer.stat().st_size} bytes; only a thin public bootstrap is allowed."
         )
 
     for path in all_worktree_files():

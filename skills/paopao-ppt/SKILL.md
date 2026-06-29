@@ -7,7 +7,7 @@ description: "Use Paopao to turn PDFs, reports, papers, and reference images int
 
 Paopao creates editable PowerPoint decks from source documents.
 
-Default production path: source material -> analysis -> HTML slide source -> editable PPTX -> one-pass structural delivery gate.
+Default production path: source material -> evidence pool -> editorial judgment -> prompt/layout selection (plan-prompts) -> locked `direct_build_packet_XX.md` -> `build_deck.py` (reads packets + imports `deck_frame.py`) -> editable PPTX -> rendered slide images -> Co work pixel review -> delivery.
 
 ## Setup
 
@@ -60,55 +60,61 @@ python3 <plugin-root>/scripts/paopao_run.py make-deck \
   --focus "<focus>"
 ```
 
-### 2. Run `next` in a loop
+### 2. Run `next` after each completed step
 
 ```bash
 python3 <plugin-root>/scripts/paopao_run.py next --task-dir output/<task-name>
 ```
 
-Each `next` call returns one task. Complete it, then call `next` again. Repeat until `step` is `"finalize"`.
+Each `next` call returns the current required step. Complete that step, then call `next` again until `step` is `"finalize"`.
 
 ## Pipeline Steps
 
-1. `analysis` — read sources and produce the required analysis artifacts.
-2. `html` — for each page, run `generate-html`, create the requested `html/slideXX.html`, then run `register-html`.
-3. `render` — convert the registered HTML into editable PPTX, then record the render contract.
-4. `finalize` — run the structural/render delivery gate and package the deliverable.
+1. `analysis` — read sources, extract evidence, and produce the editorial judgment. This is where the deck storyline is formed; do not summarize page-by-page by default.
+2. `prompt_selection` — run `plan-prompts` to record one full local prompt template for each slide. The default selector is neutral catalog order: no role-fit preference, no suitability tags, no diversity penalty. This step stays in direct PPTX; it does not mean generating HTML.
+3. `direct_build_packets` — run `prepare-direct-build-packets` to lock `SYSTEM_PROMPT.md + selected full local prompt template + analysis context + deck_frame contract` into `qa/direct_build_prompt_packets/direct_build_packet_XX.md`.
+4. `build` — read only the locked direct build packets and `deck_frame.py`. Write one `build_deck.py` script that imports `deck_frame.py`.
+5. `pixel_qa` — run `render-pptx-previews` to create `qa/pptx_actual/slide-*.jpg`; read every image, fix visible layout defects, rerender, then open the real PPTX and record per-slide evidence in `qa/powerpoint_review.json`.
+6. `finalize` — deliver the editable PPTX. Do not expose internal scripts, QA images, or analysis artifacts unless the user asks.
 
-## How to Write HTML
+## How to Build PPTX
 
-Use the default high-quality page inputs:
+Read `<plugin-root>/reference/direct_pptx_guide.md` before writing the build script.
+
+Before writing code, run `prepare-direct-build-packets` and confirm that `qa/direct_build_prompt_manifest.json` and every `qa/direct_build_prompt_packets/direct_build_packet_XX.md` exist. Each slide is built from the locked packet.
+
+The build script must:
+
+- Import `deck_frame.py` and use `new_deck()`, `new_slide()`, `chrome()`, `box()`, `txt()`, `panel()`, `add_table()`, `add_chart()`, `add_flow()`, `metric_strip()`, `evidence_bar()`, and `note_band()` where appropriate.
+- For each slide, read `direct_build_packet_XX.md` and execute it. Do not read `SYSTEM_PROMPT.md`, source files, analysis files, raw templates, or prior build drafts during build.
+- Bind packet hashes from `qa/direct_build_prompt_manifest.json`; checks fail if this manifest is missing, stale, or the build script reads forbidden inputs.
+- Use the framework region calculators: `main_region()`, `split_lr()`, `equal_rows()`, `equal_cols()`, and `grid()`. Do not hand-place repeated blocks.
+- Keep business content inside the main band only. The nav/title/safe bands are owned by `chrome()`.
+- Use native PPT objects. Charts must be native PowerPoint charts, which automatically embed editable Excel workbook data.
+- Treat the goal function as hard: content must fill the fixed canvas, not more and not less. Large whitespace, thin content, and overflow are all failures. Fallback layouts must use `dense_exhibit_mosaic()` rather than loose equal cards; sparse slides need proof, examples, metric strips, note bands, or another secondary information layer before QA.
+- Treat richness as argument structure, not decoration. Prefer chart + implication, SCR + forecast table, driver tree, matrix, bridge, value chain, ranked table, or diagnostic-to-action mapping. Use bordered exhibit containers with headers, dividers, charts/tables, and evidence rows; white fill is substrate, not empty space. Avoid shadows, rounded candy cards, broad pale-blue panel fills, oversized number bubbles, and artistic arrows unless the source/reference explicitly requires them.
+- Co work pixel loop is mandatory: code success is not layout success. The actual PPTX must be rendered to images before delivery, and every review must be backed by reading those rendered images with concrete per-slide evidence.
+
+QA command pattern:
 
 ```bash
-python3 <plugin-root>/scripts/paopao_run.py generate-html --task-dir output/<task-name> --slide <N>
+python3 <plugin-root>/scripts/paopao_run.py check \
+  --task-dir output/<task-name> \
+  --stage pptx \
+  --pptx output/<task-name>/pptx/deck.pptx
+python3 <plugin-root>/scripts/paopao_run.py render-pptx-previews \
+  --task-dir output/<task-name> \
+  --pptx output/<task-name>/pptx/deck.pptx
+open output/<task-name>/pptx/deck.pptx
 ```
 
-After `generate-html`, generate the requested `html/slideXX.html` from:
+After `render-pptx-previews`, read every `qa/pptx_actual/slide-*.jpg`. Fix overlap, overflow, safe-band intrusion, low contrast, spacing inconsistency, large whitespace, or placeholders; rerender after fixes. `qa/powerpoint_review.json` must set `pixel_review_completed: true`, `reviewed_all_slides: true`, `revision_rounds_completed >= 1`, and concrete evidence for each slide. Fix by trimming/expanding content or adjusting font scale, not by endless coordinate tweaks.
 
-1. `analysis/final_prompt_XX.md`
-2. `qa/html_generation_requests/renderer_compact_guide.md`
+## Legacy HTML Path
 
-Include the exact required marker returned by `generate-html`, then register the HTML before rendering:
+Only use HTML when the user explicitly asks for HTML output, browser preview, or a legacy HTML-source workflow.
 
-```bash
-python3 <plugin-root>/scripts/paopao_run.py register-html --task-dir output/<task-name> --slide <N>
-```
-
-Treat the final prompt as the design brief. The compact guide is only the editable-PPTX output contract, not a design guide. Do not improvise from memory, do not skip registration, and do not reopen PDF/source, `analysis_report.md`, `SYSTEM_PROMPT.md`, full `SKILL.md`, full renderer guide, previous slides, or old drafts.
-
-The compact guide includes minimal semantic markers such as `data-paopao-component`. These labels help the renderer identify intent; they are not a design system, layout template, or reason to simplify the slide.
-
-### Token-efficient HTML generation
-
-For each slide, spawn a separate Agent to keep the context clean. The agent reads only two files:
-1. `analysis/final_prompt_XX.md`
-2. `qa/html_generation_requests/renderer_compact_guide.md`
-
-The agent acts as an MBB slide designer, writes `html/slideXX.html`, then the **main conversation** runs `register-html`. Editability and Excel-linked charts are output requirements, not a reason to simplify the slide. Do not pass PDF, analysis report, SYSTEM_PROMPT, or previous slides' HTML to the agent.
-
-`html_compact_packet_XX.md` is economy/debug input only. Do not use it on the default high-quality path unless the user explicitly asks for low-token/economy mode.
-
-When `next` returns step `html_source`, it includes a `subagent_prompt` field — use it directly as the Agent prompt.
+If and only if the task is explicitly HTML-based, use `generate-html`, create `html/slideXX.html`, run `register-html`, then render through the legacy renderer. Do not use this path for normal PPTX generation.
 
 ## Confidentiality
 
@@ -125,10 +131,11 @@ When `next` returns step `html_source`, it includes a `subagent_prompt` field �
 
 ## What NOT to Do
 
-- Do NOT hand-author HTML from memory or a self-written prompt. Use only the page work order returned by `generate-html`.
-- Do NOT use `html_compact_packet_XX.md` as the default HTML input; it is an economy/debug fallback. Default quality path uses full `final_prompt_XX.md`.
+- Do NOT use HTML/renderer as the default production path.
+- Do NOT hand-author HTML unless the user explicitly requested the legacy HTML path.
+- Do NOT use `html_compact_packet_XX.md` as the default input; it is an economy/debug fallback for legacy HTML tasks.
 - Do NOT use `compile_object_graph.py` — it has been deleted from the codebase.
-- Do NOT write production `python-pptx` code. Use `renderer.py` only.
+- Do NOT write freehand production `python-pptx` code without `deck_frame.py`.
 - Do NOT generate Image2 unless the user explicitly asks for it.
 - Do NOT use experimental planning or object graph documents.
-- Do NOT redesign during PPTX conversion. Browser-rendered HTML is the reconstruction reference; the default path does not require exporting or inspecting PPTX preview images.
+- Do NOT redesign during build/QA. Locked `direct_build_packet_XX.md` files are the source of truth; the build script only executes them.
