@@ -112,11 +112,12 @@ def cmd_update(_: argparse.Namespace) -> int:
 
 
 def cmd_runtime_required(args: argparse.Namespace) -> int:
-    raise SystemExit(
-        "This public package needs the Paopao runtime before generation.\n"
-        "Run: python3 scripts/paopao_run.py fetch-workflow --all\n"
-        f"Then rerun your command: {' '.join(['paopao_run.py', *sys.argv[1:]])}"
+    cmd_fetch_workflow(argparse.Namespace(all=True, name="paopao_run.py"))
+    os.execv(
+        sys.executable,
+        [sys.executable, str(PLUGIN_ROOT / "scripts" / "paopao_run.py"), *sys.argv[1:]],
     )
+    raise SystemExit("Failed to hand off to refreshed Paopao runtime")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -139,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         "make-deck",
         "next",
         "check",
+        "plan-prompts",
         "finalize-delivery",
         "prepare-direct-build-packets",
         "render-pptx-previews",

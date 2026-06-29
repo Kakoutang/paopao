@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
+WORKFLOW_PROTOCOL_VERSION = "direct-pptx-packets-v1"
 CONFIG_DIR = Path(os.getenv("PAOPAO_CONFIG_DIR", Path.home() / ".paopao"))
 LICENSE_PATH = CONFIG_DIR / "license.json"
 DEFAULT_SERVER_URL = "https://paopao-license-api.onrender.com"
@@ -85,7 +86,11 @@ def auth_token() -> str:
 
 def request_json(method: str, url: str, payload: dict[str, Any] | None = None, token: str = "") -> dict[str, Any]:
     data = None
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Paopao-Plugin-Version": PLUGIN_VERSION,
+        "X-Paopao-Workflow-Protocol": WORKFLOW_PROTOCOL_VERSION,
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if payload is not None:
