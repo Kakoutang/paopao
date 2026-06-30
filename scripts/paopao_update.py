@@ -28,6 +28,7 @@ MANAGED_FILES = PUBLIC_SHELL_FILES
 AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 WORKFLOW_DESTINATIONS = {name: ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
 BUNDLE_CHUNK_SIZE = 80
+OPTIONAL_WORKFLOW_FILES = {"paopao_delivery_safety.py"}
 
 
 def ssl_context() -> ssl.SSLContext:
@@ -74,6 +75,11 @@ def fetch(path: str, ref: str) -> bytes:
         return resp.read()
 
 
+def workflow_file_missing(exc: Exception) -> bool:
+    text = str(exc)
+    return "HTTP 404" in text and "Workflow file not found" in text
+
+
 def fetch_authorized_runtime(*, full_library: bool = False) -> tuple[list[str], str, int]:
     try:
         import paopao_auth
@@ -97,7 +103,20 @@ def fetch_authorized_runtime(*, full_library: bool = False) -> tuple[list[str], 
     written: list[str] = []
     try:
         for start in range(0, len(names), BUNDLE_CHUNK_SIZE):
-            result = paopao_auth.fetch_workflow_bundle(names[start:start + BUNDLE_CHUNK_SIZE])
+            chunk = names[start:start + BUNDLE_CHUNK_SIZE]
+            try:
+                result = paopao_auth.fetch_workflow_bundle(chunk)
+            except Exception as exc:
+                if not workflow_file_missing(exc):
+                    raise
+                result = {"files": []}
+                for name in chunk:
+                    try:
+                        result["files"].append(paopao_auth.fetch_workflow_file(name))
+                    except Exception as file_exc:
+                        if name in OPTIONAL_WORKFLOW_FILES and workflow_file_missing(file_exc):
+                            continue
+                        raise
             for item in result.get("files", []):
                 name = str(item.get("name", "")).strip()
                 content = str(item.get("content", "")).strip()

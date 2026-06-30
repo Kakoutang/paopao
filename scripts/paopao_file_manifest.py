@@ -19,6 +19,7 @@ PUBLIC_SHELL_FILES = [
 
 AUTHORIZED_RUNTIME_FILES = [
     "paopao_run.py",
+    "paopao_delivery_safety.py",
     "paopao_delivery_commands.py",
     "paopao_pipeline_state.py",
     "SKILL.md",
@@ -30,6 +31,7 @@ AUTHORIZED_RUNTIME_FILES = [
 
 WORKFLOW_DESTINATION_RELS = {
     "paopao_run.py": "scripts/paopao_run.py",
+    "paopao_delivery_safety.py": "scripts/paopao_delivery_safety.py",
     "paopao_delivery_commands.py": "scripts/paopao_delivery_commands.py",
     "paopao_pipeline_state.py": "scripts/paopao_pipeline_state.py",
     "SKILL.md": "skills/paopao-ppt/SKILL.md",

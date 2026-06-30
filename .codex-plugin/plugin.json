@@ -1,6 +1,6 @@
 {
   "name": "paopao",
-  "version": "0.2.1+codex.20260619110000",
+  "version": "0.3.1+codex.20260630090000",
   "description": "paopao: generate editable consulting-style PPTX decks from PDFs, reports, papers, and reference materials.",
   "author": {
     "name": "Paopao"

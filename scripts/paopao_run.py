@@ -19,6 +19,7 @@ from paopao_file_manifest import AUTHORIZED_RUNTIME_FILES, WORKFLOW_DESTINATION_
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 BUNDLE_CHUNK_SIZE = 80
+OPTIONAL_WORKFLOW_FILES = {"paopao_delivery_safety.py"}
 
 
 def _load_sibling(name: str):
@@ -43,6 +44,11 @@ def fetch_workflow_file(name: str, destination: Path) -> None:
     destination.write_text(content + "\n", encoding="utf-8")
 
 
+def workflow_file_missing(exc: Exception) -> bool:
+    text = str(exc)
+    return "HTTP 404" in text and "Workflow file not found" in text
+
+
 def fetch_prompt_templates() -> list[str]:
     paopao_auth = _load_sibling("paopao_auth")
     try:
@@ -64,10 +70,20 @@ def fetch_workflow_bundle(names: list[str]) -> list[str]:
     paopao_auth = _load_sibling("paopao_auth")
     written: list[str] = []
     for start in range(0, len(names), BUNDLE_CHUNK_SIZE):
+        chunk = names[start:start + BUNDLE_CHUNK_SIZE]
         try:
-            result = paopao_auth.fetch_workflow_bundle(names[start:start + BUNDLE_CHUNK_SIZE])
+            result = paopao_auth.fetch_workflow_bundle(chunk)
         except paopao_auth.AuthError as exc:
-            raise SystemExit(str(exc)) from exc
+            if not workflow_file_missing(exc):
+                raise SystemExit(str(exc)) from exc
+            result = {"files": []}
+            for name in chunk:
+                try:
+                    result["files"].append(paopao_auth.fetch_workflow_file(name))
+                except paopao_auth.AuthError as file_exc:
+                    if name in OPTIONAL_WORKFLOW_FILES and workflow_file_missing(file_exc):
+                        continue
+                    raise SystemExit(str(file_exc)) from file_exc
         for item in result.get("files", []):
             name = str(item.get("name", "")).strip()
             content = str(item.get("content", "")).strip()
