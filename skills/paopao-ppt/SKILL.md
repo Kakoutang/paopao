@@ -15,7 +15,7 @@ description: "Use Paopao to turn PDFs, reports, papers, and reference images int
 Before starting, update the local workflow files:
 
 ```bash
-python3 <plugin-root>/scripts/paopao_run.py fetch-workflow --all
+python3 <plugin-root>/scripts/paopao_run.py update
 ```
 
 Then follow the refreshed Paopao instructions exactly. If the command fails,

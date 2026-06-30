@@ -8,6 +8,7 @@ large directories. It updates only the small managed public runtime files.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import ssl
 import subprocess
@@ -29,6 +30,21 @@ AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
 WORKFLOW_DESTINATIONS = {name: ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
 BUNDLE_CHUNK_SIZE = 80
 OPTIONAL_WORKFLOW_FILES = {"paopao_delivery_safety.py"}
+
+
+def current_workflow_manifest() -> tuple[list[str], dict[str, Path]]:
+    """Return the latest authorized runtime list after public files refresh."""
+    try:
+        manifest = importlib.import_module("paopao_file_manifest")
+        manifest = importlib.reload(manifest)
+        names = list(getattr(manifest, "AUTHORIZED_RUNTIME_FILES"))
+        destinations = {
+            str(name): ROOT / str(rel)
+            for name, rel in getattr(manifest, "WORKFLOW_DESTINATION_RELS").items()
+        }
+        return names, destinations
+    except Exception:
+        return list(AUTHORIZED_WORKFLOW_FILES), dict(WORKFLOW_DESTINATIONS)
 
 
 def ssl_context() -> ssl.SSLContext:
@@ -85,7 +101,7 @@ def fetch_authorized_runtime(*, full_library: bool = False) -> tuple[list[str], 
         import paopao_auth
     except Exception as exc:
         return [], f"paopao_auth unavailable: {exc}", 0
-    names = list(AUTHORIZED_WORKFLOW_FILES)
+    names, workflow_destinations = current_workflow_manifest()
     skipped_prompts = 0
     try:
         catalog = paopao_auth.fetch_prompt_catalog()
@@ -120,8 +136,8 @@ def fetch_authorized_runtime(*, full_library: bool = False) -> tuple[list[str], 
             for item in result.get("files", []):
                 name = str(item.get("name", "")).strip()
                 content = str(item.get("content", "")).strip()
-                if name in WORKFLOW_DESTINATIONS:
-                    target = WORKFLOW_DESTINATIONS[name]
+                if name in workflow_destinations:
+                    target = workflow_destinations[name]
                 elif name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
                     target = ROOT / "prompts" / name
                 else:

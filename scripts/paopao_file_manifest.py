@@ -22,6 +22,7 @@ AUTHORIZED_RUNTIME_FILES = [
     "paopao_delivery_safety.py",
     "paopao_delivery_commands.py",
     "paopao_pipeline_state.py",
+    "paopao_visibility.py",
     "SKILL.md",
     "SYSTEM_PROMPT.md",
     "direct_pptx_guide.md",
@@ -34,6 +35,7 @@ WORKFLOW_DESTINATION_RELS = {
     "paopao_delivery_safety.py": "scripts/paopao_delivery_safety.py",
     "paopao_delivery_commands.py": "scripts/paopao_delivery_commands.py",
     "paopao_pipeline_state.py": "scripts/paopao_pipeline_state.py",
+    "paopao_visibility.py": "scripts/paopao_visibility.py",
     "SKILL.md": "skills/paopao-ppt/SKILL.md",
     "SYSTEM_PROMPT.md": "prompts/SYSTEM_PROMPT.md",
     "direct_pptx_guide.md": "reference/direct_pptx_guide.md",
@@ -63,7 +65,7 @@ description: "Use Paopao to turn PDFs, reports, papers, and reference images int
 Before starting, update the local workflow files:
 
 ```bash
-python3 <plugin-root>/scripts/paopao_run.py fetch-workflow --all
+python3 <plugin-root>/scripts/paopao_run.py update
 ```
 
 Then follow the refreshed Paopao instructions exactly. If the command fails,
