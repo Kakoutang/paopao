@@ -220,7 +220,9 @@ def extract_text_from_source(path_value: str) -> str:
 
 def clip_text(text: str, limit: int) -> str:
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
-    return clean if len(clean) <= limit else clean[:limit - 3].rstrip() + "..."
+    if len(clean) > limit:
+        raise SystemExit("job spec field is too long; ask the local AI to rewrite it shorter before submitting.")
+    return clean
 
 
 def compact_lines(text: str, limit: int = 18, item_limit: int = 112) -> list[str]:
@@ -244,63 +246,7 @@ def _sample_numbers(seed: int, count: int) -> list[float]:
 
 
 def build_job_spec(source_text: str, pages: int, focus: str, language: str) -> dict[str, object]:
-    lines = compact_lines(source_text or focus, limit=max(24, pages * 3))
-    if not lines:
-        lines = [focus or "Paopao direction deck"]
-    spec_pages: list[dict[str, object]] = []
-    for idx in range(1, pages + 1):
-        intent = JOB_SPEC_INTENTS[(idx - 1) % len(JOB_SPEC_INTENTS)]
-        start = (idx - 1) * 2
-        bullets = lines[start:start + 5] or lines[:5]
-        takeaway = clip_text(bullets[0] if bullets else (focus or f"Page {idx} key message"), 170)
-        page: dict[str, object] = {
-            "intent": intent,
-            "title": clip_text(f"Page {idx}: {INTENT_TITLES.get(intent, 'Direction')}", 86),
-            "takeaway": takeaway,
-            "bullets": [clip_text(line, 112) for line in bullets[:5]],
-            "source": "Source: user-provided local material",
-        }
-        if intent == "summary_scr":
-            page["scr"] = {
-                "situation": clip_text(bullets[0] if len(bullets) > 0 else takeaway, 130),
-                "complication": clip_text(bullets[1] if len(bullets) > 1 else takeaway, 130),
-                "resolution": clip_text(bullets[2] if len(bullets) > 2 else takeaway, 130),
-            }
-        if intent == "trend_chart":
-            page["chart"] = {
-                "chart_type": "line",
-                "unit": "index",
-                "categories": ["T1", "T2", "T3", "T4"],
-                "series": [{"name": "Signal", "values": _sample_numbers(idx, 4)}],
-            }
-        if intent == "comparison":
-            page["comparison"] = [
-                {"label": "Option A", "points": [clip_text(line, 86) for line in bullets[:3]]},
-                {"label": "Option B", "points": [clip_text(line, 86) for line in (bullets[2:5] or bullets[:3])]},
-            ]
-        if intent == "process":
-            page["steps"] = [clip_text(line, 64) for line in bullets[:5]]
-        if intent == "kpi_summary":
-            page["kpis"] = [
-                {"label": "Priority", "value": str(idx), "note": clip_text(bullets[0] if bullets else "", 56)},
-                {"label": "Signal", "value": "High", "note": clip_text(bullets[1] if len(bullets) > 1 else "", 56)},
-                {"label": "Action", "value": "Next", "note": clip_text(bullets[2] if len(bullets) > 2 else "", 56)},
-            ]
-        if intent == "table_analysis":
-            page["table"] = {
-                "headers": ["Theme", "Evidence", "Implication"],
-                "rows": [[f"Item {i + 1}", line[:42], "Review"] for i, line in enumerate(bullets[:4])],
-            }
-        if intent in {"structure_map", "decision_memo"}:
-            page["comparison"] = [{"label": f"Area {i + 1}", "points": [clip_text(line, 86)]} for i, line in enumerate(bullets[:4])]
-        spec_pages.append(page)
-    return {
-        "schema_version": JOB_SPEC_SCHEMA_VERSION,
-        "language": language,
-        "focus": focus,
-        "pages": spec_pages,
-        "client_note": "Public job spec contains page intent, title, takeaway, content blocks, and source notes only.",
-    }
+    raise SystemExit("make-deck requires --job-spec for server generation. Use analysis/job_spec_prompt.json to create a complete public job spec locally, then rerun with --job-spec.")
 
 
 def write_job_spec_prompt(task_dir: Path) -> None:
@@ -309,7 +255,14 @@ def write_job_spec_prompt(task_dir: Path) -> None:
         "instructions": [
             "Create one page object per slide.",
             "Use only public intent values such as comparison, trend_chart, process, kpi_summary, structure_map, summary_scr, table_analysis, decision_memo.",
-            "For each page provide title, takeaway, bullets, optional table, optional chart, optional comparison, optional steps, optional kpis, optional scr, and source.",
+            "For each page provide title, takeaway, source, and the structured block required by that intent.",
+            "trend_chart needs chart categories, named series with numeric values, unit, x_axis, and y_axis.",
+            "kpi_summary needs at least 3 kpis; each kpi needs label, value, and note.",
+            "table_analysis needs headers, rows, and an Implication column with every row filled.",
+            "process needs 3-5 short steps; keep CJK steps especially compact.",
+            "summary_scr and decision_memo need scr.situation, scr.complication, and scr.resolution.",
+            "Do not repeat the same takeaway or content block across pages.",
+            "Do not use ellipsis for truncated content; rewrite shorter instead.",
             "Keep title under 90 characters, takeaway under 180 characters, bullets under 120 characters, tables at 5 rows by 4 columns, charts at 6 categories by 3 series.",
         ],
         "page_fields": [
@@ -370,12 +323,10 @@ def cmd_make_deck_server(args: argparse.Namespace) -> int:
     source_text = extract_text_from_source(str(args.source or ""))
     lines = compact_lines(source_text, limit=28)
     analysis_summary = "\n".join(f"- {line}" for line in lines) or str(args.focus or "")
-    job_spec = load_job_spec(str(getattr(args, "job_spec", "") or "")) or build_job_spec(
-        source_text,
-        min(pages, 8),
-        str(args.focus or ""),
-        str(args.language or ""),
-    )
+    write_job_spec_prompt(task_dir)
+    job_spec = load_job_spec(str(getattr(args, "job_spec", "") or ""))
+    if job_spec is None:
+        raise SystemExit("make-deck requires --job-spec for server generation. A fill-in guide was written to analysis/job_spec_prompt.json.")
     payload = {
         "client_job_id": f"{task_dir.name}-{int(time.time())}",
         "pages": pages,
@@ -383,7 +334,6 @@ def cmd_make_deck_server(args: argparse.Namespace) -> int:
         "focus": str(args.focus or ""),
         "job_spec": job_spec,
     }
-    write_job_spec_prompt(task_dir)
     try:
         revise_job_id = str(getattr(args, "revise_job_id", "") or "")
         if revise_job_id:
