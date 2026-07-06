@@ -24,6 +24,27 @@ CATALOG_EMPTY_ERROR = (
     "page templates for this access token; please update Paopao service package."
 )
 SERVER_JOB_ARTIFACTS = {"deck.pptx", "analysis_report.md"}
+JOB_SPEC_SCHEMA_VERSION = "paopao.job_spec.v1"
+JOB_SPEC_INTENTS = [
+    "summary_scr",
+    "trend_chart",
+    "comparison",
+    "process",
+    "kpi_summary",
+    "table_analysis",
+    "structure_map",
+    "decision_memo",
+]
+INTENT_TITLES = {
+    "summary_scr": "Executive logic",
+    "trend_chart": "Signal trend",
+    "comparison": "Option comparison",
+    "process": "Execution path",
+    "kpi_summary": "KPI dashboard",
+    "table_analysis": "Evidence matrix",
+    "structure_map": "Structure map",
+    "decision_memo": "Decision memo",
+}
 
 
 def _s(*parts: str) -> str:
@@ -197,7 +218,12 @@ def extract_text_from_source(path_value: str) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def compact_lines(text: str, limit: int = 18) -> list[str]:
+def clip_text(text: str, limit: int) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    return clean if len(clean) <= limit else clean[:limit - 3].rstrip() + "..."
+
+
+def compact_lines(text: str, limit: int = 18, item_limit: int = 112) -> list[str]:
     clean = re.sub(r"\s+", " ", text or "").strip()
     if not clean:
         return []
@@ -207,29 +233,114 @@ def compact_lines(text: str, limit: int = 18) -> list[str]:
         item = piece.strip(" -•\t")
         if not item:
             continue
-        if len(item) > 160:
-            item = item[:157].rstrip() + "..."
-        lines.append(item)
+        lines.append(clip_text(item, item_limit))
         if len(lines) >= limit:
             break
     return lines
 
 
-def build_story_outline(source_text: str, pages: int, focus: str) -> list[dict[str, object]]:
+def _sample_numbers(seed: int, count: int) -> list[float]:
+    return [float(max(1, ((seed + i * 3) % 9) + 2)) for i in range(count)]
+
+
+def build_job_spec(source_text: str, pages: int, focus: str, language: str) -> dict[str, object]:
     lines = compact_lines(source_text or focus, limit=max(24, pages * 3))
     if not lines:
         lines = [focus or "Paopao direction deck"]
-    outline: list[dict[str, object]] = []
+    spec_pages: list[dict[str, object]] = []
     for idx in range(1, pages + 1):
+        intent = JOB_SPEC_INTENTS[(idx - 1) % len(JOB_SPEC_INTENTS)]
         start = (idx - 1) * 2
-        evidence = lines[start:start + 3] or lines[:3]
-        claim = evidence[0] if evidence else (focus or f"Direction page {idx}")
-        outline.append({
-            "title": f"Page {idx}: {claim[:52]}",
-            "core_claim": claim,
-            "evidence": evidence,
-        })
-    return outline
+        bullets = lines[start:start + 5] or lines[:5]
+        takeaway = clip_text(bullets[0] if bullets else (focus or f"Page {idx} key message"), 170)
+        page: dict[str, object] = {
+            "intent": intent,
+            "title": clip_text(f"Page {idx}: {INTENT_TITLES.get(intent, 'Direction')}", 86),
+            "takeaway": takeaway,
+            "bullets": [clip_text(line, 112) for line in bullets[:5]],
+            "source": "Source: user-provided local material",
+        }
+        if intent == "summary_scr":
+            page["scr"] = {
+                "situation": clip_text(bullets[0] if len(bullets) > 0 else takeaway, 130),
+                "complication": clip_text(bullets[1] if len(bullets) > 1 else takeaway, 130),
+                "resolution": clip_text(bullets[2] if len(bullets) > 2 else takeaway, 130),
+            }
+        if intent == "trend_chart":
+            page["chart"] = {
+                "chart_type": "line",
+                "unit": "index",
+                "categories": ["T1", "T2", "T3", "T4"],
+                "series": [{"name": "Signal", "values": _sample_numbers(idx, 4)}],
+            }
+        if intent == "comparison":
+            page["comparison"] = [
+                {"label": "Option A", "points": [clip_text(line, 86) for line in bullets[:3]]},
+                {"label": "Option B", "points": [clip_text(line, 86) for line in (bullets[2:5] or bullets[:3])]},
+            ]
+        if intent == "process":
+            page["steps"] = [clip_text(line, 64) for line in bullets[:5]]
+        if intent == "kpi_summary":
+            page["kpis"] = [
+                {"label": "Priority", "value": str(idx), "note": clip_text(bullets[0] if bullets else "", 56)},
+                {"label": "Signal", "value": "High", "note": clip_text(bullets[1] if len(bullets) > 1 else "", 56)},
+                {"label": "Action", "value": "Next", "note": clip_text(bullets[2] if len(bullets) > 2 else "", 56)},
+            ]
+        if intent == "table_analysis":
+            page["table"] = {
+                "headers": ["Theme", "Evidence", "Implication"],
+                "rows": [[f"Item {i + 1}", line[:42], "Review"] for i, line in enumerate(bullets[:4])],
+            }
+        if intent in {"structure_map", "decision_memo"}:
+            page["comparison"] = [{"label": f"Area {i + 1}", "points": [clip_text(line, 86)]} for i, line in enumerate(bullets[:4])]
+        spec_pages.append(page)
+    return {
+        "schema_version": JOB_SPEC_SCHEMA_VERSION,
+        "language": language,
+        "focus": focus,
+        "pages": spec_pages,
+        "client_note": "Public job spec contains page intent, title, takeaway, content blocks, and source notes only.",
+    }
+
+
+def write_job_spec_prompt(task_dir: Path) -> None:
+    prompt = {
+        "schema_version": JOB_SPEC_SCHEMA_VERSION,
+        "instructions": [
+            "Create one page object per slide.",
+            "Use only public intent values such as comparison, trend_chart, process, kpi_summary, structure_map, summary_scr, table_analysis, decision_memo.",
+            "For each page provide title, takeaway, bullets, optional table, optional chart, optional comparison, optional steps, optional kpis, optional scr, and source.",
+            "Keep title under 90 characters, takeaway under 180 characters, bullets under 120 characters, tables at 5 rows by 4 columns, charts at 6 categories by 3 series.",
+        ],
+        "page_fields": [
+            "intent",
+            "title",
+            "takeaway",
+            "bullets",
+            "table",
+            "chart",
+            "comparison",
+            "steps",
+            "kpis",
+            "scr",
+            "source",
+        ],
+    }
+    analysis_dir = task_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    (analysis_dir / "job_spec_prompt.json").write_text(json.dumps(prompt, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_job_spec(path_value: str) -> dict[str, object] | None:
+    if not path_value:
+        return None
+    path = Path(path_value).expanduser()
+    if not path.exists():
+        raise SystemExit(f"job spec not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit("job spec must be a JSON object.")
+    return data
 
 
 def cmd_make_deck_server(args: argparse.Namespace) -> int:
@@ -245,15 +356,20 @@ def cmd_make_deck_server(args: argparse.Namespace) -> int:
     source_text = extract_text_from_source(str(args.source or ""))
     lines = compact_lines(source_text, limit=28)
     analysis_summary = "\n".join(f"- {line}" for line in lines) or str(args.focus or "")
+    job_spec = load_job_spec(str(getattr(args, "job_spec", "") or "")) or build_job_spec(
+        source_text,
+        min(pages, 8),
+        str(args.focus or ""),
+        str(args.language or ""),
+    )
     payload = {
         "client_job_id": f"{task_dir.name}-{int(time.time())}",
         "pages": pages,
         "language": str(args.language or ""),
         "focus": str(args.focus or ""),
-        "story_outline": build_story_outline(source_text, min(pages, 8), str(args.focus or "")),
-        "analysis_summary": analysis_summary,
-        "analysis_report": analysis_summary,
+        "job_spec": job_spec,
     }
+    write_job_spec_prompt(task_dir)
     try:
         job = paopao_auth.submit_deck_job(payload)
         job_id = str(job.get("job_id", ""))
@@ -391,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     make_deck.add_argument("--focus", default="")
     make_deck.add_argument("--output-root", default="output")
     make_deck.add_argument("--pipeline-mode", default="direct_pptx")
+    make_deck.add_argument("--job-spec", default="")
     make_deck.set_defaults(func=cmd_runtime_required, command="make-deck")
 
     for name in [
