@@ -23,7 +23,7 @@ CATALOG_EMPTY_ERROR = (
     "Authorized prompt catalog is empty. Paopao service did not return any "
     "page templates for this access token; please update Paopao service package."
 )
-SERVER_JOB_ARTIFACTS = {"deck.pptx", "analysis_report.md"}
+SERVER_JOB_ARTIFACT_SUFFIXES = {".pptx", ".md", ".jpg", ".jpeg"}
 JOB_SPEC_SCHEMA_VERSION = "paopao.job_spec.v1"
 JOB_SPEC_INTENTS = [
     "summary_scr",
@@ -343,6 +343,20 @@ def load_job_spec(path_value: str) -> dict[str, object] | None:
     return data
 
 
+def parse_page_numbers(value: str) -> list[int]:
+    pages: list[int] = []
+    for part in re.split(r"[,\s]+", value or ""):
+        if not part:
+            continue
+        try:
+            page = int(part)
+        except ValueError:
+            continue
+        if page > 0:
+            pages.append(page)
+    return sorted(set(pages))
+
+
 def cmd_make_deck_server(args: argparse.Namespace) -> int:
     paopao_auth = _load_sibling("paopao_auth")
     if not args.name:
@@ -371,14 +385,26 @@ def cmd_make_deck_server(args: argparse.Namespace) -> int:
     }
     write_job_spec_prompt(task_dir)
     try:
-        job = paopao_auth.submit_deck_job(payload)
+        revise_job_id = str(getattr(args, "revise_job_id", "") or "")
+        if revise_job_id:
+            if not getattr(args, "job_spec", ""):
+                raise SystemExit("server deck revision requires --job-spec.")
+            job = paopao_auth.revise_deck_job(
+                revise_job_id,
+                {
+                    "job_spec": job_spec,
+                    "revised_pages": parse_page_numbers(str(getattr(args, "revised_pages", "") or "")),
+                },
+            )
+        else:
+            job = paopao_auth.submit_deck_job(payload)
         job_id = str(job.get("job_id", ""))
         status = job if str(job.get("status")) == "done" else paopao_auth.fetch_deck_job(job_id)
         if str(status.get("status")) != "done":
             raise SystemExit(json.dumps(status, ensure_ascii=False, indent=2))
         artifacts = [
             name for name in status.get("artifacts", job.get("artifacts", []))
-            if isinstance(name, str) and Path(name).name in SERVER_JOB_ARTIFACTS
+            if isinstance(name, str) and Path(name).name == name and Path(name).suffix.lower() in SERVER_JOB_ARTIFACT_SUFFIXES
         ]
         for name in artifacts:
             data = paopao_auth.fetch_deck_job_artifact(job_id, name)
@@ -394,8 +420,14 @@ def cmd_make_deck_server(args: argparse.Namespace) -> int:
         "status": "delivered",
         "pipeline_mode": "server_job",
         "server_job_id": job_id,
+        "server_job_revision_count": int(status.get("revision_count", job.get("revision_count", 0)) or 0),
+        "server_job_usage_pages": int(status.get("usage_pages", job.get("usage_pages", pages)) or pages),
         "delivery_dir": str(delivery_dir),
         "delivery_files": sorted(path.name for path in delivery_dir.iterdir() if path.is_file()),
+        "preview_review": (
+            "Read every preview_slide_*.jpg locally. If a quality issue is found, update the public job spec "
+            "and rerun make-deck with --revise-job-id and --job-spec; do not edit deck.pptx locally."
+        ),
     }
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "paopao_task.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -508,6 +540,8 @@ def build_parser() -> argparse.ArgumentParser:
     make_deck.add_argument("--output-root", default="output")
     make_deck.add_argument("--pipeline-mode", default="direct_pptx")
     make_deck.add_argument("--job-spec", default="")
+    make_deck.add_argument("--revise-job-id", default="")
+    make_deck.add_argument("--revised-pages", default="")
     make_deck.set_defaults(func=cmd_runtime_required, command="make-deck")
 
     for name in [

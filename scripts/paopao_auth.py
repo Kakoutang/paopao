@@ -348,6 +348,12 @@ def fetch_deck_job(job_id: str) -> dict[str, Any]:
     return request_json("GET", f"{server_url()}/jobs/{job_id}", token=auth_token())
 
 
+def revise_deck_job(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
+    return request_json("POST", f"{server_url()}/jobs/{job_id}/revise", payload, token=auth_token())
+
+
 def fetch_deck_job_artifact(job_id: str, file_name: str) -> bytes:
     if not auth_token() and open_preview_enabled():
         ensure_preview_access()
