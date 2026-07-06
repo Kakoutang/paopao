@@ -1,0 +1,22 @@
+{
+  "name": "paopao",
+  "version": "0.3.1+codex.20260630090000",
+  "description": "paopao: generate editable consulting-style PPTX decks from PDFs, reports, papers, and reference materials.",
+  "author": {
+    "name": "Paopao"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "paopao",
+    "shortDescription": "Turn source documents into editable consulting-style PPTX decks.",
+    "longDescription": "paopao helps turn source documents into polished, editable PowerPoint decks. It is designed for reports, papers, market research, academic presentations, and consulting-style deliverables.",
+    "developerName": "Paopao",
+    "category": "Productivity",
+    "capabilities": [
+      "local-files",
+      "presentations",
+      "document-analysis"
+    ],
+    "defaultPrompt": "Use Paopao to turn this document into an editable PPTX deck."
+  }
+}

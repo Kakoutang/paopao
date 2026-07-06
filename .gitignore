@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.paopao/
+output/
+dist/
+
+# Files fetched from the service at runtime
+prompts/.catalog_cache.json
+
+# Private assets that must never be committed
+docs/
+memory/
+qa/
+pptx/
+html/
+spec/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.pptx
+*.ppt
+*.pdf

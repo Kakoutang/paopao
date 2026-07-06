@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Thin public bootstrap for Paopao."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+from paopao_file_manifest import AUTHORIZED_RUNTIME_FILES, WORKFLOW_DESTINATION_RELS
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+AUTHORIZED_WORKFLOW_FILES = AUTHORIZED_RUNTIME_FILES
+BUNDLE_CHUNK_SIZE = 80
+OPTIONAL_WORKFLOW_FILES = {"paopao_delivery_safety.py"}
+CATALOG_EMPTY_ERROR = (
+    "Authorized prompt catalog is empty. Paopao service did not return any "
+    "page templates for this access token; please update Paopao service package."
+)
+
+
+def _s(*parts: str) -> str:
+    return "".join(parts)
+
+
+def _load_sibling(name: str):
+    sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+    return __import__(name)
+
+
+def workflow_destinations() -> dict[str, Path]:
+    return {name: PLUGIN_ROOT / rel for name, rel in WORKFLOW_DESTINATION_RELS.items()}
+
+
+def fetch_workflow_file(name: str, destination: Path) -> None:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        result = paopao_auth.fetch_workflow_file(name)
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    content = str(result.get("content", "")).strip()
+    if not content:
+        raise SystemExit(f"Workflow file is empty: {name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content + "\n", encoding="utf-8")
+
+
+def workflow_file_missing(exc: Exception) -> bool:
+    text = str(exc)
+    return "HTTP 404" in text and "Workflow file not found" in text
+
+
+def fetch_prompt_templates() -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        catalog = paopao_auth.fetch_prompt_catalog()
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    written: list[str] = []
+    for item in catalog.get("prompts", []):
+        name = str(item.get("template", "")).strip()
+        if not name.endswith(".md") or "/" in name or "\\" in name or ".." in name:
+            continue
+        target = PLUGIN_ROOT / "prompts" / name
+        fetch_workflow_file(name, target)
+        written.append(str(target.relative_to(PLUGIN_ROOT)))
+    return written
+
+
+def fetch_workflow_bundle(names: list[str]) -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    written: list[str] = []
+    for start in range(0, len(names), BUNDLE_CHUNK_SIZE):
+        chunk = names[start:start + BUNDLE_CHUNK_SIZE]
+        try:
+            result = paopao_auth.fetch_workflow_bundle(chunk)
+        except paopao_auth.AuthError as exc:
+            if not workflow_file_missing(exc):
+                raise SystemExit(str(exc)) from exc
+            result = {"files": []}
+            for name in chunk:
+                try:
+                    result["files"].append(paopao_auth.fetch_workflow_file(name))
+                except paopao_auth.AuthError as file_exc:
+                    if name in OPTIONAL_WORKFLOW_FILES and workflow_file_missing(file_exc):
+                        continue
+                    raise SystemExit(str(file_exc)) from file_exc
+        for item in result.get("files", []):
+            name = str(item.get("name", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not content:
+                raise SystemExit(f"Workflow file is empty: {name}")
+            if name in WORKFLOW_DESTINATION_RELS:
+                target = PLUGIN_ROOT / WORKFLOW_DESTINATION_RELS[name]
+            elif name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+                target = PLUGIN_ROOT / "prompts" / name
+            else:
+                raise SystemExit(f"Unknown workflow file: {name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content + "\n", encoding="utf-8")
+            written.append(str(target.relative_to(PLUGIN_ROOT)))
+    return written
+
+
+def assert_downloaded_prompts(expected: list[str], written: list[str]) -> None:
+    written_prompts = {
+        Path(label).name
+        for label in written
+        if Path(label).parent.name == "prompts" and Path(label).suffix == ".md"
+    }
+    missing = sorted(set(expected) - written_prompts)
+    if missing:
+        sample = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise SystemExit(
+            "Authorized prompt library did not download completely: "
+            f"missing {len(missing)} template(s): {sample}{suffix}"
+        )
+
+
+def authorized_prompt_names(*, full_library: bool = False) -> list[str]:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        catalog = paopao_auth.fetch_prompt_catalog()
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    names: list[str] = []
+    for item in catalog.get("prompts", []):
+        name = str(item.get("template", "")).strip()
+        if name.endswith(".md") and "/" not in name and "\\" not in name and ".." not in name:
+            # Render already returns only the templates this token may use.
+            # The public bootstrap should not downgrade paid users to the
+            # starter/free prompt subset.
+            names.append(name)
+    if not names:
+        raise SystemExit(CATALOG_EMPTY_ERROR)
+    return names
+
+
+def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
+    return {
+        "count": len(paths),
+        "sample": paths[:sample_size],
+        "truncated": len(paths) > sample_size,
+    }
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    runtime = PLUGIN_ROOT / "scripts" / _s("deck", "_frame.py")
+    fetched: list[str] = []
+    error = ""
+    if not runtime.exists():
+        try:
+            names = [*AUTHORIZED_WORKFLOW_FILES, *authorized_prompt_names()]
+            fetched = fetch_workflow_bundle(names)
+        except SystemExit as exc:
+            error = str(exc)
+    checks = {
+        "plugin_root": str(PLUGIN_ROOT),
+        "public_bootstrap": True,
+        "runtime_present": runtime.exists(),
+        "access_ready": True,
+        "fetched": summarize(fetched),
+        "next_step": (
+            "Paopao is ready. You can start creating the deck."
+            if runtime.exists()
+            else "Run: python3 scripts/paopao_run.py update. If this keeps failing, contact support."
+        ),
+    }
+    if error:
+        checks["error"] = error
+    print(json.dumps(checks, ensure_ascii=False, indent=2))
+    return 0 if runtime.exists() else 1
+
+
+def cmd_fetch_workflow(args: argparse.Namespace) -> int:
+    destinations = workflow_destinations()
+    names = AUTHORIZED_WORKFLOW_FILES if args.all else [args.name]
+    for name in names:
+        if name not in destinations:
+            raise SystemExit(f"Unknown workflow file: {name}")
+    if args.all:
+        prompt_names = authorized_prompt_names(full_library=bool(getattr(args, "full_library", False)))
+        names = [*names, *prompt_names]
+    else:
+        prompt_names = []
+    written = fetch_workflow_bundle(list(names))
+    if prompt_names:
+        assert_downloaded_prompts(prompt_names, written)
+    print(json.dumps({
+        "ok": True,
+        "library_mode": "server_authorized",
+        "written": summarize(written),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    return cmd_fetch_workflow(
+        argparse.Namespace(
+            all=True,
+            name="paopao_run.py",
+            full_library=bool(getattr(args, "full_library", False)),
+        )
+    )
+
+
+def cmd_runtime_required(args: argparse.Namespace) -> int:
+    cmd_fetch_workflow(argparse.Namespace(all=True, name="paopao_run.py", full_library=True))
+    os.execv(
+        sys.executable,
+        [sys.executable, str(PLUGIN_ROOT / "scripts" / "paopao_run.py"), *sys.argv[1:]],
+    )
+    raise SystemExit("Failed to hand off to refreshed Paopao runtime")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="paopao public bootstrap")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="Check local bootstrap state")
+    doctor.set_defaults(func=cmd_doctor)
+
+    update = sub.add_parser("update", help="Update public bootstrap files")
+    update.add_argument("--full-library", action="store_true", help="Also refresh every authorized prompt template")
+    update.set_defaults(func=cmd_update)
+
+    fetch = sub.add_parser("fetch-workflow", help="Fetch authorized Paopao runtime files")
+    fetch.add_argument("--all", action="store_true")
+    fetch.add_argument("--full-library", action="store_true", help="Also fetch every authorized prompt template")
+    fetch.add_argument("--name", default="paopao_run.py", choices=sorted(workflow_destinations().keys()))
+    fetch.set_defaults(func=cmd_fetch_workflow)
+
+    for name in [
+        "init",
+        "make-deck",
+        "next",
+        "check",
+        "plan-prompts",
+        "finalize-delivery",
+        _s("prepare-direct-build-", "pack", "ets"),
+        "render-pptx-previews",
+    ]:
+        command = sub.add_parser(name, help=argparse.SUPPRESS)
+        command.set_defaults(func=cmd_runtime_required)
+    return parser
+
+
+def main() -> int:
+    args, _unknown = build_parser().parse_known_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
