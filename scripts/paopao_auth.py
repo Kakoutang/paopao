@@ -141,6 +141,48 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
     raise AuthError("无法连接 paopao 服务，请检查网络后重试。English: cannot reach paopao service.")
 
 
+def request_bytes(method: str, url: str, payload: dict[str, Any] | None = None, token: str = "") -> bytes:
+    data = None
+    headers = {
+        "Content-Type": "application/json",
+        "X-Paopao-Plugin-Version": PLUGIN_VERSION,
+        "X-Paopao-Workflow-Protocol": WORKFLOW_PROTOCOL_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    for attempt in range(REQUEST_RETRIES):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=ssl_context()) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in {502, 503, 504} and attempt < REQUEST_RETRIES - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            message = ""
+            try:
+                parsed = json.loads(detail)
+                message = str(parsed.get("detail", "")).strip()
+            except Exception:
+                message = detail.strip()
+            if len(message) > 500:
+                message = message[:500].rstrip() + "..."
+            raise AuthError(f"paopao service rejected request: HTTP {exc.code} {message}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise AuthError(
+                "无法连接 paopao 服务，请检查网络后重试。"
+                f"English: cannot reach paopao service: {exc}"
+            ) from exc
+    raise AuthError("无法连接 paopao 服务，请检查网络后重试。English: cannot reach paopao service.")
+
+
 def activate(code: str, url: str) -> dict[str, Any]:
     base = server_url(url)
     if not base:
@@ -290,6 +332,29 @@ def fetch_workflow_bundle(names: list[str]) -> dict[str, Any]:
         "POST",
         f"{server_url()}/workflow/bundle",
         {"names": clean_names},
+        token=auth_token(),
+    )
+
+
+def submit_deck_job(payload: dict[str, Any]) -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
+    return request_json("POST", f"{server_url()}/jobs/deck", payload, token=auth_token())
+
+
+def fetch_deck_job(job_id: str) -> dict[str, Any]:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
+    return request_json("GET", f"{server_url()}/jobs/{job_id}", token=auth_token())
+
+
+def fetch_deck_job_artifact(job_id: str, file_name: str) -> bytes:
+    if not auth_token() and open_preview_enabled():
+        ensure_preview_access()
+    clean_name = Path(file_name).name
+    return request_bytes(
+        "GET",
+        f"{server_url()}/jobs/{job_id}/artifacts/{clean_name}",
         token=auth_token(),
     )
 

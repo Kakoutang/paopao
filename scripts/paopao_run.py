@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from paopao_file_manifest import AUTHORIZED_RUNTIME_FILES, WORKFLOW_DESTINATION_RELS
@@ -19,6 +23,7 @@ CATALOG_EMPTY_ERROR = (
     "Authorized prompt catalog is empty. Paopao service did not return any "
     "page templates for this access token; please update Paopao service package."
 )
+SERVER_JOB_ARTIFACTS = {"deck.pptx", "analysis_report.md"}
 
 
 def _s(*parts: str) -> str:
@@ -147,6 +152,146 @@ def summarize(paths: list[str], sample_size: int = 12) -> dict[str, object]:
     }
 
 
+def slugify(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip()).strip("-").lower()
+    return slug or "paopao-task"
+
+
+def current_plan() -> str:
+    paopao_auth = _load_sibling("paopao_auth")
+    try:
+        status = paopao_auth.status()
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    license_data = status.get("license", {}) if isinstance(status.get("license", {}), dict) else {}
+    return str(license_data.get("plan", "") or "").strip().lower()
+
+
+def should_use_server_job() -> bool:
+    plan = current_plan()
+    return plan.startswith("free_preview") or plan.startswith("starter")
+
+
+def extract_text_from_source(path_value: str) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        raise SystemExit(f"Source file not found: {path}")
+    if path.suffix.lower() in {".txt", ".md", ".csv"}:
+        return path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() == ".pdf":
+        tool = shutil.which("pdftotext")
+        if tool:
+            result = subprocess.run(
+                [tool, str(path), "-"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+        return f"PDF source file provided locally: {path.name}. Text extraction was unavailable in this environment."
+    raw = path.read_bytes()[:120000]
+    return raw.decode("utf-8", errors="ignore")
+
+
+def compact_lines(text: str, limit: int = 18) -> list[str]:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return []
+    pieces = re.split(r"(?<=[。！？.!?])\s+|[;\n]+", clean)
+    lines: list[str] = []
+    for piece in pieces:
+        item = piece.strip(" -•\t")
+        if not item:
+            continue
+        if len(item) > 160:
+            item = item[:157].rstrip() + "..."
+        lines.append(item)
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def build_story_outline(source_text: str, pages: int, focus: str) -> list[dict[str, object]]:
+    lines = compact_lines(source_text or focus, limit=max(24, pages * 3))
+    if not lines:
+        lines = [focus or "Paopao direction deck"]
+    outline: list[dict[str, object]] = []
+    for idx in range(1, pages + 1):
+        start = (idx - 1) * 2
+        evidence = lines[start:start + 3] or lines[:3]
+        claim = evidence[0] if evidence else (focus or f"Direction page {idx}")
+        outline.append({
+            "title": f"Page {idx}: {claim[:52]}",
+            "core_claim": claim,
+            "evidence": evidence,
+        })
+    return outline
+
+
+def cmd_make_deck_server(args: argparse.Namespace) -> int:
+    paopao_auth = _load_sibling("paopao_auth")
+    if not args.name:
+        raise SystemExit("make-deck requires --name.")
+    if not args.pages:
+        raise SystemExit("make-deck requires --pages.")
+    pages = int(args.pages)
+    task_dir = Path(args.output_root).resolve() / slugify(args.name)
+    delivery_dir = task_dir / "delivery"
+    delivery_dir.mkdir(parents=True, exist_ok=True)
+    source_text = extract_text_from_source(str(args.source or ""))
+    lines = compact_lines(source_text, limit=28)
+    analysis_summary = "\n".join(f"- {line}" for line in lines) or str(args.focus or "")
+    payload = {
+        "client_job_id": f"{task_dir.name}-{int(time.time())}",
+        "pages": pages,
+        "language": str(args.language or ""),
+        "focus": str(args.focus or ""),
+        "story_outline": build_story_outline(source_text, min(pages, 8), str(args.focus or "")),
+        "analysis_summary": analysis_summary,
+        "analysis_report": analysis_summary,
+    }
+    try:
+        job = paopao_auth.submit_deck_job(payload)
+        job_id = str(job.get("job_id", ""))
+        status = job if str(job.get("status")) == "done" else paopao_auth.fetch_deck_job(job_id)
+        if str(status.get("status")) != "done":
+            raise SystemExit(json.dumps(status, ensure_ascii=False, indent=2))
+        artifacts = [
+            name for name in status.get("artifacts", job.get("artifacts", []))
+            if isinstance(name, str) and Path(name).name in SERVER_JOB_ARTIFACTS
+        ]
+        for name in artifacts:
+            data = paopao_auth.fetch_deck_job_artifact(job_id, name)
+            (delivery_dir / Path(name).name).write_bytes(data)
+    except paopao_auth.AuthError as exc:
+        raise SystemExit(str(exc)) from exc
+    manifest = {
+        "task_name": task_dir.name,
+        "page_count": min(pages, 8),
+        "requested_page_count": pages,
+        "language": str(args.language or ""),
+        "focus": str(args.focus or ""),
+        "status": "delivered",
+        "pipeline_mode": "server_job",
+        "server_job_id": job_id,
+        "delivery_dir": str(delivery_dir),
+        "delivery_files": sorted(path.name for path in delivery_dir.iterdir() if path.is_file()),
+    }
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "paopao_task.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "task_dir": str(task_dir),
+        "delivery_dir": str(delivery_dir),
+        "files": manifest["delivery_files"],
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     runtime = PLUGIN_ROOT / "scripts" / _s("deck", "_frame.py")
     fetched: list[str] = []
@@ -208,6 +353,8 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_required(args: argparse.Namespace) -> int:
+    if getattr(args, "command", "") == "make-deck" and should_use_server_job():
+        return cmd_make_deck_server(args)
     cmd_fetch_workflow(argparse.Namespace(all=True, name="paopao_run.py", full_library=True))
     os.execv(
         sys.executable,
@@ -233,9 +380,20 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--name", default="paopao_run.py", choices=sorted(workflow_destinations().keys()))
     fetch.set_defaults(func=cmd_fetch_workflow)
 
+    init = sub.add_parser("init", help=argparse.SUPPRESS)
+    init.set_defaults(func=cmd_runtime_required, command="init")
+
+    make_deck = sub.add_parser("make-deck", help=argparse.SUPPRESS)
+    make_deck.add_argument("--name", default="")
+    make_deck.add_argument("--source", default="")
+    make_deck.add_argument("--pages", type=int, default=0)
+    make_deck.add_argument("--language", default="")
+    make_deck.add_argument("--focus", default="")
+    make_deck.add_argument("--output-root", default="output")
+    make_deck.add_argument("--pipeline-mode", default="direct_pptx")
+    make_deck.set_defaults(func=cmd_runtime_required, command="make-deck")
+
     for name in [
-        "init",
-        "make-deck",
         "next",
         "check",
         "plan-prompts",
@@ -244,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
         "render-pptx-previews",
     ]:
         command = sub.add_parser(name, help=argparse.SUPPRESS)
-        command.set_defaults(func=cmd_runtime_required)
+        command.set_defaults(func=cmd_runtime_required, command=name)
     return parser
 
 
